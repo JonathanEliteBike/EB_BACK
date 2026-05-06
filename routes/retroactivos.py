@@ -211,8 +211,8 @@ def ejecutar_sincronizacion_y_calculos():
             UPDATE tabla_retroactivos
             SET 
                 TOTAL_ACUMULADO = (COALESCE(COMPRA_GLOBAL_SCOTT, 0) + COALESCE(COMPRA_GLOBAL_APPAREL, 0) + COALESCE(COMPRA_GLOBAL_BOLD, 0)),
-                compra_anual_crudo = (COALESCE(COMPRAS_TOTALES_CRUDO, 0) - COALESCE(notas_credito, 0) - COALESCE(productos_ofertados, 0)),
-                compra_adicional = (COALESCE(COMPRAS_TOTALES_CRUDO, 0) - COALESCE(notas_credito, 0) - COALESCE(productos_ofertados, 0) - COALESCE(COMPRA_MINIMA_ANUAL, 0))
+                compra_anual_crudo = (COALESCE(COMPRAS_TOTALES_CRUDO, 0) - COALESCE(notas_credito, 0) - COALESCE(garantias, 0)),
+                compra_adicional = (COALESCE(COMPRAS_TOTALES_CRUDO, 0) - COALESCE(notas_credito, 0) - COALESCE(garantias, 0) - COALESCE(COMPRA_MINIMA_ANUAL, 0))
         """)
         
         # ==============================================================================
