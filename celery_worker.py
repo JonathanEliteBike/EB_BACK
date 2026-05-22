@@ -1,5 +1,6 @@
 from celery import Celery
 import os
+import sys
 import smtplib
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
@@ -11,6 +12,10 @@ import time
 import logging
 
 # Importa la librería para generar PDFs cuando sea necesario (import dinámico)
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+if BASE_DIR not in sys.path:
+    sys.path.insert(0, BASE_DIR)
 
 # Importa las funciones auxiliares de tu módulo de utilidades
 from utils.email_utils import (
@@ -135,3 +140,23 @@ def enviar_caratula_pdf_async(data, usuario, historial_id):
         logging.error(f"[{datetime.now()}] Error en tarea {historial_id}: {str(e)}")
         actualizar_estado_historial(historial_id, 'Fallido')
         return {"status": "error", "mensaje": f"Error al enviar email: {str(e)}"}
+    
+@celery_app.task(name='tasks.recalcular_previo_async')
+def recalcular_previo_async():
+    """
+    Tarea asíncrona para recalcular la tabla previo.
+    """
+    try:
+        logging.info(f"BASE_DIR Celery: {BASE_DIR}")
+        logging.info(f"sys.path Celery: {sys.path}")
+
+        from tasks_previo import recalcular_previo
+
+        return recalcular_previo()
+
+    except Exception as e:
+        logging.exception("Error en tarea recalcular_previo_async")
+        return {
+            "status": "error",
+            "mensaje": str(e)
+        }

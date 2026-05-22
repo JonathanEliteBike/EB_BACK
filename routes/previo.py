@@ -13,16 +13,88 @@ def obtener_previo():
     try:
         conexion = obtener_conexion()
         cursor = conexion.cursor(dictionary=True)
-        # Seleccionamos todos los campos necesarios
-        cursor.execute("SELECT * FROM previo") 
+
+        cursor.execute("""
+            SELECT 
+                id,
+                clave,
+                evac,
+                nombre_cliente,
+                acumulado_anticipado,
+                nivel,
+                compra_minima_anual,
+                porcentaje_anual,
+                compra_minima_inicial,
+                avance_global,
+                porcentaje_global,
+                compromiso_scott,
+                avance_global_scott,
+                porcentaje_scott,
+                compromiso_jul_ago,
+                avance_jul_ago,
+                porcentaje_jul_ago,
+                compromiso_sep_oct,
+                avance_sep_oct,
+                porcentaje_sep_oct,
+                compromiso_nov_dic,
+                avance_nov_dic,
+                porcentaje_nov_dic,
+                compromiso_ene_feb,
+                avance_ene_feb,
+                porcentaje_ene_feb,
+                compromiso_mar_abr,
+                avance_mar_abr,
+                porcentaje_mar_abr,
+                compromiso_may_jun,
+                avance_may_jun,
+                porcentaje_may_jun,
+                compromiso_apparel_syncros_vittoria,
+                avance_global_apparel_syncros_vittoria,
+                porcentaje_apparel_syncros_vittoria,
+                compromiso_jul_ago_app,
+                avance_jul_ago_app,
+                porcentaje_jul_ago_app,
+                compromiso_sep_oct_app,
+                avance_sep_oct_app,
+                porcentaje_sep_oct_app,
+                compromiso_nov_dic_app,
+                avance_nov_dic_app,
+                porcentaje_nov_dic_app,
+                compromiso_ene_feb_app,
+                avance_ene_feb_app,
+                porcentaje_ene_feb_app,
+                compromiso_mar_abr_app,
+                avance_mar_abr_app,
+                porcentaje_mar_abr_app,
+                compromiso_may_jun_app,
+                avance_may_jun_app,
+                porcentaje_may_jun_app,
+                acumulado_syncros,
+                acumulado_apparel,
+                acumulado_vittoria,
+                acumulado_bold,
+                es_integral,
+                grupo_integral
+            FROM previo
+            WHERE nombre_cliente IS NOT NULL
+                AND nombre_cliente <> ''
+                AND nivel IS NOT NULL
+                AND nivel <> ''
+            ORDER BY es_integral ASC, nombre_cliente ASC
+        """)
+
         registros = cursor.fetchall()
         return jsonify(registros), 200
+
     except Exception as e:
         logging.exception("Error obteniendo previo")
         return jsonify({'error': str(e)}), 500
+
     finally:
-        if cursor: cursor.close()
-        if conexion: conexion.close()
+        if cursor:
+            cursor.close()
+        if conexion:
+            conexion.close()
 
 @previo_bp.route('/actualizar_previo', methods=['POST'])
 def actualizar_previo():
@@ -237,3 +309,21 @@ def obtener_previo_int():
             cursor.close()
         if conexion and conexion.is_connected():
             conexion.close()
+
+@previo_bp.route('/recalcular_previo', methods=['POST'])
+def disparar_recalculo_previo():
+    try:
+        from celery_worker import celery_app
+
+        task = celery_app.send_task('tasks.recalcular_previo_async')
+
+        return jsonify({
+            'mensaje': 'Recalculo de previo iniciado',
+            'task_id': task.id
+        }), 202
+
+    except Exception as e:
+        logging.exception("Error iniciando recalculo de previo")
+        return jsonify({
+            'error': str(e)
+        }), 500
