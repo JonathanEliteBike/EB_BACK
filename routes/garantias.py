@@ -4,7 +4,8 @@ import logging
 import os
 import uuid
 
-from flask import Blueprint, jsonify, request, send_file
+from flask import Blueprint, jsonify, request, send_file, redirect
+from services.s3_service import subir_archivo_s3, generar_url_firmada_s3, existe_archivo_s3
 from werkzeug.utils import secure_filename
 
 from db_conexion import obtener_conexion
@@ -763,24 +764,44 @@ def get_latencias():
 def subir_archivo():
     if 'archivo' not in request.files:
         return jsonify({"error": "No se recibio archivo"}), 400
+
     file = request.files['archivo']
+
     if not file.filename:
         return jsonify({"error": "Nombre de archivo vacio"}), 400
+
     if not allowed_file(file.filename):
         return jsonify({"error": "Tipo de archivo no permitido"}), 400
 
-    filename = secure_filename(file.filename)
-    unique_name = f"{uuid.uuid4().hex}_{filename}"
-    file_path = os.path.join(UPLOAD_FOLDER, unique_name)
-    file.save(file_path)
+    try:
+        resultado = subir_archivo_s3(file)
+        url = generar_url_firmada_s3(resultado["key"])
 
-    return jsonify({"ok": True, "nombre": unique_name, "original": filename})
+        return jsonify({
+            "ok": True,
+            "nombre": resultado["key"],
+            "original": resultado["original"],
+            "url": url,
+            "storage": "s3"
+        })
+
+    except Exception as e:
+        logging.exception("Error subiendo archivo de garantia a S3: %s", e)
+        return jsonify({"error": "Error al subir archivo"}), 500
 
 
-@garantias_bp.route("/archivo/<nombre>", methods=["GET"])
+@garantias_bp.route("/archivo/<path:nombre>", methods=["GET"])
 def descargar_archivo(nombre):
-    file_path = os.path.join(UPLOAD_FOLDER, secure_filename(nombre))
-    if not os.path.exists(file_path):
-        return jsonify({"error": "Archivo no encontrado"}), 404
-    # as_attachment=False → Content-Disposition: inline → el browser lo muestra directamente
-    return send_file(file_path, as_attachment=False)
+    try:
+        key_s3 = nombre
+
+        if not existe_archivo_s3(key_s3):
+            return jsonify({"error": "Archivo no encontrado"}), 404
+
+        url = generar_url_firmada_s3(key_s3)
+
+        return redirect(url)
+
+    except Exception as e:
+        logging.exception("Error obteniendo archivo de garantia desde S3: %s", e)
+        return jsonify({"error": "Error al obtener archivo"}), 500

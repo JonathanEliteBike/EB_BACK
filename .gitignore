@@ -15,3 +15,7 @@ parse_output.json
 parse_output_utf8.json
 migrar_importaciones.py
 parse_importaciones.py
+.env
+analizar_diferencia.py
+tests/demo.py
+tests/test_calculo_scott.py
