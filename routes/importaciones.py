@@ -346,6 +346,207 @@ def obtener(id_imp):
         conn.close()
 
 
+# ── GET /importaciones/dashboard  →  datos analíticos agregados ──────────────
+
+@importaciones_bp.route("/dashboard", methods=["GET"])
+def dashboard():
+    via    = request.args.get("via",    "").strip()
+    estado = request.args.get("estado", "").strip()
+    origen = request.args.get("origen", "").strip()
+    anio   = request.args.get("anio",   "").strip()
+
+    conn = obtener_conexion()
+    if not conn:
+        return jsonify({"error": "Sin conexion a BD"}), 500
+    try:
+        cursor = conn.cursor(dictionary=True)
+
+        where  = ["estado != 'eliminado'"]
+        params = []
+        if via:
+            where.append("via_transporte = %s")
+            params.append(via)
+        if estado:
+            where.append("estado = %s")
+            params.append(estado)
+        if origen:
+            where.append("log_origen LIKE %s")
+            params.append(f"%{origen}%")
+        if anio:
+            where.append("YEAR(COALESCE(log_fecha_booking, created_at)) = %s")
+            params.append(int(anio))
+
+        w = " AND ".join(where)
+        cursor.execute(
+            f"SELECT * FROM importaciones WHERE {w} ORDER BY COALESCE(log_fecha_booking, created_at) DESC",
+            params or []
+        )
+        rows = [_serialize(r) for r in cursor.fetchall()]
+
+        # ── KPIs ──────────────────────────────────────────────────────────────
+        total      = len(rows)
+        activos    = sum(1 for r in rows if r.get("estado") == "activo")
+        cerrados   = sum(1 for r in rows if r.get("estado") == "cerrado")
+        cancelados = sum(1 for r in rows if r.get("estado") == "cancelado")
+
+        fletes = [float(r["cos_flete_internacional_usd"]) for r in rows if r.get("cos_flete_internacional_usd")]
+        flete_total = round(sum(fletes), 2)
+        flete_prom  = round(flete_total / len(fletes), 2) if fletes else 0
+
+        transitos    = [r["log_dias_transito_maritimo"] for r in rows if r.get("log_dias_transito_maritimo")]
+        transito_prom = round(sum(transitos) / len(transitos), 1) if transitos else 0
+
+        avances = []
+        for r in rows:
+            prog = _calcular_progreso(r)
+            t = sum(s["total"] for s in prog.values())
+            c = sum(s["completados"] for s in prog.values())
+            avances.append(round(c / t * 100) if t else 0)
+        pct_prom = round(sum(avances) / len(avances)) if avances else 0
+
+        # ── Por vía ───────────────────────────────────────────────────────────
+        por_via: dict = {}
+        for r in rows:
+            v = r.get("via_transporte") or "MARITIMO"
+            por_via[v] = por_via.get(v, 0) + 1
+        por_via_list = [{"via": k, "count": v} for k, v in sorted(por_via.items())]
+
+        # ── Por origen (top 10) ───────────────────────────────────────────────
+        por_origen: dict = {}
+        for r in rows:
+            o = (r.get("log_origen") or "Sin origen").strip().upper()
+            por_origen[o] = por_origen.get(o, 0) + 1
+        por_origen_list = sorted(
+            [{"origen": k, "count": v} for k, v in por_origen.items()],
+            key=lambda x: -x["count"]
+        )[:10]
+
+        # ── Por mes ───────────────────────────────────────────────────────────
+        from collections import defaultdict
+        por_mes: dict = defaultdict(lambda: {"maritimo": 0, "aereo": 0})
+        meses_es = ["Ene","Feb","Mar","Abr","May","Jun","Jul","Ago","Sep","Oct","Nov","Dic"]
+        for r in rows:
+            fecha = r.get("log_fecha_booking") or (r.get("created_at") or "")[:10]
+            if fecha and len(str(fecha)) >= 7:
+                mes_key = str(fecha)[:7]
+                via_r   = r.get("via_transporte") or "MARITIMO"
+                if via_r == "MARITIMO":
+                    por_mes[mes_key]["maritimo"] += 1
+                else:
+                    por_mes[mes_key]["aereo"] += 1
+        por_mes_list = []
+        for mes_key in sorted(por_mes.keys()):
+            try:
+                y, m = mes_key.split("-")
+                label = f"{meses_es[int(m)-1]} {y}"
+            except Exception:
+                label = mes_key
+            por_mes_list.append({"mes": mes_key, "label": label, **por_mes[mes_key]})
+
+        # ── Flete promedio por vía ────────────────────────────────────────────
+        f_mar = [float(r["cos_flete_internacional_usd"]) for r in rows
+                 if r.get("cos_flete_internacional_usd") and (r.get("via_transporte") or "MARITIMO") == "MARITIMO"]
+        f_aer = [float(r["cos_flete_internacional_usd"]) for r in rows
+                 if r.get("cos_flete_internacional_usd") and r.get("via_transporte") == "AEREO"]
+        flete_por_via = {
+            "maritimo_avg":   round(sum(f_mar) / len(f_mar), 2) if f_mar else 0,
+            "maritimo_count": len(f_mar),
+            "aereo_avg":      round(sum(f_aer) / len(f_aer), 2) if f_aer else 0,
+            "aereo_count":    len(f_aer),
+        }
+
+        # ── Por estado ────────────────────────────────────────────────────────
+        por_estado: dict = {}
+        for r in rows:
+            e = r.get("estado") or "activo"
+            por_estado[e] = por_estado.get(e, 0) + 1
+        por_estado_list = [{"estado": k, "count": v} for k, v in por_estado.items()]
+
+        # ── Resumen por embarque ──────────────────────────────────────────────
+        embarques_res = []
+        for r in rows:
+            prog = _calcular_progreso(r)
+            t = sum(s["total"] for s in prog.values())
+            c = sum(s["completados"] for s in prog.values())
+            pct_global = round(c / t * 100) if t else 0
+
+            tc = float(r.get("cos_tipo_cambio_pedimento") or 0)
+            costo_total_pesos = round(
+                ((float(r.get("cos_flete_internacional_usd") or 0) +
+                  float(r.get("cos_flete_terrestre_usd")      or 0) +
+                  float(r.get("cos_pernoctas_usd")            or 0) +
+                  float(r.get("cos_demoras_usd")              or 0)) * tc) +
+                float(r.get("cos_gastos_forwarder_pesos")   or 0) +
+                float(r.get("cos_seguro_pesos")             or 0) +
+                float(r.get("cos_custodia_pesos")           or 0) +
+                float(r.get("cos_maniobras_pesos")          or 0) +
+                float(r.get("cos_honorarios_pesos")         or 0) +
+                float(r.get("cos_verificacion_pesos")       or 0) +
+                float(r.get("cos_lavado_contenedor_pesos")  or 0) +
+                float(r.get("cos_monitoreo_pesos")          or 0) +
+                float(r.get("cos_impuestos_pagados_pesos")  or 0) +
+                float(r.get("cos_reconocimiento_aduanero")  or 0) +
+                float(r.get("cos_cargos_adicionales_pesos") or 0),
+                2
+            )
+
+            embarques_res.append({
+                "id":                         r["id"],
+                "referencia":                 r["referencia"],
+                "nombre":                     r.get("nombre") or "",
+                "via_transporte":             r.get("via_transporte") or "MARITIMO",
+                "log_origen":                 r.get("log_origen") or "",
+                "estado":                     r.get("estado") or "activo",
+                "pct_global":                 pct_global,
+                "log_fecha_booking":          r.get("log_fecha_booking"),
+                "des_llegada_almacen":        r.get("des_llegada_almacen"),
+                "log_dias_transito_maritimo": r.get("log_dias_transito_maritimo"),
+                "cos_flete_internacional_usd": float(r["cos_flete_internacional_usd"]) if r.get("cos_flete_internacional_usd") else None,
+                "costo_total_pesos":          costo_total_pesos,
+                "progreso":                   prog,
+            })
+
+        # ── Opciones para filtros ─────────────────────────────────────────────
+        all_origenes = sorted({
+            (r.get("log_origen") or "").strip().upper()
+            for r in rows if r.get("log_origen")
+        })
+        all_anios = sorted({
+            str(r.get("log_fecha_booking") or r.get("created_at", ""))[:4]
+            for r in rows
+            if str(r.get("log_fecha_booking") or r.get("created_at", ""))[:4].isdigit()
+        }, reverse=True)
+
+        return jsonify({
+            "kpis": {
+                "total":                           total,
+                "activos":                         activos,
+                "cerrados":                        cerrados,
+                "cancelados":                      cancelados,
+                "flete_total_usd":                 flete_total,
+                "flete_promedio_usd":              flete_prom,
+                "transito_maritimo_promedio_dias": transito_prom,
+                "pct_avance_promedio":             pct_prom,
+            },
+            "por_via":       por_via_list,
+            "por_origen":    por_origen_list,
+            "por_mes":       por_mes_list,
+            "flete_por_via": flete_por_via,
+            "por_estado":    por_estado_list,
+            "embarques":     embarques_res,
+            "filtros": {
+                "origenes": all_origenes,
+                "anios":    all_anios,
+            },
+        }), 200
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return jsonify({"error": str(e)}), 500
+    finally:
+        conn.close()
+
+
 # ── POST /importaciones  →  crear nuevo embarque ─────────────────────────────
 
 @importaciones_bp.route("", methods=["POST"])

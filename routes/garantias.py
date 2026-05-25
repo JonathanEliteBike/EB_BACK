@@ -150,19 +150,36 @@ def enviar_formulario():
                             email = datos['email_asignado']
 
         cursor = conn.cursor()
+        fecha_ingreso = datos.get('fecha_ingreso') or None
+
         # Insertar sin folio para obtener el ID auto-increment
-        cursor.execute("""
-            INSERT INTO garantia_formularios
-                (email, distribuidor, contacto, puesto, marca, datos)
-            VALUES (%s, %s, %s, %s, %s, %s)
-        """, (
-            email,
-            datos.get('distribuidor', ''),
-            datos.get('contacto', ''),
-            datos.get('puesto', ''),
-            datos.get('marca', ''),
-            json.dumps(datos, ensure_ascii=False),
-        ))
+        if fecha_ingreso:
+            cursor.execute("""
+                INSERT INTO garantia_formularios
+                    (email, distribuidor, contacto, puesto, marca, datos, fecha_creacion)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
+            """, (
+                email,
+                datos.get('distribuidor', ''),
+                datos.get('contacto', ''),
+                datos.get('puesto', ''),
+                datos.get('marca', ''),
+                json.dumps(datos, ensure_ascii=False),
+                fecha_ingreso,
+            ))
+        else:
+            cursor.execute("""
+                INSERT INTO garantia_formularios
+                    (email, distribuidor, contacto, puesto, marca, datos)
+                VALUES (%s, %s, %s, %s, %s, %s)
+            """, (
+                email,
+                datos.get('distribuidor', ''),
+                datos.get('contacto', ''),
+                datos.get('puesto', ''),
+                datos.get('marca', ''),
+                json.dumps(datos, ensure_ascii=False),
+            ))
         new_id = cursor.lastrowid
         folio = f"GAR-{new_id:04d}"
         cursor.execute("UPDATE garantia_formularios SET folio = %s WHERE id = %s", (folio, new_id))
@@ -436,6 +453,7 @@ def actualizar_validacion_doc(form_id):
         campo          = datos.get('campo', '')
         estado         = datos.get('estado')          # 'valido' | 'rechazado' | None
         nombre_legible = datos.get('nombre_legible', campo)
+        fecha_val      = datos.get('fecha_validacion') or None  # YYYY-MM-DD opcional
 
         if not campo:
             return jsonify({"error": "Campo requerido"}), 400
@@ -468,10 +486,16 @@ def actualizar_validacion_doc(form_id):
 
         accion = 'validado' if estado == 'valido' else ('rechazado' if estado == 'rechazado' else 'restablecido')
         texto  = f'Documento "{nombre_legible}" {accion}'
-        cursor.execute(
-            "INSERT INTO garantia_comentarios (formulario_id, autor, texto, tipo) VALUES (%s, %s, %s, %s)",
-            (form_id, 'Sistema', texto, 'validacion')
-        )
+        if fecha_val:
+            cursor.execute(
+                "INSERT INTO garantia_comentarios (formulario_id, autor, texto, tipo, fecha) VALUES (%s, %s, %s, %s, %s)",
+                (form_id, 'Sistema', texto, 'validacion', fecha_val)
+            )
+        else:
+            cursor.execute(
+                "INSERT INTO garantia_comentarios (formulario_id, autor, texto, tipo) VALUES (%s, %s, %s, %s)",
+                (form_id, 'Sistema', texto, 'validacion')
+            )
         conn.commit()
         return jsonify({"ok": True, "validacion_docs_json": val_json})
     except Exception as e:
@@ -619,12 +643,30 @@ def get_comentarios(formulario_id):
     if not conn:
         return jsonify({"error": "Sin conexion a BD"}), 500
     try:
+        es_admin = False
+        auth_header = request.headers.get('Authorization', '')
+        if auth_header:
+            raw_token = auth_header.split(' ')[1] if ' ' in auth_header else None
+            if raw_token:
+                payload = verificar_token(raw_token)
+                if payload and payload.get('id'):
+                    cursor_u = conn.cursor(dictionary=True)
+                    cursor_u.execute("SELECT rol_id FROM usuarios WHERE id = %s", (payload['id'],))
+                    user = cursor_u.fetchone()
+                    es_admin = bool(user and user.get('rol_id') == 1)
+
         cursor = conn.cursor(dictionary=True)
-        cursor.execute("""
-            SELECT * FROM garantia_comentarios
-            WHERE formulario_id = %s
-            ORDER BY fecha ASC
-        """, (formulario_id,))
+        if es_admin:
+            cursor.execute("""
+                SELECT * FROM garantia_comentarios
+                WHERE formulario_id = %s ORDER BY fecha ASC
+            """, (formulario_id,))
+        else:
+            cursor.execute("""
+                SELECT * FROM garantia_comentarios
+                WHERE formulario_id = %s AND tipo != 'nota_interna'
+                ORDER BY fecha ASC
+            """, (formulario_id,))
         rows = cursor.fetchall()
         for r in rows:
             if r.get('fecha'):
@@ -647,8 +689,26 @@ def add_comentario(formulario_id):
         texto = (datos.get('texto') or '').strip()
         if not texto:
             return jsonify({"error": "El comentario no puede estar vacio"}), 400
-        autor = (datos.get('autor') or 'Administrador').strip()
-        tipo  = datos.get('tipo', 'comentario')
+        tipo = datos.get('tipo', 'comentario')
+
+        if tipo == 'nota_interna':
+            # Extraer nombre real del JWT — requerido para notas internas
+            auth_header = request.headers.get('Authorization', '')
+            raw_token = auth_header.split(' ')[1] if ' ' in auth_header else None
+            if not raw_token:
+                return jsonify({"error": "No autorizado"}), 401
+            tok_payload = verificar_token(raw_token)
+            if not tok_payload or not tok_payload.get('id'):
+                return jsonify({"error": "Token inválido"}), 401
+            cursor_u = conn.cursor(dictionary=True)
+            cursor_u.execute("SELECT nombre, rol_id FROM usuarios WHERE id = %s", (tok_payload['id'],))
+            user = cursor_u.fetchone()
+            if not user or user.get('rol_id') != 1:
+                return jsonify({"error": "No autorizado"}), 403
+            autor = user.get('nombre') or 'Administrador'
+        else:
+            autor = (datos.get('autor') or 'Administrador').strip()
+
         cursor = conn.cursor()
         cursor.execute("""
             INSERT INTO garantia_comentarios (formulario_id, autor, texto, tipo)
