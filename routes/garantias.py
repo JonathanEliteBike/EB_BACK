@@ -338,6 +338,53 @@ def mis_tickets():
         conn.close()
 
 
+@garantias_bp.route("/formulario/<int:form_id>", methods=["DELETE"])
+def eliminar_formulario(form_id):
+    """Elimina un ticket y renumera los folios consecutivamente. Solo admins."""
+    auth_header = request.headers.get('Authorization', '')
+    raw_token = auth_header.split(' ')[1] if ' ' in auth_header else None
+    if not raw_token:
+        return jsonify({"error": "No autorizado"}), 401
+    payload = verificar_token(raw_token)
+    if not payload or not payload.get('id'):
+        return jsonify({"error": "Token inválido"}), 401
+
+    conn = obtener_conexion()
+    if not conn:
+        return jsonify({"error": "Sin conexion a BD"}), 500
+    try:
+        cursor_u = conn.cursor(dictionary=True)
+        cursor_u.execute("SELECT rol_id FROM usuarios WHERE id = %s", (payload['id'],))
+        user = cursor_u.fetchone()
+        if not user or user.get('rol_id') != 1:
+            return jsonify({"error": "Solo administradores pueden eliminar tickets"}), 403
+
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM garantia_comentarios WHERE formulario_id = %s", (form_id,))
+        cursor.execute("DELETE FROM garantia_formularios WHERE id = %s", (form_id,))
+        if cursor.rowcount == 0:
+            conn.rollback()
+            return jsonify({"error": "No encontrado"}), 404
+
+        # Renumerar consecutivamente por orden de id ascendente
+        cursor.execute("SELECT id FROM garantia_formularios ORDER BY id ASC")
+        ids = [row[0] for row in cursor.fetchall()]
+        for i, record_id in enumerate(ids, start=1):
+            cursor.execute(
+                "UPDATE garantia_formularios SET folio = %s WHERE id = %s",
+                (f"GAR-{i:04d}", record_id)
+            )
+
+        conn.commit()
+        return jsonify({"ok": True})
+    except Exception as e:
+        conn.rollback()
+        logging.exception("Error al eliminar formulario: %s", e)
+        return jsonify({"error": str(e)}), 500
+    finally:
+        conn.close()
+
+
 @garantias_bp.route("/formulario/<int:form_id>", methods=["GET"])
 def obtener_formulario(form_id):
     conn = obtener_conexion()

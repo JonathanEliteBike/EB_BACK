@@ -1,7 +1,3 @@
-import eventlet
-# Temporarily disable eventlet monkey-patching to avoid possible XML-RPC issues
-# eventlet.monkey_patch()  # Debe estar al inicio del archivo
-
 from flask import Flask
 from flask_cors import CORS
 from socket_instance import socketio
@@ -33,12 +29,16 @@ from routes.forecast import forecast_bp
 from routes.ventas import ventas_bp
 from routes.garantias import garantias_bp
 from routes.proyecciones_my27 import proyecciones_my27_bp
+from routes.importaciones import importaciones_bp
 
 # Importamos la instancia de Celery desde celery_worker
 from celery_worker import celery_app as celery
 
 def create_app():
     app = Flask(__name__)
+
+    # Límite de tamaño para uploads (500 MB — necesario para videos)
+    app.config['MAX_CONTENT_LENGTH'] = 500 * 1024 * 1024
 
     # Vinculamos y configuramos Celery después de crear la app
     celery.conf.update(
@@ -145,6 +145,7 @@ def create_app():
     app.register_blueprint(ventas_bp)
     app.register_blueprint(garantias_bp)
     app.register_blueprint(proyecciones_my27_bp)
+    app.register_blueprint(importaciones_bp)
     return app
 
 app = create_app()
