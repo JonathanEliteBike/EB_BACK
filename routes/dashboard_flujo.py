@@ -4,12 +4,21 @@ from decimal import Decimal
 from datetime import date, datetime
 from collections import defaultdict
 import calendar
-try:
-    import pandas as pd
-    PANDAS_OK = True
-except Exception:
-    pd = None  # type: ignore
-    PANDAS_OK = False
+pd = None
+PANDAS_OK = False
+
+def _get_pandas():
+    global pd, PANDAS_OK
+    if pd is not None:
+        return pd
+    try:
+        import pandas as _pd
+        pd = _pd
+        PANDAS_OK = True
+    except Exception:
+        pd = None
+        PANDAS_OK = False
+    return pd
 from io import BytesIO
 from flask import send_file
 from openpyxl.utils import get_column_letter

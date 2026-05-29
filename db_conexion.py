@@ -9,8 +9,9 @@ db_config = {
     'host': os.getenv('MYSQL_HOST', '127.0.0.1'),
     'user': os.getenv('MYSQL_USER', 'root'),
     'password': os.getenv('MYSQL_PASSWORD', 'root'),
-    'database': os.getenv('MYSQL_DATABASE', 'elite_bike_db'),
-    'port': int(os.getenv('MYSQL_PORT', 3306))
+    'database': os.getenv('MYSQL_DATABASE', 'elite_bike'),
+    'port': int(os.getenv('MYSQL_PORT', 3306)),
+    'connection_timeout': 10,
 }
 
 def obtener_conexion():

@@ -3,6 +3,7 @@ import json
 import logging
 import os
 import uuid
+from datetime import date
 
 from flask import Blueprint, jsonify, request, send_file, redirect
 from services.s3_service import subir_archivo_s3, generar_url_firmada_s3, existe_archivo_s3
@@ -109,6 +110,8 @@ def inicializar_tablas():
             "ALTER TABLE garantia_formularios ADD COLUMN serie_validada TINYINT(1) DEFAULT 0",
             "ALTER TABLE garantia_formularios ADD COLUMN validacion_docs_json LONGTEXT DEFAULT NULL",
             "ALTER TABLE garantia_formularios ADD COLUMN pieza_reemplazo VARCHAR(100) DEFAULT NULL",
+            "ALTER TABLE garantia_formularios ADD COLUMN fecha_estatus DATE DEFAULT NULL",
+            "ALTER TABLE garantia_formularios ADD COLUMN fecha_pieza DATE DEFAULT NULL",
         ]:
             try:
                 cursor.execute(col_sql)
@@ -204,7 +207,8 @@ def lista_formularios():
             SELECT id, folio, email, distribuidor, contacto, puesto, marca,
                    estatus, estatus_pieza, pieza_reemplazo,
                    docs_validados, serie_validada,
-                   validacion_docs_json, fecha_creacion
+                   validacion_docs_json, fecha_creacion,
+                   fecha_estatus, fecha_pieza
             FROM garantia_formularios
             ORDER BY fecha_creacion DESC
         """)
@@ -212,6 +216,10 @@ def lista_formularios():
         for r in rows:
             if r.get('fecha_creacion'):
                 r['fecha_creacion'] = r['fecha_creacion'].strftime('%d/%m/%Y %H:%M')
+            if r.get('fecha_estatus'):
+                r['fecha_estatus'] = r['fecha_estatus'].strftime('%Y-%m-%d')
+            if r.get('fecha_pieza'):
+                r['fecha_pieza'] = r['fecha_pieza'].strftime('%Y-%m-%d')
         return jsonify(rows)
     except Exception as e:
         logging.exception("Error al listar formularios de garantias: %s", e)
@@ -400,6 +408,10 @@ def obtener_formulario(form_id):
             row['fecha_creacion'] = row['fecha_creacion'].strftime('%d/%m/%Y %H:%M')
         if row.get('fecha_actualizacion'):
             row['fecha_actualizacion'] = row['fecha_actualizacion'].strftime('%d/%m/%Y %H:%M')
+        if row.get('fecha_estatus'):
+            row['fecha_estatus'] = row['fecha_estatus'].strftime('%Y-%m-%d')
+        if row.get('fecha_pieza'):
+            row['fecha_pieza'] = row['fecha_pieza'].strftime('%Y-%m-%d')
         if row.get('datos') and isinstance(row['datos'], str):
             row['datos'] = json.loads(row['datos'])
         if row.get('validacion_docs_json') and isinstance(row['validacion_docs_json'], str):
@@ -420,19 +432,47 @@ def actualizar_estatus(form_id):
     try:
         datos = request.get_json(force=True) or {}
         nuevo_estatus = datos.get('estatus', 'Enviado')
+        fecha = datos.get('fecha') or date.today().isoformat()
         cursor = conn.cursor()
         cursor.execute(
-            "UPDATE garantia_formularios SET estatus = %s WHERE id = %s",
-            (nuevo_estatus, form_id)
+            "UPDATE garantia_formularios SET estatus = %s, fecha_estatus = %s WHERE id = %s",
+            (nuevo_estatus, fecha, form_id)
         )
         cursor.execute(
             "INSERT INTO garantia_comentarios (formulario_id, autor, texto, tipo) VALUES (%s,%s,%s,%s)",
-            (form_id, 'Sistema', f'Estatus actualizado a "{nuevo_estatus}"', 'estatus')
+            (form_id, 'Sistema', f'Estatus actualizado a "{nuevo_estatus}" (fecha: {fecha})', 'estatus')
         )
         conn.commit()
-        return jsonify({"ok": True})
+        return jsonify({"ok": True, "fecha_estatus": fecha})
     except Exception as e:
         logging.exception("Error al actualizar estatus: %s", e)
+        return jsonify({"error": str(e)}), 500
+    finally:
+        conn.close()
+
+
+@garantias_bp.route("/formulario/<int:form_id>/fecha-estatus", methods=["PUT"])
+def actualizar_fecha_estatus(form_id):
+    """Edita solo la fecha del estatus actual sin cambiar el estatus."""
+    conn = obtener_conexion()
+    if not conn:
+        return jsonify({"error": "Sin conexion a BD"}), 500
+    try:
+        datos = request.get_json(force=True) or {}
+        fecha = datos.get('fecha') or date.today().isoformat()
+        cursor = conn.cursor()
+        cursor.execute(
+            "UPDATE garantia_formularios SET fecha_estatus = %s WHERE id = %s",
+            (fecha, form_id)
+        )
+        cursor.execute(
+            "INSERT INTO garantia_comentarios (formulario_id, autor, texto, tipo) VALUES (%s,%s,%s,%s)",
+            (form_id, 'Sistema', f'Fecha de estatus corregida a {fecha}', 'estatus')
+        )
+        conn.commit()
+        return jsonify({"ok": True, "fecha_estatus": fecha})
+    except Exception as e:
+        logging.exception("Error al actualizar fecha_estatus: %s", e)
         return jsonify({"error": str(e)}), 500
     finally:
         conn.close()
@@ -472,19 +512,47 @@ def actualizar_pieza(form_id):
     try:
         datos = request.get_json(force=True) or {}
         nuevo_estatus = datos.get('estatus_pieza', 'Sin pieza')
+        fecha = datos.get('fecha') or date.today().isoformat()
         cursor = conn.cursor()
         cursor.execute(
-            "UPDATE garantia_formularios SET estatus_pieza = %s WHERE id = %s",
-            (nuevo_estatus, form_id)
+            "UPDATE garantia_formularios SET estatus_pieza = %s, fecha_pieza = %s WHERE id = %s",
+            (nuevo_estatus, fecha, form_id)
         )
         cursor.execute(
             "INSERT INTO garantia_comentarios (formulario_id, autor, texto, tipo) VALUES (%s, %s, %s, %s)",
-            (form_id, 'Sistema', f'Estado de pieza actualizado a "{nuevo_estatus}"', 'pieza')
+            (form_id, 'Sistema', f'Estado de pieza actualizado a "{nuevo_estatus}" (fecha: {fecha})', 'pieza')
         )
         conn.commit()
-        return jsonify({"ok": True})
+        return jsonify({"ok": True, "fecha_pieza": fecha})
     except Exception as e:
         logging.exception("Error al actualizar pieza: %s", e)
+        return jsonify({"error": str(e)}), 500
+    finally:
+        conn.close()
+
+
+@garantias_bp.route("/formulario/<int:form_id>/fecha-pieza", methods=["PUT"])
+def actualizar_fecha_pieza(form_id):
+    """Edita solo la fecha del estatus de pieza sin cambiar el estatus."""
+    conn = obtener_conexion()
+    if not conn:
+        return jsonify({"error": "Sin conexion a BD"}), 500
+    try:
+        datos = request.get_json(force=True) or {}
+        fecha = datos.get('fecha') or date.today().isoformat()
+        cursor = conn.cursor()
+        cursor.execute(
+            "UPDATE garantia_formularios SET fecha_pieza = %s WHERE id = %s",
+            (fecha, form_id)
+        )
+        cursor.execute(
+            "INSERT INTO garantia_comentarios (formulario_id, autor, texto, tipo) VALUES (%s, %s, %s, %s)",
+            (form_id, 'Sistema', f'Fecha de pieza corregida a {fecha}', 'pieza')
+        )
+        conn.commit()
+        return jsonify({"ok": True, "fecha_pieza": fecha})
+    except Exception as e:
+        logging.exception("Error al actualizar fecha_pieza: %s", e)
         return jsonify({"error": str(e)}), 500
     finally:
         conn.close()
@@ -785,7 +853,10 @@ def get_latencias():
             SELECT
                 f.id, f.folio, f.estatus, f.distribuidor,
                 CASE WHEN f.estatus IN ('Cerrado','Rechazado')
-                     THEN DATEDIFF(f.fecha_actualizacion, f.fecha_creacion)
+                     THEN DATEDIFF(
+                         COALESCE(f.fecha_estatus, DATE(f.fecha_actualizacion)),
+                         DATE(f.fecha_creacion)
+                     )
                      ELSE NULL END AS lat_cierre,
                 MIN(CASE WHEN c.tipo = 'validacion' AND DATEDIFF(c.fecha, f.fecha_creacion) >= 0
                          THEN DATEDIFF(c.fecha, f.fecha_creacion)
@@ -793,7 +864,7 @@ def get_latencias():
             FROM garantia_formularios f
             LEFT JOIN garantia_comentarios c ON c.formulario_id = f.id
             GROUP BY f.id, f.folio, f.estatus, f.distribuidor,
-                     f.fecha_creacion, f.fecha_actualizacion
+                     f.fecha_creacion, f.fecha_actualizacion, f.fecha_estatus
             ORDER BY f.fecha_creacion DESC
         """)
         rows = cursor.fetchall()

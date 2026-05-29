@@ -1,19 +1,28 @@
 from flask import Blueprint, jsonify
 from db_conexion import obtener_conexion
 from flask import request
-import mysql.connector
+import pymysql as mysql_connector_compat
 import jwt
 import json
 from werkzeug.utils import secure_filename
 import os
 from datetime import datetime
 from utils.tiempo import ahora_mx, ahora_str
-try:
-    import pandas as pd
-    PANDAS_OK = True
-except Exception:
-    pd = None  # type: ignore
-    PANDAS_OK = False
+pd = None
+PANDAS_OK = False
+
+def _get_pandas():
+    global pd, PANDAS_OK
+    if pd is not None:
+        return pd
+    try:
+        import pandas as _pd
+        pd = _pd
+        PANDAS_OK = True
+    except Exception:
+        pd = None
+        PANDAS_OK = False
+    return pd
 import traceback
 try:
     import numpy as np
@@ -263,7 +272,7 @@ def agregar_proyecciones_cliente():
             ]) for p in data)
         }), 201
 
-    except mysql.connector.Error as err:
+    except mysql_connector_compat.Error as err:
         print("Error al insertar proyecciones:", str(err))
         conexion.rollback()
         return jsonify({"error": "Error al insertar proyecciones"}), 500
@@ -1180,7 +1189,7 @@ def manejar_autoguardado():
         else:
             return jsonify({"error": "Acción no válida"}), 400
 
-    except mysql.connector.Error as err:
+    except mysql_connector_compat.Error as err:
         print("Error en autoguardado:", str(err))
         conexion.rollback()
         return jsonify({"error": "Error en el servidor"}), 500

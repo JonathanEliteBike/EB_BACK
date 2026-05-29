@@ -138,7 +138,7 @@ def obtener_deducciones_odoo(claves_db, fechas_por_clave):
         return resultados_por_clave
 
     except Exception as e:
-        print(f"❌ Error Odoo: {e}")
+        print(f"Error Odoo: {e}")
         traceback.print_exc()
         return {}
 
@@ -151,7 +151,7 @@ def ejecutar_sincronizacion_y_calculos():
     cursor_dict = conexion.cursor(dictionary=True)
     cursor = conexion.cursor() 
     try:
-        print("🔵 Auto-sincronizando Odoo y calculando matemáticas...")
+        print("Auto-sincronizando Odoo y calculando matematicas...")
         
         # OBTENEMOS LAS CLAVES Y SUS FECHAS ESPECÍFICAS HACIENDO UN JOIN
         cursor_dict.execute("""
@@ -280,7 +280,7 @@ def ejecutar_sincronizacion_y_calculos():
         conexion.commit()
     except Exception as e:
         if conexion: conexion.rollback()
-        print(f"❌ Error en auto-sync: {e}")
+        print(f"Error en auto-sync: {e}")
     finally:
         if cursor_dict: cursor_dict.close()
         if cursor: cursor.close()

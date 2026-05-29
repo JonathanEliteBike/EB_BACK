@@ -68,7 +68,7 @@ def obtener_ultima_actualizacion():
         t1 = time.time()
         conexion = obtener_conexion()
         t2 = time.time()
-        print(f"⏱️ Tiempo Conexión: {t2 - t1:.4f} seg") # ¿Aquí tarda 14s?
+        print(f"Tiempo Conexion: {t2 - t1:.4f} seg")
 
         cursor = conexion.cursor(dictionary=True)
         
@@ -79,10 +79,10 @@ def obtener_ultima_actualizacion():
         cursor.execute(consulta)
         resultado = cursor.fetchone()
         t4 = time.time()
-        print(f"⏱️ Tiempo SQL: {t4 - t3:.4f} seg") # ¿O aquí?
+        print(f"Tiempo SQL: {t4 - t3:.4f} seg")
         
         t_total = time.time() - t_inicio
-        print(f"🚀 TIEMPO TOTAL API: {t_total:.4f} seg")
+        print(f"TIEMPO TOTAL API: {t_total:.4f} seg")
 
         if resultado and resultado['ultima_fecha']:
             return jsonify({
@@ -762,67 +762,210 @@ def sync_monitor_odoo():
 
 def _recalcular_acumulados_previo(conexion, cursor):
     """
-    Lee la tabla monitor agrupada por contacto_referencia y actualiza en previo:
-      - acumulado_anticipado  (total general)
-      - acumulado_syncros     (marca = SYNCROS)
-      - acumulado_apparel     (apparel = SI)
-      - acumulado_vittoria    (marca = VITTORIA)
-      - acumulado_bold        (marca = BOLD)
-    Para filas integrales suma los montos de todos los miembros del grupo.
+    Actualiza previo con los avances de cumplimiento calculados desde monitor.
+
+    Solo cuentan para cumplimiento:
+      - SCOTT: bicicletas SCOTT / MEGAMO / BOLD (subcategoria=BICICLETA o nombre contiene BICICLETA)
+      - APP:   SYNCROS (marca) + APPAREL (apparel=SI) + VITTORIA (marca)  — NO total-scott
+
+    El campo acumulado_anticipado = SCOTT + APP (no el total bruto del monitor).
+    Aplica f_inicio por cliente desde la tabla clientes (default 2025-07-01).
+    El primer periodo (jul_ago) arranca desde f_inicio, no desde el 1 de julio,
+    lo que permite contabilizar correctamente a distribuidores con inicio anticipado.
+    Para filas integrales suma los miembros del grupo.
     Retorna el número de filas actualizadas.
     """
-    # Totales por clave desde monitor
-    cursor.execute("""
+    DEFAULT_INICIO = '2025-07-01'
+
+    SCOTT_COND = """
+        m.marca IN ('SCOTT', 'MEGAMO', 'BOLD')
+        AND (m.subcategoria = 'BICICLETA' OR m.nombre_producto LIKE '%%BICICLETA%%')
+        AND (m.apparel = 'NO'            OR m.nombre_producto LIKE '%%BICICLETA%%')
+    """
+
+    cursor.execute(f"""
         SELECT
-            contacto_referencia AS clave,
-            SUM(venta_total)                                          AS total,
-            SUM(CASE WHEN marca = 'SYNCROS'  THEN venta_total ELSE 0 END) AS syncros,
-            SUM(CASE WHEN apparel = 'SI'     THEN venta_total ELSE 0 END) AS apparel,
-            SUM(CASE WHEN marca = 'VITTORIA' THEN venta_total ELSE 0 END) AS vittoria,
-            SUM(CASE WHEN marca = 'BOLD'     THEN venta_total ELSE 0 END) AS bold
-        FROM monitor
-        WHERE contacto_referencia IS NOT NULL AND contacto_referencia != ''
-        GROUP BY contacto_referencia
-    """)
+            m.contacto_referencia AS clave,
+            -- Acumulados de sub-marcas (sin filtro de fecha mas alla de f_inicio)
+            SUM(m.venta_total)                                                          AS total_bruto,
+            SUM(CASE WHEN m.marca = 'SYNCROS'  THEN m.venta_total ELSE 0 END)          AS syncros,
+            SUM(CASE WHEN m.apparel = 'SI'     THEN m.venta_total ELSE 0 END)          AS apparel,
+            SUM(CASE WHEN m.marca = 'VITTORIA' THEN m.venta_total ELSE 0 END)          AS vittoria,
+            SUM(CASE WHEN m.marca = 'BOLD'
+                          AND (m.subcategoria = 'BICICLETA' OR m.nombre_producto LIKE '%%BICICLETA%%')
+                          AND (m.apparel = 'NO'            OR m.nombre_producto LIKE '%%BICICLETA%%')
+                     THEN m.venta_total ELSE 0 END)                                     AS bold,
+            -- SCOTT bicicletas: total y por periodo
+            SUM(CASE WHEN {SCOTT_COND} THEN m.venta_total ELSE 0 END)                  AS scott,
+            SUM(CASE WHEN m.fecha_factura <= '2025-08-31'
+                          AND {SCOTT_COND} THEN m.venta_total ELSE 0 END)              AS scott_jul_ago,
+            SUM(CASE WHEN m.fecha_factura BETWEEN '2025-09-01' AND '2025-10-31'
+                          AND {SCOTT_COND} THEN m.venta_total ELSE 0 END)              AS scott_sep_oct,
+            SUM(CASE WHEN m.fecha_factura BETWEEN '2025-11-01' AND '2025-12-31'
+                          AND {SCOTT_COND} THEN m.venta_total ELSE 0 END)              AS scott_nov_dic,
+            SUM(CASE WHEN m.fecha_factura BETWEEN '2026-01-01' AND '2026-02-28'
+                          AND {SCOTT_COND} THEN m.venta_total ELSE 0 END)              AS scott_ene_feb,
+            SUM(CASE WHEN m.fecha_factura BETWEEN '2026-03-01' AND '2026-04-30'
+                          AND {SCOTT_COND} THEN m.venta_total ELSE 0 END)              AS scott_mar_abr,
+            SUM(CASE WHEN m.fecha_factura BETWEEN '2026-05-01' AND '2026-06-30'
+                          AND {SCOTT_COND} THEN m.venta_total ELSE 0 END)              AS scott_may_jun,
+            -- SYNCROS por periodo
+            SUM(CASE WHEN m.fecha_factura <= '2025-08-31'
+                          AND m.marca = 'SYNCROS' THEN m.venta_total ELSE 0 END)       AS syncros_jul_ago,
+            SUM(CASE WHEN m.fecha_factura BETWEEN '2025-09-01' AND '2025-10-31'
+                          AND m.marca = 'SYNCROS' THEN m.venta_total ELSE 0 END)       AS syncros_sep_oct,
+            SUM(CASE WHEN m.fecha_factura BETWEEN '2025-11-01' AND '2025-12-31'
+                          AND m.marca = 'SYNCROS' THEN m.venta_total ELSE 0 END)       AS syncros_nov_dic,
+            SUM(CASE WHEN m.fecha_factura BETWEEN '2026-01-01' AND '2026-02-28'
+                          AND m.marca = 'SYNCROS' THEN m.venta_total ELSE 0 END)       AS syncros_ene_feb,
+            SUM(CASE WHEN m.fecha_factura BETWEEN '2026-03-01' AND '2026-04-30'
+                          AND m.marca = 'SYNCROS' THEN m.venta_total ELSE 0 END)       AS syncros_mar_abr,
+            SUM(CASE WHEN m.fecha_factura BETWEEN '2026-05-01' AND '2026-06-30'
+                          AND m.marca = 'SYNCROS' THEN m.venta_total ELSE 0 END)       AS syncros_may_jun,
+            -- APPAREL (apparel=SI) por periodo
+            SUM(CASE WHEN m.fecha_factura <= '2025-08-31'
+                          AND m.apparel = 'SI' THEN m.venta_total ELSE 0 END)          AS apparel_jul_ago,
+            SUM(CASE WHEN m.fecha_factura BETWEEN '2025-09-01' AND '2025-10-31'
+                          AND m.apparel = 'SI' THEN m.venta_total ELSE 0 END)          AS apparel_sep_oct,
+            SUM(CASE WHEN m.fecha_factura BETWEEN '2025-11-01' AND '2025-12-31'
+                          AND m.apparel = 'SI' THEN m.venta_total ELSE 0 END)          AS apparel_nov_dic,
+            SUM(CASE WHEN m.fecha_factura BETWEEN '2026-01-01' AND '2026-02-28'
+                          AND m.apparel = 'SI' THEN m.venta_total ELSE 0 END)          AS apparel_ene_feb,
+            SUM(CASE WHEN m.fecha_factura BETWEEN '2026-03-01' AND '2026-04-30'
+                          AND m.apparel = 'SI' THEN m.venta_total ELSE 0 END)          AS apparel_mar_abr,
+            SUM(CASE WHEN m.fecha_factura BETWEEN '2026-05-01' AND '2026-06-30'
+                          AND m.apparel = 'SI' THEN m.venta_total ELSE 0 END)          AS apparel_may_jun,
+            -- VITTORIA por periodo
+            SUM(CASE WHEN m.fecha_factura <= '2025-08-31'
+                          AND m.marca = 'VITTORIA' THEN m.venta_total ELSE 0 END)      AS vittoria_jul_ago,
+            SUM(CASE WHEN m.fecha_factura BETWEEN '2025-09-01' AND '2025-10-31'
+                          AND m.marca = 'VITTORIA' THEN m.venta_total ELSE 0 END)      AS vittoria_sep_oct,
+            SUM(CASE WHEN m.fecha_factura BETWEEN '2025-11-01' AND '2025-12-31'
+                          AND m.marca = 'VITTORIA' THEN m.venta_total ELSE 0 END)      AS vittoria_nov_dic,
+            SUM(CASE WHEN m.fecha_factura BETWEEN '2026-01-01' AND '2026-02-28'
+                          AND m.marca = 'VITTORIA' THEN m.venta_total ELSE 0 END)      AS vittoria_ene_feb,
+            SUM(CASE WHEN m.fecha_factura BETWEEN '2026-03-01' AND '2026-04-30'
+                          AND m.marca = 'VITTORIA' THEN m.venta_total ELSE 0 END)      AS vittoria_mar_abr,
+            SUM(CASE WHEN m.fecha_factura BETWEEN '2026-05-01' AND '2026-06-30'
+                          AND m.marca = 'VITTORIA' THEN m.venta_total ELSE 0 END)      AS vittoria_may_jun
+        FROM monitor m
+        LEFT JOIN clientes c ON m.contacto_referencia = c.clave
+        WHERE m.contacto_referencia IS NOT NULL
+          AND m.contacto_referencia != ''
+          AND m.fecha_factura >= COALESCE(c.f_inicio, %s)
+        GROUP BY m.contacto_referencia
+    """, (DEFAULT_INICIO,))
     totales = {row['clave']: row for row in cursor.fetchall()}
 
-    # Miembros de grupos integrales
     cursor.execute("SELECT clave, id_grupo FROM clientes WHERE id_grupo IS NOT NULL")
     miembros_grupo = {}
     for row in cursor.fetchall():
         miembros_grupo.setdefault(row['id_grupo'], []).append(row['clave'])
 
-    # Filas de previo
-    cursor.execute("SELECT id, clave, es_integral, grupo_integral FROM previo")
+    cursor.execute("""
+        SELECT id, clave, es_integral, grupo_integral,
+               compromiso_scott, compromiso_apparel_syncros_vittoria,
+               compromiso_jul_ago,     compromiso_sep_oct,     compromiso_nov_dic,
+               compromiso_ene_feb,     compromiso_mar_abr,     compromiso_may_jun,
+               compromiso_jul_ago_app, compromiso_sep_oct_app, compromiso_nov_dic_app,
+               compromiso_ene_feb_app, compromiso_mar_abr_app, compromiso_may_jun_app,
+               compra_minima_inicial,  compra_minima_anual
+        FROM previo
+    """)
     filas = cursor.fetchall()
+
+    PERIODS = ['jul_ago', 'sep_oct', 'nov_dic', 'ene_feb', 'mar_abr', 'may_jun']
+
+    def flt(v):
+        return float(v or 0)
+
+    def pct(avance, compromiso):
+        return int(round(avance / compromiso * 100)) if compromiso > 0 else 0
+
+    def sf(claves, field):
+        return sum(flt(totales.get(c, {}).get(field, 0)) for c in claves)
 
     actualizados = 0
     for fila in filas:
         if fila['es_integral']:
             grupo_id = fila['grupo_integral']
-            claves = miembros_grupo.get(grupo_id, [])
-            total     = sum(float(totales.get(c, {}).get('total', 0) or 0)    for c in claves)
-            syncros   = sum(float(totales.get(c, {}).get('syncros', 0) or 0)  for c in claves)
-            apparel   = sum(float(totales.get(c, {}).get('apparel', 0) or 0)  for c in claves)
-            vittoria  = sum(float(totales.get(c, {}).get('vittoria', 0) or 0) for c in claves)
-            bold      = sum(float(totales.get(c, {}).get('bold', 0) or 0)     for c in claves)
+            claves   = miembros_grupo.get(grupo_id, [])
+            syncros  = sf(claves, 'syncros')
+            apparel  = sf(claves, 'apparel')
+            vittoria = sf(claves, 'vittoria')
+            bold     = sf(claves, 'bold')
+            scott    = sf(claves, 'scott')
+            p_syncros  = {p: sf(claves, f'syncros_{p}')  for p in PERIODS}
+            p_apparel  = {p: sf(claves, f'apparel_{p}')  for p in PERIODS}
+            p_vittoria = {p: sf(claves, f'vittoria_{p}') for p in PERIODS}
+            p_scott    = {p: sf(claves, f'scott_{p}')    for p in PERIODS}
         else:
-            row = totales.get(fila['clave']) or {}
-            total    = float(row.get('total', 0)    or 0)
-            syncros  = float(row.get('syncros', 0)  or 0)
-            apparel  = float(row.get('apparel', 0)  or 0)
-            vittoria = float(row.get('vittoria', 0) or 0)
-            bold     = float(row.get('bold', 0)     or 0)
+            row      = totales.get(fila['clave']) or {}
+            syncros  = flt(row.get('syncros'))
+            apparel  = flt(row.get('apparel'))
+            vittoria = flt(row.get('vittoria'))
+            bold     = flt(row.get('bold'))
+            scott    = flt(row.get('scott'))
+            p_syncros  = {p: flt(row.get(f'syncros_{p}'))  for p in PERIODS}
+            p_apparel  = {p: flt(row.get(f'apparel_{p}'))  for p in PERIODS}
+            p_vittoria = {p: flt(row.get(f'vittoria_{p}')) for p in PERIODS}
+            p_scott    = {p: flt(row.get(f'scott_{p}'))    for p in PERIODS}
+
+        # APP = SYNCROS + APPAREL + VITTORIA (componentes/kits/remplazos NO cuentan)
+        app_global = round(syncros + apparel + vittoria, 2)
+        acum_total = round(scott + app_global, 2)
+        p_app = {p: round(p_syncros[p] + p_apparel[p] + p_vittoria[p], 2) for p in PERIODS}
+
+        cm_ini = flt(fila.get('compra_minima_inicial'))
+        cm_anu = flt(fila.get('compra_minima_anual'))
 
         cursor.execute("""
             UPDATE previo SET
-                acumulado_anticipado = %s,
-                acumulado_syncros    = %s,
-                acumulado_apparel    = %s,
-                acumulado_vittoria   = %s,
-                acumulado_bold       = %s
+                acumulado_anticipado                   = %s,
+                acumulado_syncros                      = %s,
+                acumulado_apparel                      = %s,
+                acumulado_vittoria                     = %s,
+                acumulado_bold                         = %s,
+                avance_global                          = %s,
+                avance_global_scott                    = %s,
+                avance_global_apparel_syncros_vittoria = %s,
+                porcentaje_global                      = %s,
+                porcentaje_anual                       = %s,
+                porcentaje_scott                       = %s,
+                porcentaje_apparel_syncros_vittoria    = %s,
+                avance_jul_ago     = %s,  porcentaje_jul_ago     = %s,
+                avance_sep_oct     = %s,  porcentaje_sep_oct     = %s,
+                avance_nov_dic     = %s,  porcentaje_nov_dic     = %s,
+                avance_ene_feb     = %s,  porcentaje_ene_feb     = %s,
+                avance_mar_abr     = %s,  porcentaje_mar_abr     = %s,
+                avance_may_jun     = %s,  porcentaje_may_jun     = %s,
+                avance_jul_ago_app = %s,  porcentaje_jul_ago_app = %s,
+                avance_sep_oct_app = %s,  porcentaje_sep_oct_app = %s,
+                avance_nov_dic_app = %s,  porcentaje_nov_dic_app = %s,
+                avance_ene_feb_app = %s,  porcentaje_ene_feb_app = %s,
+                avance_mar_abr_app = %s,  porcentaje_mar_abr_app = %s,
+                avance_may_jun_app = %s,  porcentaje_may_jun_app = %s
             WHERE id = %s
-        """, (total, syncros, apparel, vittoria, bold, fila['id']))
+        """, (
+            acum_total, syncros, apparel, vittoria, bold,
+            acum_total, scott, app_global,
+            pct(acum_total, cm_ini), pct(acum_total, cm_anu),
+            pct(scott,      flt(fila.get('compromiso_scott'))),
+            pct(app_global, flt(fila.get('compromiso_apparel_syncros_vittoria'))),
+            p_scott['jul_ago'], pct(p_scott['jul_ago'], flt(fila.get('compromiso_jul_ago'))),
+            p_scott['sep_oct'], pct(p_scott['sep_oct'], flt(fila.get('compromiso_sep_oct'))),
+            p_scott['nov_dic'], pct(p_scott['nov_dic'], flt(fila.get('compromiso_nov_dic'))),
+            p_scott['ene_feb'], pct(p_scott['ene_feb'], flt(fila.get('compromiso_ene_feb'))),
+            p_scott['mar_abr'], pct(p_scott['mar_abr'], flt(fila.get('compromiso_mar_abr'))),
+            p_scott['may_jun'], pct(p_scott['may_jun'], flt(fila.get('compromiso_may_jun'))),
+            p_app['jul_ago'],   pct(p_app['jul_ago'],   flt(fila.get('compromiso_jul_ago_app'))),
+            p_app['sep_oct'],   pct(p_app['sep_oct'],   flt(fila.get('compromiso_sep_oct_app'))),
+            p_app['nov_dic'],   pct(p_app['nov_dic'],   flt(fila.get('compromiso_nov_dic_app'))),
+            p_app['ene_feb'],   pct(p_app['ene_feb'],   flt(fila.get('compromiso_ene_feb_app'))),
+            p_app['mar_abr'],   pct(p_app['mar_abr'],   flt(fila.get('compromiso_mar_abr_app'))),
+            p_app['may_jun'],   pct(p_app['may_jun'],   flt(fila.get('compromiso_may_jun_app'))),
+            fila['id']
+        ))
         actualizados += 1
 
     conexion.commit()
