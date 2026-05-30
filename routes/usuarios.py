@@ -13,16 +13,17 @@ usuarios_bp = Blueprint('usuarios', __name__, url_prefix='/usuarios')
 
 @usuarios_bp.route('/para-monitor', methods=['GET'])
 def usuarios_para_monitor():
-    """Devuelve TODOS los clientes (tengan o no usuario vinculado) junto con su grupo
-    para que el administrador pueda seleccionarlos en el Monitor de Pedidos."""
+    """Devuelve los clientes dados de alta correctamente en el monitor (tienen evac,
+    nivel y f_inicio configurados) junto con su grupo. Los registros importados
+    automáticamente desde Odoo que solo tienen clave y nombre se excluyen."""
     conexion = None
     cursor = None
     try:
         conexion = obtener_conexion()
         cursor = conexion.cursor(dictionary=True)
-        
-        # 1. Partimos de clientes (c) y hacemos LEFT JOIN a usuarios (u)
-        # 2. UNION con usuarios que no tienen cliente vinculado (admins/internos)
+
+        # Solo clientes con datos completos (dados de alta manualmente).
+        # Los auto-importados de Odoo tienen evac, nivel y f_inicio en NULL.
         cursor.execute("""
             SELECT
                 c.id AS id_cliente,
@@ -39,6 +40,9 @@ def usuarios_para_monitor():
             LEFT JOIN usuarios u ON u.cliente_id = c.id
             LEFT JOIN grupo_clientes g ON c.id_grupo = g.id
             LEFT JOIN (SELECT DISTINCT clave_cliente FROM forecast_proyecciones) fp ON fp.clave_cliente = c.clave
+            WHERE c.evac IS NOT NULL AND c.evac != ''
+              AND c.nivel IS NOT NULL AND c.nivel != ''
+              AND c.f_inicio IS NOT NULL
 
             UNION
 
@@ -98,82 +102,45 @@ def usuarios_para_monitor():
 @usuarios_bp.route('/sync-odoo', methods=['POST'])
 def sync_clientes_desde_odoo():
     """
-    Sincroniza partners de Odoo hacia la tabla local `clientes`.
-    Solo agrega registros nuevos (por clave/ref); no modifica los existentes.
-    Retorna { agregados, ya_existian, total_odoo }.
+    Verifica qué clientes del monitor están enlazados con Odoo por clave (ref).
+    NO agrega ni modifica clientes. Solo reporta el estado del enlace.
+    Para agregar un cliente nuevo: registrarlo manualmente en el monitor
+    con la clave que tenga asignada en Odoo; el siguiente sync lo detectará.
+    Retorna { enlazados, sin_match, total_monitor }.
     """
     try:
         uid, models, err = get_odoo_models()
         if not uid:
             return jsonify({'error': 'No se pudo conectar a Odoo', 'detail': err}), 500
 
-        # Partners de Odoo con customer_rank > 0 (son clientes reales)
-        partners = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD,
-            'res.partner', 'search_read',
-            [[['customer_rank', '>', 0]]],
-            {'fields': ['id', 'ref', 'name'], 'limit': 0})
-
-        if not partners:
-            return jsonify({'agregados': 0, 'ya_existian': 0, 'total_odoo': 0}), 200
-
         conexion = obtener_conexion()
         cursor = conexion.cursor(dictionary=True)
 
-        # Claves ya existentes en local
-        cursor.execute("SELECT clave FROM clientes")
-        claves_locales = {r['clave'].strip().upper() for r in cursor.fetchall()}
-
-        agregados = 0
-        ya_existian = 0
-        actualizados = 0
-
-        for p in partners:
-            ref    = (p.get('ref') or '').strip().upper()
-            nombre = (p.get('name') or '').strip().upper()
-            clave_odoo = f"ODOO{p['id']}"
-
-            if ref:
-                # Partner ya tiene clave real
-                if ref in claves_locales:
-                    ya_existian += 1
-                elif clave_odoo in claves_locales:
-                    # Tenía clave temporal → actualizar a la real
-                    cursor.execute(
-                        "UPDATE clientes SET clave = %s, nombre_cliente = %s WHERE clave = %s",
-                        (ref, nombre, clave_odoo)
-                    )
-                    claves_locales.discard(clave_odoo)
-                    claves_locales.add(ref)
-                    actualizados += 1
-                else:
-                    cursor.execute(
-                        "INSERT IGNORE INTO clientes (clave, nombre_cliente) VALUES (%s, %s)",
-                        (ref, nombre)
-                    )
-                    claves_locales.add(ref)
-                    agregados += 1
-            else:
-                # Sin ref → clave temporal ODOO{id}
-                if clave_odoo in claves_locales or ref in claves_locales:
-                    ya_existian += 1
-                    continue
-                cursor.execute(
-                    "INSERT IGNORE INTO clientes (clave, nombre_cliente) VALUES (%s, %s)",
-                    (clave_odoo, nombre)
-                )
-                claves_locales.add(clave_odoo)
-                agregados += 1
-
-        conexion.commit()
+        # Clientes registrados en el monitor
+        cursor.execute("SELECT clave FROM clientes WHERE clave IS NOT NULL AND clave != ''")
+        claves_monitor = [r['clave'].strip().upper() for r in cursor.fetchall()]
         cursor.close()
         conexion.close()
 
-        logging.info('sync-odoo: %d agregados, %d actualizados, %d ya existían', agregados, actualizados, ya_existian)
+        if not claves_monitor:
+            return jsonify({'enlazados': 0, 'sin_match': 0, 'total_monitor': 0}), 200
+
+        # Buscar en Odoo solo los partners cuya ref coincida con alguna clave del monitor
+        partners = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD,
+            'res.partner', 'search_read',
+            [[['ref', 'in', claves_monitor]]],
+            {'fields': ['ref'], 'limit': 0})
+
+        refs_en_odoo = {(p.get('ref') or '').strip().upper() for p in partners}
+
+        enlazados  = sum(1 for c in claves_monitor if c in refs_en_odoo)
+        sin_match  = len(claves_monitor) - enlazados
+
+        logging.info('sync-odoo: %d/%d clientes enlazados con Odoo', enlazados, len(claves_monitor))
         return jsonify({
-            'agregados':    agregados,
-            'actualizados': actualizados,
-            'ya_existian':  ya_existian,
-            'total_odoo':   len(partners),
+            'enlazados':     enlazados,
+            'sin_match':     sin_match,
+            'total_monitor': len(claves_monitor),
         }), 200
 
     except Exception as e:
