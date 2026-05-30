@@ -147,7 +147,15 @@ def recalcular_previo_async():
     Tarea asíncrona para recalcular la tabla previo.
     """
     try:
-        logging.info(f"BASE_DIR Celery: {BASE_DIR}")
+        import os
+        import sys
+
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+
+        if base_dir not in sys.path:
+            sys.path.insert(0, base_dir)
+
+        logging.info(f"BASE_DIR Celery: {base_dir}")
         logging.info(f"sys.path Celery: {sys.path}")
 
         from tasks_previo import recalcular_previo

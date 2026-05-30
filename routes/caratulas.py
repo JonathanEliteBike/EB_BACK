@@ -333,6 +333,11 @@ def obtener_datos_previo():
                     'LD653','MD680','ID492',
                     'LD660','NA718','7C042'
                 )
+                AND nombre_cliente IS NOT NULL
+                AND nombre_cliente <> ''
+                AND nivel IS NOT NULL
+                AND nivel <> ''
+                AND clave NOT LIKE 'ODOO%'
             """)
             resultados = cursor.fetchall()
             
@@ -345,6 +350,223 @@ def obtener_datos_previo():
         return jsonify(resultados), 200
     except Exception as e:
         return jsonify({'error': str(e)}), 500
+    finally:
+        if cursor:
+            cursor.close()
+        if conexion and conexion.is_connected():
+            conexion.close()
+
+@caratulas_bp.route('/debug-caratula-global-otros', methods=['GET'])
+def debug_caratula_global_otros():
+    conexion = None
+    cursor = None
+
+    try:
+        conexion = obtener_conexion()
+        cursor = conexion.cursor(dictionary=True)
+
+        claves_excluidas = (
+            'JC539','EC216','LC657',
+            'GC411','MC679','MC677',
+            'LC625','LC626','LC627',
+            'LD653','MD680','ID492',
+            'LD660','NA718','7C042'
+        )
+
+        placeholders = ",".join(["%s"] * len(claves_excluidas))
+
+        # 1) Resumen por cliente desde previo
+        cursor.execute(f"""
+            SELECT
+                clave,
+                nombre_cliente,
+                acumulado_anticipado,
+                avance_global_scott,
+                acumulado_bold,
+                avance_global_apparel_syncros_vittoria,
+                (
+                    COALESCE(avance_global_scott, 0)
+                    + COALESCE(acumulado_bold, 0)
+                    + COALESCE(avance_global_apparel_syncros_vittoria, 0)
+                ) AS suma_categorias,
+                (
+                    COALESCE(acumulado_anticipado, 0)
+                    -
+                    (
+                        COALESCE(avance_global_scott, 0)
+                        + COALESCE(acumulado_bold, 0)
+                        + COALESCE(avance_global_apparel_syncros_vittoria, 0)
+                    )
+                ) AS diferencia
+            FROM previo
+            WHERE clave NOT IN ({placeholders})
+            AND nombre_cliente IS NOT NULL
+            AND nombre_cliente <> ''
+            AND nivel IS NOT NULL
+            AND nivel <> ''
+            AND clave NOT LIKE 'ODOO%'
+            HAVING ABS(diferencia) > 1
+            ORDER BY diferencia DESC
+        """, claves_excluidas)
+
+        clientes_con_diferencia = cursor.fetchall()
+
+        claves_con_diferencia = [
+            row["clave"] for row in clientes_con_diferencia
+            if row.get("clave") and not str(row.get("clave")).startswith("Integral")
+        ]
+
+        # 2) Si no hay claves normales, devolver solo resumen
+        if not claves_con_diferencia:
+            return jsonify({
+                "mensaje": "No se encontraron clientes normales con diferencia. Solo hay integrales o no hay diferencia.",
+                "clientes_con_diferencia": clientes_con_diferencia
+            }), 200
+
+        placeholders_clientes = ",".join(["%s"] * len(claves_con_diferencia))
+
+        # 3) Clasificación por marca/categoría desde monitor_odoo
+        cursor.execute(f"""
+            SELECT
+                CASE
+                    WHEN UPPER(COALESCE(marca, '')) = 'SCOTT'
+                         AND UPPER(COALESCE(apparel, '')) = 'SI'
+                        THEN 'APPAREL'
+
+                    WHEN UPPER(COALESCE(marca, '')) = 'SCOTT'
+                         AND UPPER(COALESCE(apparel, '')) <> 'SI'
+                        THEN 'SCOTT'
+
+                    WHEN UPPER(COALESCE(marca, '')) = 'BOLD'
+                        THEN 'BOLD'
+
+                    WHEN UPPER(COALESCE(marca, '')) = 'SYNCROS'
+                        THEN 'SYNCROS'
+
+                    WHEN UPPER(COALESCE(marca, '')) = 'VITTORIA'
+                        THEN 'VITTORIA'
+
+                    WHEN UPPER(COALESCE(categoria_producto, '')) LIKE 'SCOTT / APPAREL%%'
+                        THEN 'APPAREL_CATEGORIA_SIN_MARCA'
+
+                    WHEN UPPER(COALESCE(categoria_producto, '')) LIKE 'SCOTT%%'
+                        THEN 'SCOTT_CATEGORIA_SIN_MARCA'
+
+                    WHEN UPPER(COALESCE(categoria_producto, '')) LIKE 'BOLD%%'
+                        THEN 'BOLD_CATEGORIA_SIN_MARCA'
+
+                    WHEN UPPER(COALESCE(categoria_producto, '')) LIKE 'SYNCROS%%'
+                        THEN 'SYNCROS_CATEGORIA_SIN_MARCA'
+
+                    WHEN UPPER(COALESCE(categoria_producto, '')) LIKE 'VITTORIA%%'
+                        THEN 'VITTORIA_CATEGORIA_SIN_MARCA'
+
+                    WHEN UPPER(COALESCE(categoria_producto, '')) LIKE 'SERVICIOS%%'
+                        THEN 'SERVICIOS'
+
+                    WHEN COALESCE(marca, '') = ''
+                         AND COALESCE(categoria_producto, '') = ''
+                        THEN 'SIN_MARCA_SIN_CATEGORIA'
+
+                    ELSE 'OTROS'
+                END AS clasificacion_debug,
+
+                COALESCE(marca, '') AS marca,
+                COALESCE(subcategoria, '') AS subcategoria,
+                COALESCE(apparel, '') AS apparel,
+                COALESCE(eride, '') AS eride,
+                COALESCE(categoria_producto, '') AS categoria_producto,
+
+                COUNT(*) AS registros,
+                ROUND(SUM(COALESCE(venta_total, 0)), 2) AS total
+            FROM monitor_odoo
+            WHERE contacto_referencia IN ({placeholders_clientes})
+            GROUP BY
+                clasificacion_debug,
+                marca,
+                subcategoria,
+                apparel,
+                eride,
+                categoria_producto
+            HAVING total <> 0
+            ORDER BY
+                clasificacion_debug,
+                total DESC
+        """, claves_con_diferencia)
+
+        detalle_categorias = cursor.fetchall()
+
+        # 4) Resumen solo de categorías sospechosas
+        cursor.execute(f"""
+            SELECT
+                CASE
+                    WHEN UPPER(COALESCE(marca, '')) = 'SCOTT'
+                         AND UPPER(COALESCE(apparel, '')) = 'SI'
+                        THEN 'APPAREL'
+
+                    WHEN UPPER(COALESCE(marca, '')) = 'SCOTT'
+                         AND UPPER(COALESCE(apparel, '')) <> 'SI'
+                        THEN 'SCOTT'
+
+                    WHEN UPPER(COALESCE(marca, '')) = 'BOLD'
+                        THEN 'BOLD'
+
+                    WHEN UPPER(COALESCE(marca, '')) = 'SYNCROS'
+                        THEN 'SYNCROS'
+
+                    WHEN UPPER(COALESCE(marca, '')) = 'VITTORIA'
+                        THEN 'VITTORIA'
+
+                    WHEN UPPER(COALESCE(categoria_producto, '')) LIKE 'SCOTT / APPAREL%%'
+                        THEN 'APPAREL_CATEGORIA_SIN_MARCA'
+
+                    WHEN UPPER(COALESCE(categoria_producto, '')) LIKE 'SCOTT%%'
+                        THEN 'SCOTT_CATEGORIA_SIN_MARCA'
+
+                    WHEN UPPER(COALESCE(categoria_producto, '')) LIKE 'BOLD%%'
+                        THEN 'BOLD_CATEGORIA_SIN_MARCA'
+
+                    WHEN UPPER(COALESCE(categoria_producto, '')) LIKE 'SYNCROS%%'
+                        THEN 'SYNCROS_CATEGORIA_SIN_MARCA'
+
+                    WHEN UPPER(COALESCE(categoria_producto, '')) LIKE 'VITTORIA%%'
+                        THEN 'VITTORIA_CATEGORIA_SIN_MARCA'
+
+                    WHEN UPPER(COALESCE(categoria_producto, '')) LIKE 'SERVICIOS%%'
+                        THEN 'SERVICIOS'
+
+                    WHEN COALESCE(marca, '') = ''
+                         AND COALESCE(categoria_producto, '') = ''
+                        THEN 'SIN_MARCA_SIN_CATEGORIA'
+
+                    ELSE 'OTROS'
+                END AS clasificacion_debug,
+
+                COUNT(*) AS registros,
+                ROUND(SUM(COALESCE(venta_total, 0)), 2) AS total
+            FROM monitor_odoo
+            WHERE contacto_referencia IN ({placeholders_clientes})
+            GROUP BY clasificacion_debug
+            HAVING total <> 0
+            ORDER BY total DESC
+        """, claves_con_diferencia)
+
+        resumen_clasificacion = cursor.fetchall()
+
+        total_diferencia_previo = sum(float(row["diferencia"] or 0) for row in clientes_con_diferencia)
+
+        return jsonify({
+            "objetivo": "Detectar qué categorías/marcas explican la diferencia entre acumulado general y SCOTT + BOLD + APPAREL/SYNCROS/VITTORIA",
+            "total_diferencia_previo": round(total_diferencia_previo, 2),
+            "clientes_con_diferencia": clientes_con_diferencia,
+            "resumen_clasificacion_monitor_odoo": resumen_clasificacion,
+            "detalle_categorias_monitor_odoo": detalle_categorias
+        }), 200
+
+    except Exception as e:
+        logging.exception("Error en debug_caratula_global_otros")
+        return jsonify({"error": str(e)}), 500
+
     finally:
         if cursor:
             cursor.close()
