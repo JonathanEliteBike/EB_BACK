@@ -629,23 +629,9 @@ def obtener_deducciones_odoo(claves_db, fechas_por_clave):
     uid = resultado_odoo[0]
     models = resultado_odoo[1]
 
-    if not uid:
-        return {}
-
-    print("🔎 Mapeando IDs internos de Odoo con las claves de la base de datos...")
-
-    partners_odoo = models.execute_kw(
-        ODOO_DB,
-        uid,
-        ODOO_PASSWORD,
-        'res.partner',
-        'search_read',
-        [[]],
-        {
-            'fields': ['id', 'name', 'ref'],
-            'limit': 20000
-        }
-    )
+    print("Mapeando IDs internos de Odoo con las Claves de la Base de Datos...")
+    partners_odoo = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, 'res.partner', 'search_read',
+        [[]], {'fields': ['id', 'name', 'ref', 'parent_id']})
 
     odoo_id_to_clave = {}
 
@@ -677,7 +663,13 @@ def obtener_deducciones_odoo(claves_db, fechas_por_clave):
         if p['id'] not in odoo_id_to_clave and name_odoo in redirecciones:
             odoo_id_to_clave[p['id']] = redirecciones[name_odoo]
 
-    clave_por_partner_id = dict(odoo_id_to_clave)
+    # Segunda pasada: mapear cuentas hijas (contactos secundarios) al mismo CLAVE del padre.
+    # Esto cubre casos como "Cycling riding B2B" que es hija de CYCLING RIDING DE MEXICO (GD380).
+    for p in partners_odoo:
+        if p['id'] not in odoo_id_to_clave and p.get('parent_id'):
+            parent_id = p['parent_id'][0] if isinstance(p['parent_id'], (list, tuple)) else p['parent_id']
+            if parent_id and parent_id in odoo_id_to_clave:
+                odoo_id_to_clave[p['id']] = odoo_id_to_clave[parent_id]
 
     resultados_por_clave = {
         clave: {
@@ -738,39 +730,43 @@ def obtener_deducciones_odoo(claves_db, fechas_por_clave):
         min_date = max(min(todas_inicios), FECHA_MINIMA_RETROACTIVOS) if todas_inicios else FECHA_MINIMA_RETROACTIVOS
         max_date = max(todas_fines) if todas_fines else '2026-06-30'
 
-        print(f"📅 Consultando Odoo desde {min_date} hasta {max_date}")
-
-        # ==========================================================================
-        # A. GARANTÍAS
-        # ==========================================================================
-        domain_garantia = [
-            ('move_id.move_type', '=', 'out_refund'),
-            ('move_id.state', '=', 'posted'),
-            ('move_id.invoice_date', '>=', min_date),
-            ('move_id.invoice_date', '<=', max_date),
-            ('quantity', '=', 1),
-            ('partner_id', 'in', lista_ids_validos),
-            '|',
-                ('product_id.default_code', 'ilike', 'DESCGARANTIA'),
-                ('name', 'ilike', 'DESCGARANTIA')
-        ]
-
-        lineas_garantia = fetch_all_odoo(
-            models,
-            uid,
-            'account.move.line',
-            domain_garantia,
-            ['partner_id', 'price_subtotal', 'name', 'date']
+        # Pre-cargamos los IDs de la cuenta garantía (402.01.05)
+        ids_cuenta_garantia = models.execute_kw(
+            ODOO_DB, uid, ODOO_PASSWORD, 'account.account', 'search',
+            [[('code', '=', '402.01.05')]]
         )
 
-        for linea in lineas_garantia:
-            if linea.get('partner_id'):
-                agregar_valor(
-                    linea['partner_id'][0],
-                    'garantia',
-                    linea.get('price_subtotal', 0),
-                    linea.get('date')
-                )
+        # A. GARANTÍAS — identificamos qué NC tienen línea en cuenta 402.01.05,
+        # luego leemos amount_total de account.move (incluye IVA correctamente).
+        lineas_garantia_raw = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, 'account.move.line', 'search_read',
+            [[
+                ('move_id.move_type', '=', 'out_refund'),
+                ('move_id.state', '=', 'posted'),
+                ('move_id.invoice_date', '>=', min_date),
+                ('move_id.invoice_date', '<=', max_date),
+                ('partner_id', 'in', lista_ids_validos),
+                ('account_id', 'in', ids_cuenta_garantia)
+            ]],
+            {'fields': ['move_id', 'partner_id', 'date']}
+        )
+
+        move_ids_garantia = set()
+        move_meta_garantia = {}  # move_id -> (partner_id, date)
+        for l in lineas_garantia_raw:
+            mid = l['move_id'][0]
+            move_ids_garantia.add(mid)
+            if mid not in move_meta_garantia:
+                pid = l['partner_id'][0] if l['partner_id'] else None
+                move_meta_garantia[mid] = (pid, l.get('date'))
+
+        if move_ids_garantia:
+            facturas_garantia = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, 'account.move', 'read',
+                [list(move_ids_garantia)], {'fields': ['id', 'amount_total']}
+            )
+            for f in facturas_garantia:
+                pid, fecha = move_meta_garantia.get(f['id'], (None, None))
+                if pid:
+                    agregar_valor(pid, 'garantia', f['amount_total'], fecha)
 
         # ==========================================================================
         # B. PRODUCTOS OFERTADOS
@@ -787,10 +783,6 @@ def obtener_deducciones_odoo(claves_db, fechas_por_clave):
         tags_ofertados = datos_ofertados['tags_ofertados']
         tag_ids_ofertados = datos_ofertados['tag_ids_ofertados']
 
-        print(f"🏷️ Tags productos ofertados encontradas: {tags_ofertados}")
-        print(f"🧾 Productos especiales encontrados por referencia: {len(datos_ofertados['productos_especiales'])}")
-        print(f"🟧 Registros productos ofertados encontrados: {len(registros_ofertados)}")
-
         producto_por_id, plantilla_por_id, tag_por_id = preparar_productos_y_etiquetas(
             models,
             uid,
@@ -805,12 +797,12 @@ def obtener_deducciones_odoo(claves_db, fechas_por_clave):
                 continue
 
             partner_id = partner[0]
-            clave_encontrada = clave_por_partner_id.get(partner_id)
+            clave_encontrada = odoo_id_to_clave.get(partner_id)
 
             if not clave_encontrada or clave_encontrada not in resultados_por_clave:
                 continue
 
-            fecha_registro = str(registro.get('date', ''))[:10]
+            fecha_registro = str(registro.get('date') or '')[:10]
 
             if not fecha_registro:
                 continue
@@ -844,35 +836,16 @@ def obtener_deducciones_odoo(claves_db, fechas_por_clave):
                 etiquetas_producto
             )
 
-            monto = float(calculo['monto_descuento'] or 0)
+            monto = float(calculo.get('monto_descuento') or 0)
 
             if monto <= 0:
-                print(
-                    f"⚠️ Ofertado ignorado | Tipo: {calculo['tipo_calculo']} | "
-                    f"Clave: {clave_encontrada} | Orden: {registro.get('name')} | "
-                    f"Producto: {obtener_nombre_m2o(registro.get('product_id'))} | "
-                    f"Motivo: {calculo['motivo_ignorado']}"
-                )
                 continue
 
             resultados_por_clave[clave_encontrada]['ofertado'] += monto
 
-            print(
-                f"🟧 Ofertado tomado | Tipo: {calculo['tipo_calculo']} | "
-                f"Clave: {clave_encontrada} | Cliente Odoo: {partner[1]} | "
-                f"Orden: {registro.get('name')} | "
-                f"Producto: {obtener_nombre_m2o(registro.get('product_id'))} | "
-                f"Etiquetas aplicadas: {calculo.get('etiquetas_aplicadas')} | "
-                f"Etiquetas fuera de fecha: {calculo.get('etiquetas_fuera_de_fecha')} | "
-                f"Total venta: {float(registro.get('price_total') or 0)} | "
-                f"Monto descuento tomado: {monto}"
-            )
-
         # ==========================================================================
         # B2. BICICLETAS DEMO
         # ==========================================================================
-        # DEMO se busca desde sale.order porque la etiqueta está en la orden de venta.
-        # Se toma amount_total para que cuadre con el total mostrado en Odoo.
         domain_ordenes_demo = [
             ('state', 'in', ['sale', 'done']),
             ('date_order', '>=', f'{min_date} 00:00:00'),
@@ -899,8 +872,6 @@ def obtener_deducciones_odoo(claves_db, fechas_por_clave):
             order='date_order asc'
         )
 
-        print(f"🟦 Órdenes DEMO encontradas: {len(ordenes_demo)}")
-
         for orden in ordenes_demo:
             partner = orden.get('partner_id')
 
@@ -908,14 +879,8 @@ def obtener_deducciones_odoo(claves_db, fechas_por_clave):
                 continue
 
             partner_id = partner[0]
-            fecha_orden = str(orden.get('date_order', ''))[:10]
+            fecha_orden = str(orden.get('date_order') or '')[:10]
             monto_demo = float(orden.get('amount_total') or 0)
-
-            print(
-                f"🟦 DEMO tomado | Orden: {orden.get('name')} | "
-                f"Cliente: {partner} | "
-                f"Monto total orden con impuestos: {monto_demo}"
-            )
 
             agregar_valor(
                 partner_id,
@@ -927,7 +892,6 @@ def obtener_deducciones_odoo(claves_db, fechas_por_clave):
         # ==========================================================================
         # B3. BICICLETAS BOLD
         # ==========================================================================
-        # Se conserva por compatibilidad, aunque después se reemplaza por COMPRA_GLOBAL_BOLD.
         domain_bold = [
             ('move_id.move_type', '=', 'out_invoice'),
             ('move_id.state', '=', 'posted'),
@@ -961,58 +925,41 @@ def obtener_deducciones_odoo(claves_db, fechas_por_clave):
         )
 
         for linea in lineas_bold:
-            if linea.get('partner_id'):
-                agregar_valor(
-                    linea['partner_id'][0],
-                    'bold',
-                    linea.get('price_subtotal', 0),
-                    linea.get('date')
-                )
+            partner = linea.get('partner_id')
 
-        # ==========================================================================
-        # C. NOTAS DE CRÉDITO
-        # ==========================================================================
-        domain_nc = [
-            ('move_id.move_type', '=', 'out_refund'),
-            ('move_id.state', '=', 'posted'),
-            ('move_id.invoice_date', '>=', min_date),
-            ('move_id.invoice_date', '<=', max_date),
-            ('move_id.l10n_mx_edi_usage', '=', 'G02'),
-            ('partner_id', 'in', lista_ids_validos),
-            ('quantity', '=', 1)
-        ]
-
-        lineas_nc = fetch_all_odoo(
-            models,
-            uid,
-            'account.move.line',
-            domain_nc,
-            ['partner_id', 'price_subtotal', 'name', 'date']
-        )
-
-        for linea in lineas_nc:
-            if not linea.get('partner_id'):
+            if not partner:
                 continue
 
-            monto = float(linea.get('price_subtotal', 0))
-            nombre_producto = str(linea.get('name') or '').upper()
-            fecha_nc = linea.get('date')
-
-            es_garantia = 'GARANTIA' in nombre_producto or 'DESCGARANTIA' in nombre_producto
-            es_aplant = 'APLANT' in nombre_producto or 'ANTICIPO' in nombre_producto
-            es_descuento_valido = (
-                'DESC' in nombre_producto or
-                'DESCESPECIAL' in nombre_producto or
-                'DESCPAGO' in nombre_producto
+            agregar_valor(
+                partner[0],
+                'bold',
+                linea.get('price_subtotal', 0),
+                linea.get('date')
             )
 
-            if not es_garantia and not es_aplant and es_descuento_valido:
-                agregar_valor(
-                    linea['partner_id'][0],
-                    'nc',
-                    monto,
-                    fecha_nc
-                )
+        # C. NOTAS DE CRÉDITO — leemos amount_total de account.move (con IVA).
+        # Se excluyen las NC ya clasificadas como Garantías y las de APLANT/ANTICIPO.
+        todas_nc_moves = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, 'account.move', 'search_read',
+            [[
+                ('move_type', '=', 'out_refund'),
+                ('state', '=', 'posted'),
+                ('invoice_date', '>=', min_date),
+                ('invoice_date', '<=', max_date),
+                ('partner_id', 'in', lista_ids_validos)
+            ]],
+            {'fields': ['id', 'partner_id', 'amount_total', 'invoice_date', 'name', 'ref']}
+        )
+
+        for nc in todas_nc_moves:
+            if nc['id'] in move_ids_garantia:
+                continue  # Es garantía, ya contada arriba
+            pid = nc['partner_id'][0] if nc['partner_id'] else None
+            if not pid:
+                continue
+            ref_texto = (str(nc.get('name') or '') + ' ' + str(nc.get('ref') or '')).upper()
+            if 'APLANT' in ref_texto or 'ANTICIPO' in ref_texto:
+                continue
+            agregar_valor(pid, 'nc', nc['amount_total'], nc.get('invoice_date'))
 
         return resultados_por_clave
 
@@ -1470,7 +1417,7 @@ def obtener_retroactivo_individual(identificador):
         )
 
         cliente_data['acumulado_global_calculado'] = (
-            cliente_data.get('COMPRAS_TOTALES_CRUDO', 0) -
+            (cliente_data.get('COMPRA_GLOBAL_SCOTT', 0) + cliente_data.get('COMPRA_GLOBAL_APPAREL', 0)) -
             cliente_data.get('notas_credito', 0) -
             cliente_data.get('garantias', 0)
         )
