@@ -1170,26 +1170,31 @@ def ejecutar_sincronizacion_y_calculos():
                 ))
 
         # ==========================================================================
-        # CÁLCULOS BASE
-        # ==========================================================================
+# CÁLCULOS BASE
+# ==========================================================================
         cursor.execute("""
             UPDATE tabla_retroactivos
             SET 
                 TOTAL_ACUMULADO = (
                     COALESCE(COMPRA_GLOBAL_SCOTT, 0) + 
-                    COALESCE(COMPRA_GLOBAL_APPAREL, 0) + 
-                    COALESCE(COMPRA_GLOBAL_BOLD, 0)
+                    COALESCE(COMPRA_GLOBAL_APPAREL, 0)
                 ),
 
                 compra_anual_crudo = (
-                    COALESCE(TOTAL_ACUMULADO, 0) -
+                    (
+                        COALESCE(COMPRA_GLOBAL_SCOTT, 0) + 
+                        COALESCE(COMPRA_GLOBAL_APPAREL, 0)
+                    ) -
                     COALESCE(notas_credito, 0) -
                     COALESCE(garantias, 0)
                 ),
 
                 compra_adicional = (
                     (
-                        COALESCE(TOTAL_ACUMULADO, 0) -
+                        (
+                            COALESCE(COMPRA_GLOBAL_SCOTT, 0) + 
+                            COALESCE(COMPRA_GLOBAL_APPAREL, 0)
+                        ) -
                         COALESCE(notas_credito, 0) -
                         COALESCE(garantias, 0)
                     ) - COALESCE(COMPRA_MINIMA_ANUAL, 0)
@@ -1197,7 +1202,10 @@ def ejecutar_sincronizacion_y_calculos():
 
                 importe_final = (
                     (
-                        COALESCE(TOTAL_ACUMULADO, 0) -
+                        (
+                            COALESCE(COMPRA_GLOBAL_SCOTT, 0) + 
+                            COALESCE(COMPRA_GLOBAL_APPAREL, 0)
+                        ) -
                         COALESCE(notas_credito, 0) -
                         COALESCE(garantias, 0)
                     ) -
@@ -1373,7 +1381,7 @@ def obtener_retroactivos():
             )
 
             fila['acumulado_global_calculado'] = (
-                fila.get('COMPRAS_TOTALES_CRUDO', 0) -
+                (fila.get('COMPRA_GLOBAL_SCOTT', 0) + fila.get('COMPRA_GLOBAL_APPAREL', 0)) -
                 fila.get('notas_credito', 0) -
                 fila.get('garantias', 0)
             )
