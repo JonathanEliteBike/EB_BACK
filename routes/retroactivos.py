@@ -1182,16 +1182,28 @@ def ejecutar_sincronizacion_y_calculos():
                 ),
 
                 compra_anual_crudo = (
-                    COALESCE(COMPRAS_TOTALES_CRUDO, 0) - 
-                    COALESCE(notas_credito, 0) - 
+                    COALESCE(TOTAL_ACUMULADO, 0) -
+                    COALESCE(notas_credito, 0) -
                     COALESCE(garantias, 0)
                 ),
 
                 compra_adicional = (
-                    COALESCE(COMPRAS_TOTALES_CRUDO, 0) - 
-                    COALESCE(notas_credito, 0) - 
-                    COALESCE(garantias, 0) - 
-                    COALESCE(COMPRA_MINIMA_ANUAL, 0)
+                    (
+                        COALESCE(TOTAL_ACUMULADO, 0) -
+                        COALESCE(notas_credito, 0) -
+                        COALESCE(garantias, 0)
+                    ) - COALESCE(COMPRA_MINIMA_ANUAL, 0)
+                ),
+
+                importe_final = (
+                    (
+                        COALESCE(TOTAL_ACUMULADO, 0) -
+                        COALESCE(notas_credito, 0) -
+                        COALESCE(garantias, 0)
+                    ) -
+                    COALESCE(productos_ofertados, 0) -
+                    COALESCE(bicicleta_demo, 0) -
+                    COALESCE(bicicletas_bold, 0)
                 )
         """)
 
