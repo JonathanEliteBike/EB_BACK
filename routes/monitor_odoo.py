@@ -778,9 +778,24 @@ def _recalcular_acumulados_previo(conexion, cursor):
     DEFAULT_INICIO = '2025-07-01'
 
     SCOTT_COND = """
-        m.marca IN ('SCOTT', 'MEGAMO', 'BOLD')
-        AND (m.subcategoria = 'BICICLETA' OR m.nombre_producto LIKE '%%BICICLETA%%')
-        AND (m.apparel = 'NO'            OR m.nombre_producto LIKE '%%BICICLETA%%')
+        (
+            (
+                UPPER(TRIM(m.marca)) IN ('SCOTT', 'MEGAMO')
+                AND (
+                    UPPER(TRIM(m.subcategoria)) = 'BICICLETA'
+                    OR UPPER(m.nombre_producto) LIKE '%%BICICLETA%%'
+                )
+                AND (
+                    UPPER(TRIM(m.apparel)) = 'NO'
+                    OR UPPER(m.nombre_producto) LIKE '%%BICICLETA%%'
+                )
+            )
+            OR
+            (
+                UPPER(TRIM(m.marca)) = 'BOLD'
+                AND UPPER(TRIM(m.subcategoria)) = 'BICICLETA'
+            )
+        )
     """
 
     cursor.execute(f"""
@@ -791,10 +806,14 @@ def _recalcular_acumulados_previo(conexion, cursor):
             SUM(CASE WHEN m.marca = 'SYNCROS'  THEN m.venta_total ELSE 0 END)          AS syncros,
             SUM(CASE WHEN m.apparel = 'SI'     THEN m.venta_total ELSE 0 END)          AS apparel,
             SUM(CASE WHEN m.marca = 'VITTORIA' THEN m.venta_total ELSE 0 END)          AS vittoria,
-            SUM(CASE WHEN m.marca = 'BOLD'
-                          AND (m.subcategoria = 'BICICLETA' OR m.nombre_producto LIKE '%%BICICLETA%%')
-                          AND (m.apparel = 'NO'            OR m.nombre_producto LIKE '%%BICICLETA%%')
-                     THEN m.venta_total ELSE 0 END)                                     AS bold,
+            SUM(
+                CASE 
+                    WHEN UPPER(TRIM(m.marca)) = 'BOLD'
+                    AND UPPER(TRIM(m.subcategoria)) = 'BICICLETA'
+                    THEN COALESCE(m.venta_total, 0)
+                    ELSE 0
+                END
+            ) AS bold,
             -- SCOTT bicicletas: total y por periodo
             SUM(CASE WHEN {SCOTT_COND} THEN m.venta_total ELSE 0 END)                  AS scott,
             SUM(CASE WHEN m.fecha_factura <= '2025-08-31'
