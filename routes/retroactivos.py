@@ -16,9 +16,9 @@ def obtener_deducciones_odoo(claves_db, fechas_por_clave):
     models = resultado_odoo[1]
     if not uid: return {}
 
-    print("🔎 Mapeando IDs internos de Odoo con las Claves de la Base de Datos...")
+    print("Mapeando IDs internos de Odoo con las Claves de la Base de Datos...")
     partners_odoo = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, 'res.partner', 'search_read',
-        [[]], {'fields': ['id', 'name', 'ref']})
+        [[]], {'fields': ['id', 'name', 'ref', 'parent_id']})
 
     odoo_id_to_clave = {}
     
@@ -40,6 +40,14 @@ def obtener_deducciones_odoo(claves_db, fechas_por_clave):
         name_odoo = str(p.get('name', '')).strip().upper()
         if p['id'] not in odoo_id_to_clave and name_odoo in redirecciones:
             odoo_id_to_clave[p['id']] = redirecciones[name_odoo]
+
+    # Segunda pasada: mapear cuentas hijas (contactos secundarios) al mismo CLAVE del padre.
+    # Esto cubre casos como "Cycling riding B2B" que es hija de CYCLING RIDING DE MEXICO (GD380).
+    for p in partners_odoo:
+        if p['id'] not in odoo_id_to_clave and p.get('parent_id'):
+            parent_id = p['parent_id'][0] if isinstance(p['parent_id'], (list, tuple)) else p['parent_id']
+            if parent_id and parent_id in odoo_id_to_clave:
+                odoo_id_to_clave[p['id']] = odoo_id_to_clave[parent_id]
 
     resultados_por_clave = {clave: {'nc': 0.0, 'garantia': 0.0, 'ofertado': 0.0} for clave in claves_db}
 
@@ -70,70 +78,86 @@ def obtener_deducciones_odoo(claves_db, fechas_por_clave):
         min_date = min(todas_inicios) if todas_inicios else '2025-07-01'
         max_date = max(todas_fines) if todas_fines else '2026-06-30'
 
-        # A. GARANTÍAS 
-        domain_garantia = [
-            ('move_id.move_type', '=', 'out_refund'),
-            ('move_id.state', '=', 'posted'),
-            ('move_id.invoice_date', '>=', min_date),
-            ('move_id.invoice_date', '<=', max_date),
-            ('quantity', '=', 1),
-            ('partner_id', 'in', lista_ids_validos),
-            '|', ('product_id.default_code', 'ilike', 'DESCGARANTIA'),
-                 ('name', 'ilike', 'DESCGARANTIA')
-        ]
-        lineas_garantia = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, 'account.move.line', 'search_read', 
-            [domain_garantia], {'fields': ['partner_id', 'price_subtotal', 'name', 'date']})
-        
-        for linea in lineas_garantia:
-            if linea['partner_id']:
-                agregar_valor(linea['partner_id'][0], 'garantia', float(linea['price_subtotal']), linea.get('date'))
+        # Pre-cargamos los IDs de la cuenta garantía (402.01.05)
+        ids_cuenta_garantia = models.execute_kw(
+            ODOO_DB, uid, ODOO_PASSWORD, 'account.account', 'search',
+            [[('code', '=', '402.01.05')]]
+        )
 
-        # B. PRODUCTOS OFERTADOS (Ahora incluye la etiqueta DEMO)
+        # A. GARANTÍAS — identificamos qué NC tienen línea en cuenta 402.01.05,
+        # luego leemos amount_total de account.move (incluye IVA correctamente).
+        lineas_garantia_raw = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, 'account.move.line', 'search_read',
+            [[
+                ('move_id.move_type', '=', 'out_refund'),
+                ('move_id.state', '=', 'posted'),
+                ('move_id.invoice_date', '>=', min_date),
+                ('move_id.invoice_date', '<=', max_date),
+                ('partner_id', 'in', lista_ids_validos),
+                ('account_id', 'in', ids_cuenta_garantia)
+            ]],
+            {'fields': ['move_id', 'partner_id', 'date']}
+        )
+
+        move_ids_garantia = set()
+        move_meta_garantia = {}  # move_id -> (partner_id, date)
+        for l in lineas_garantia_raw:
+            mid = l['move_id'][0]
+            move_ids_garantia.add(mid)
+            if mid not in move_meta_garantia:
+                pid = l['partner_id'][0] if l['partner_id'] else None
+                move_meta_garantia[mid] = (pid, l.get('date'))
+
+        if move_ids_garantia:
+            facturas_garantia = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, 'account.move', 'read',
+                [list(move_ids_garantia)], {'fields': ['id', 'amount_total']}
+            )
+            for f in facturas_garantia:
+                pid, fecha = move_meta_garantia.get(f['id'], (None, None))
+                if pid:
+                    agregar_valor(pid, 'garantia', f['amount_total'], fecha)
+
+        # B. PRODUCTOS OFERTADOS (incluye etiqueta DEMO)
         domain_ofertado = [
-            ('move_id.move_type', '=', 'out_invoice'), 
+            ('move_id.move_type', '=', 'out_invoice'),
             ('move_id.state', '=', 'posted'),
             ('move_id.invoice_date', '>=', min_date),
             ('move_id.invoice_date', '<=', max_date),
             ('quantity', '!=', 0),
             ('partner_id', 'in', lista_ids_validos),
-            # Usamos '|' (OR) para buscar una etiqueta u otra
-            '|', 
+            '|',
                 ('product_id.product_tmpl_id.product_tag_ids.name', 'ilike', 'Producto Ofertado'),
                 ('product_id.product_tmpl_id.product_tag_ids.name', 'ilike', 'DEMO')
         ]
-        
-        lineas_ofertado = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, 'account.move.line', 'search_read', 
+        lineas_ofertado = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, 'account.move.line', 'search_read',
             [domain_ofertado], {'fields': ['partner_id', 'price_subtotal', 'date']})
 
         for linea in lineas_ofertado:
             if linea['partner_id']:
                 agregar_valor(linea['partner_id'][0], 'ofertado', float(linea['price_subtotal']), linea.get('date'))
 
-        # C. NOTAS DE CRÉDITO 
-        domain_nc = [
-            ('move_id.move_type', '=', 'out_refund'),
-            ('move_id.state', '=', 'posted'),
-            ('move_id.invoice_date', '>=', min_date),
-            ('move_id.invoice_date', '<=', max_date),
-            ('move_id.l10n_mx_edi_usage', '=', 'G02'),
-            ('partner_id', 'in', lista_ids_validos), 
-            ('quantity', '=', 1)
-        ]
-        lineas_nc = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, 'account.move.line', 'search_read', 
-            [domain_nc], {'fields': ['partner_id', 'price_subtotal', 'name', 'date']})
+        # C. NOTAS DE CRÉDITO — leemos amount_total de account.move (con IVA).
+        # Se excluyen las NC ya clasificadas como Garantías y las de APLANT/ANTICIPO.
+        todas_nc_moves = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, 'account.move', 'search_read',
+            [[
+                ('move_type', '=', 'out_refund'),
+                ('state', '=', 'posted'),
+                ('invoice_date', '>=', min_date),
+                ('invoice_date', '<=', max_date),
+                ('partner_id', 'in', lista_ids_validos)
+            ]],
+            {'fields': ['id', 'partner_id', 'amount_total', 'invoice_date', 'name', 'ref']}
+        )
 
-        for linea in lineas_nc:
-            if not linea['partner_id']: continue
-            monto = float(linea['price_subtotal'])
-            nombre_producto = str(linea['name'] or '').upper()
-            fecha_nc = linea.get('date')
-            
-            es_garantia = 'GARANTIA' in nombre_producto or 'DESCGARANTIA' in nombre_producto
-            es_aplant = 'APLANT' in nombre_producto or 'ANTICIPO' in nombre_producto
-            es_descuento_valido = 'DESC' in nombre_producto or 'DESCESPECIAL' in nombre_producto or 'DESCPAGO' in nombre_producto
-            
-            if not es_garantia and not es_aplant and es_descuento_valido:
-                agregar_valor(linea['partner_id'][0], 'nc', monto, fecha_nc)
+        for nc in todas_nc_moves:
+            if nc['id'] in move_ids_garantia:
+                continue  # Es garantía, ya contada arriba
+            pid = nc['partner_id'][0] if nc['partner_id'] else None
+            if not pid:
+                continue
+            ref_texto = (str(nc.get('name') or '') + ' ' + str(nc.get('ref') or '')).upper()
+            if 'APLANT' in ref_texto or 'ANTICIPO' in ref_texto:
+                continue
+            agregar_valor(pid, 'nc', nc['amount_total'], nc.get('invoice_date'))
 
         return resultados_por_clave
 
