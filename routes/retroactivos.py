@@ -1306,7 +1306,6 @@ def ejecutar_sincronizacion_y_calculos():
 # ==============================================================================
 @retroactivos_bp.route('/retroactivos', methods=['GET'])
 def obtener_retroactivos():
-    ejecutar_sincronizacion_y_calculos()
 
     conexion = obtener_conexion()
     cursor = conexion.cursor(dictionary=True)
@@ -1396,7 +1395,6 @@ def sincronizar_notas_odoo():
 # ==============================================================================
 @retroactivos_bp.route('/retroactivo_cliente/<string:identificador>', methods=['GET'])
 def obtener_retroactivo_individual(identificador):
-    ejecutar_sincronizacion_y_calculos()
 
     conexion = obtener_conexion()
     cursor = conexion.cursor(dictionary=True)
