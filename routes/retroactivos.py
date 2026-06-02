@@ -76,6 +76,16 @@ PROMOCIONES_PRODUCTO_OFERTADO = {
 # Lista derivada automáticamente. Se usa para buscar las etiquetas reales en Odoo.
 ETIQUETAS_PRODUCTO_OFERTADO = list(PROMOCIONES_PRODUCTO_OFERTADO.keys())
 
+REFERENCIAS_SYNCROS_2X1_TUBELESS_2026 = {
+    # SKU: 275469
+    # Referencia interna en Odoo:
+    'KIT7',
+    '275469-0001927'
+
+    # Lo dejo también por seguridad, por si en Odoo alguna variante trae el SKU como referencia.
+    '275469',
+}
+
 # Referencias tomadas de CASCOS-OFERTADO.pdf.
 # Regla: cascos de esta lista vendidos del 2025-10-15 al 2025-12-31 se descuentan al 50%.
 REFERENCIAS_CASCOS_50 = {
@@ -621,6 +631,989 @@ def preparar_productos_y_etiquetas(models, uid, registros, tags):
     return producto_por_id, plantilla_por_id, tag_por_id
 
 
+
+
+# ==============================================================================
+# PRODUCTOS OFERTADOS POR CAMPAÑA (REFERENCIA INTERNA + FECHA DE FACTURA)
+# ==============================================================================
+# Nueva regla:
+# Ya no dependemos de etiquetas actuales de Odoo/sale.report.
+# Se replica la base validada en Odoo desde:
+# Contabilidad -> Apuntes contables
+#   - Publicado
+#   - Asiento contable / Tipo = Factura de cliente
+#   - Cuenta = 401.01.01 Ventas y/o servicios gravados a la tasa general
+#   - Producto establecido
+#   - Fecha de factura dentro del rango
+#
+# El monto tomado para productos_ofertados es price_total de account.move.line,
+# equivalente a la columna Total exportada desde Odoo, es decir, total con IVA.
+
+REFERENCIAS_SPRING_SALE_2026 = {
+    '286383-704',
+    '286383-706',
+    '290178-006',
+    '290186-008',
+    '290186-010',
+    '290187-006',
+    '290187-008',
+    '290187-010',
+    '290187-012',
+    '290187-014',
+    '290188-014',
+    '290189-008',
+    '290189-010',
+    '290194-008',
+    '290194-010',
+    '290310-704',
+    '290310-706',
+    '290310-908',
+    '290373-047',
+    '290373-049',
+    '290373-052',
+    '290373-054',
+    '290373-056',
+    '290383-047',
+    '290583-008',
+    '290584-006',
+    '290584-008',
+    '290584-010',
+    '290586-006',
+    '290586-008',
+    '290586-010',
+    '291328-010',
+    '291328-012',
+    '291329-006',
+    '291329-008',
+    '293026-008',
+    '293180-049',
+    '293180-052',
+    '293180-054',
+    '293180-056',
+    '293251-052',
+    '293251-054',
+    '293251-056',
+    '293252-049',
+    '293268-054',
+    '293268-056',
+    '293268-058',
+    '293272-047',
+    '293272-049',
+    '293272-052',
+    '293272-054',
+    '293272-056',
+    '293290-006',
+    '420650-010',
+    '423116-3020006',
+    '423116-3020008',
+    '423116-3020010',
+    '423116-7961006',
+    '423116-7961008',
+    '423116-7961010',
+    '423116-8086006',
+    '423116-8086008',
+    '423116-8086010',
+    '423120-7960006',
+    '423120-7960008',
+    '423120-7960010',
+    '423120-7960012',
+    '423128-7960006',
+    '423128-7960008',
+    '423128-7960010',
+    '423132-3020006',
+    '423132-3020008',
+    '423132-3020010',
+    '423132-3020012',
+    '423132-8085006',
+    '423132-8085008',
+    '423132-8085010',
+    '423132-8085012',
+    '423226-7315004',
+    '423226-7315006',
+    '423226-7315008',
+    '423226-7315010',
+    '423234-7241004',
+    '423234-7241006',
+    '423234-7241008',
+    '423234-7241010',
+    '423234-8102004',
+    '423234-8102006',
+    '423234-8102008',
+    '423234-8102010',
+    '423246-8096004',
+    '423246-8096006',
+    '423246-8096008',
+    '423246-8096010',
+    '423256-7959002',
+    '423256-7959004',
+    '423256-7959006',
+    '423256-7959008',
+    '423256-7959010',
+    '423256-7959012',
+    '423256-7959014',
+    '423283-3020004',
+    '423283-3020006',
+    '423283-3020008',
+    '423283-3020010',
+    '423283-8099004',
+    '423283-8099006',
+    '423283-8099008',
+    '423283-8099010',
+    '423365-8086008',
+    '423378-6922006',
+    '423380-6985004',
+    '423380-6985006',
+    '423380-6985008',
+    '423380-6985010',
+    '423380-8097002',
+    '423380-8097004',
+    '423380-8097006',
+    '423384-7965002',
+    '423384-7965004',
+    '423384-7965006',
+    '423384-7965008',
+    '423384-7965010',
+    '423384-8089002',
+    '423384-8089004',
+    '423384-8089006',
+    '423384-8089008',
+    '423384-8089010',
+    '423384-8098004',
+    '423384-8098006',
+    '423384-8098008',
+    '423384-8098010',
+    '423387-6985004',
+    '423387-6985006',
+    '423387-6985008',
+    '423387-6985010',
+    '423387-7241002',
+    '423387-7241004',
+    '423387-7241006',
+    '423387-7241008',
+    '423387-7241010',
+    '423424-3020006',
+    '423424-3020008',
+    '423424-3020010',
+    '423460-0001222',
+    'SBI20BI274747001',
+    'SBI22BI280645024',
+    'SBI22BI286274008',
+    'SBI22BI286274010',
+    'SBI22BI286276006',
+    'SBI22BI286276008',
+    'SBI22BI286276010',
+    'SBI22BI286276012',
+    'SBI22BI286277006',
+    'SBI22BI286277008',
+    'SBI22BI286277010',
+    'SBI22BI286278008',
+    'SBI22BI286335010',
+    'SBI22BI286392910',
+    'SBI23BI290116006',
+    'SBI23BI290116008',
+    'SBI23BI290116010',
+    'SBI23BI290116012',
+    'SBI23BI290118006',
+    'SBI23BI290118008',
+    'SBI23BI290118010',
+    'SBI23BI290118012',
+    'SBI23BI290119006',
+    'SBI23BI290119008',
+    'SBI23BI290119010',
+    'SBI23BI290119012',
+    'SBI23BI290120006',
+    'SBI23BI290120008',
+    'SBI23BI290120010',
+    'SBI23BI290121006',
+    'SBI23BI290121008',
+    'SBI23BI290121010',
+    'SBI23BI290121012',
+    'SBI23BI290139008',
+    'SBI23BI290139010',
+    'SBI23BI290139012',
+    'SBI23BI290140006',
+    'SBI23BI290140008',
+    'SBI23BI290140010',
+    'SBI23BI290140012',
+    'SBI23BI290141006',
+    'SBI23BI290141008',
+    'SBI23BI290141010',
+    'SBI23BI290172006',
+    'SBI23BI290172008',
+    'SBI23BI290172010',
+    'SBI23BI290172012',
+    'SBI23BI290173006',
+    'SBI23BI290173008',
+    'SBI23BI290173010',
+    'SBI23BI290173012',
+    'SBI23BI290301006',
+    'SBI23BI290301008',
+    'SBI23BI290341054',
+    'SBI23BI290349049',
+    'SBI23BI290349052',
+    'SBI23BI290349054',
+    'SBI23BI290349056',
+    'SBI23BI290351049',
+    'SBI23BI290351052',
+    'SBI23BI290353049',
+    'SBI23BI290353052',
+    'SBI23BI290353054',
+    'SBI23BI290353056',
+    'SBI23BI290353058',
+    'SBI23BI290354049',
+    'SBI23BI290354052',
+    'SBI23BI290354054',
+    'SBI23BI290354056',
+    'SBI23BI290364049',
+    'SBI23BI290364052',
+    'SBI23BI290364054',
+    'SBI23BI290364056',
+    'SBI23BI290364058',
+    'SBI23BI290366052',
+    'SBI23BI290366054',
+    'SBI23BI290366056',
+    'SBI23BI290367052',
+    'SBI23BI290367054',
+    'SBI23BI290368047',
+    'SBI23BI290368058',
+    'SBI23BI290369047',
+    'SBI23BI290369052',
+    'SBI23BI290369058',
+    'SBI23BI290370047',
+    'SBI23BI290370049',
+    'SBI23BI290370052',
+    'SBI23BI290370054',
+    'SBI23BI290370056',
+    'SBI23BI290383052',
+    'SBI23BI290383054',
+    'SBI23BI290383056',
+    'SBI23BI290384052',
+    'SBI23BI290384054',
+    'SBI23BI290384056',
+    'SBI23BI290384058',
+    'SBI23BI290524049',
+    'SBI23BI290524052',
+    'SBI23BI290524054',
+    'SBI23BI290524056',
+    'SBI23BI290525049',
+    'SBI23BI290525052',
+    'SBI23BI290525054',
+    'SBI23BI290525056',
+    'SBI23BI290546008',
+    'SBI23BI290546010',
+    'SBI23BI293025008',
+    'SBI23BI293025010',
+    'SBI23BI293026006',
+    'SBI23BI293026010',
+    'SBI23BI293182049',
+    'SBI23BI293182052',
+    'SBI23BI293182054',
+    'SBI23BI293182056',
+    'SBI23BI293251049',
+    'SBI23BI293268052',
+    'SBI23BI293269049',
+    'SBI23BI293269052',
+    'SBI23BI293269054',
+    'SBI23BI293290008',
+    'SBI23BI293290010',
+    'SBI23BI293291006',
+    'SBI23BI293291008',
+    'SBI23BI293291010',
+    'SBI23BI293292008',
+    'SBI23BI293292010',
+    'SBI24BI293290008',
+}
+
+REFERENCIAS_DEAL_IRRESISTIBLE_2025 = {
+    '286383-704',
+    '290187-008',
+    '290187-010',
+    '290187-012',
+    '290187-014',
+    '290188-014',
+    '290189-008',
+    '290189-010',
+    '290310-704',
+    '290310-706',
+    '290310-908',
+    '290564-006',
+    '290568-006',
+    '290583-008',
+    '290584-006',
+    '290584-008',
+    '290586-006',
+    '290586-008',
+    '291328-010',
+    '291328-012',
+    '291329-008',
+    '293026-008',
+    '293180-054',
+    '293180-056',
+    '293251-052',
+    '293251-054',
+    '293251-056',
+    '293252-049',
+    '293268-054',
+    '293268-056',
+    '293268-058',
+    '293272-047',
+    '293272-049',
+    '293272-052',
+    '293272-056',
+    '293290-006',
+    '420650-010',
+    '423226-7315004',
+    '423226-7315006',
+    '423226-7315008',
+    '423226-7315010',
+    '423234-7241004',
+    '423234-7241006',
+    '423234-7241010',
+    '423234-8102006',
+    '423234-8102008',
+    '423246-8096006',
+    '423246-8096010',
+    '423256-7959002',
+    '423256-7959004',
+    '423256-7959006',
+    '423256-7959008',
+    '423256-7959010',
+    '423283-3020004',
+    '423283-3020006',
+    '423283-3020008',
+    '423283-3020010',
+    '423283-8099004',
+    '423283-8099008',
+    '423283-8099010',
+    '423365-8086008',
+    '423378-6922006',
+    '423380-6985004',
+    '423380-6985006',
+    '423380-6985008',
+    '423380-6985010',
+    '423380-8097002',
+    '423380-8097004',
+    '423384-7965004',
+    '423384-7965006',
+    '423384-7965008',
+    '423384-7965010',
+    '423384-8089002',
+    '423384-8089004',
+    '423384-8089006',
+    '423384-8089008',
+    '423384-8089010',
+    '423384-8098004',
+    '423384-8098006',
+    '423384-8098008',
+    '423384-8098010',
+    '423424-3020006',
+    '423424-3020008',
+    '423424-3020010',
+    '423460-0001222',
+    '423580-2308222',
+    '423580-8133222',
+    '423581-7963222',
+    'SBI22BI280645024',
+    'SBI22BI286335010',
+    'SBI22BI286392910',
+    'SBI23BI290096010',
+    'SBI23BI290098012',
+    'SBI23BI290116006',
+    'SBI23BI290116008',
+    'SBI23BI290116010',
+    'SBI23BI290118006',
+    'SBI23BI290118008',
+    'SBI23BI290118010',
+    'SBI23BI290119006',
+    'SBI23BI290119008',
+    'SBI23BI290119010',
+    'SBI23BI290120006',
+    'SBI23BI290120008',
+    'SBI23BI290120010',
+    'SBI23BI290121006',
+    'SBI23BI290121008',
+    'SBI23BI290121010',
+    'SBI23BI290121012',
+    'SBI23BI290139008',
+    'SBI23BI290139012',
+    'SBI23BI290140006',
+    'SBI23BI290140008',
+    'SBI23BI290141006',
+    'SBI23BI290141008',
+    'SBI23BI290149008',
+    'SBI23BI290149010',
+    'SBI23BI290155008',
+    'SBI23BI290172012',
+    'SBI23BI290173006',
+    'SBI23BI290173008',
+    'SBI23BI290173010',
+    'SBI23BI290173012',
+    'SBI23BI290179006',
+    'SBI23BI290301006',
+    'SBI23BI290341054',
+    'SBI23BI290349049',
+    'SBI23BI290349052',
+    'SBI23BI290349054',
+    'SBI23BI290349056',
+    'SBI23BI290351049',
+    'SBI23BI290351052',
+    'SBI23BI290353049',
+    'SBI23BI290353052',
+    'SBI23BI290353054',
+    'SBI23BI290353056',
+    'SBI23BI290353058',
+    'SBI23BI290354052',
+    'SBI23BI290354054',
+    'SBI23BI290354056',
+    'SBI23BI290364052',
+    'SBI23BI290364054',
+    'SBI23BI290364056',
+    'SBI23BI290364058',
+    'SBI23BI290366052',
+    'SBI23BI290366054',
+    'SBI23BI290366056',
+    'SBI23BI290524054',
+    'SBI23BI290524056',
+    'SBI23BI290546006',
+    'SBI23BI290546008',
+    'SBI23BI290546010',
+    'SBI23BI290568008',
+    'SBI23BI290731004',
+    'SBI23BI293025008',
+    'SBI23BI293025010',
+    'SBI23BI293026006',
+    'SBI23BI293026010',
+    'SBI23BI293182049',
+    'SBI23BI293182052',
+    'SBI23BI293182054',
+    'SBI23BI293182056',
+    'SBI23BI293251049',
+    'SBI23BI293268052',
+    'SBI23BI293269049',
+    'SBI23BI293269052',
+    'SBI23BI293269054',
+    'SBI23BI293290008',
+    'SBI23BI293290010',
+    'SBI23BI293291006',
+    'SBI23BI293291008',
+    'SBI23BI293291010',
+    'SBI23BI293292008',
+    'SBI23BI293292010',
+    'SBI24BI293290008',
+    'SBI24BI420647006',
+    'SBI24BI420647010',
+}
+
+REFERENCIAS_DEAL_NAVIDAD_KIDS_2025 = {
+    '286383-704',
+    '290310-704',
+    '290310-706',
+    '290310-908',
+    '423580-2308222',
+    '423580-8133222',
+    '425790-3761222',
+    '425790-8269222',
+    '425791-3028222',
+    '425791-8268222',
+    '425792-2308222',
+    '425792-4173222',
+    'SBI23BI290330704',
+}
+
+REFERENCIAS_VITTORIA_OFF_SEASON_2026 = {
+    '1113442432111TG',
+    '1113442442111BK',
+    '1113442442111TG',
+    '1113S32355111BK',
+    '1113S42355111BK',
+    '1113S42355111TG',
+    '11A00194',
+    '11A00195',
+    '11A00304',
+    '11A00307',
+    '11A00389',
+    '11A00416',
+    '11A00438',
+    '11A00446',
+    '11A00518',
+    '11A00556',
+    '11A00557',
+    '11A00559',
+    '11A00560',
+    '11A00629',
+    '11A00730',
+    '11A00734',
+    '11A00736',
+    '11E00263',
+    '11E00282',
+    '11E00304',
+    '11E00306',
+    '11E00307',
+    '11E00323',
+    '11E00416',
+    'VIT13LL06ND30047',
+    'VIT13SE01NSPS',
+    'VITBAR00213',
+    'VITBAR00249',
+    'VITBAR00453',
+    'VITBAR00454',
+    'VITCOR00393',
+    'VITCOR00394',
+    'VITCOR00399',
+    'VITCOR00400',
+    'VITCOR00413',
+    'VITCOR00414',
+    'VITCOR00432',
+    'VITCOR00434',
+    'VITCOR00455',
+    'VITCOR00484',
+    'VITEVO00043',
+    'VITMAR00341',
+    'VITMAR00415',
+    'VITMAZ00313',
+    'VITMAZ00318',
+    'VITMAZ00337',
+    'VITMEZ00229',
+    'VITMEZ00252',
+    'VITMEZ00478',
+    'VITPIT00416',
+    'VITPIT00470',
+    'VITPIT00471',
+    'VITRID00428',
+    'VITRID00429',
+    'VITRID00430',
+    'VITRID00452',
+    'VITRUB00243',
+    'VITRUB00256',
+    'VITRUB00257',
+    'VITSAG00324',
+    'VITSEL00451',
+    'VITSYE00361',
+    'VITTER000401',
+    'VITTER00076',
+    'VITTER00260',
+    'VITTER00265',
+    'VITTER00406',
+    'VITTER00407',
+    'VITTER00409',
+    'VITTER00410',
+    'VITTER00437',
+    'VITTER00439',
+    'VITTER00441',
+    'VITTER00442',
+    'VITTER00445',
+    'VITVAL00468',
+    'VITVAL00469',
+    'VITZAF00050',
+    'VITZAF00305',
+    'VITZAF00316',
+    'VITZAF00318',
+    'VITZAF00328',
+    'VITZAF00466',
+    'VITZAF00467',
+}
+
+REFERENCIAS_DEAL_ZAPATOS_2025 = {
+    '296549-1007430',
+    'SCO20ZA596622408',
+    'SCO20ZA834554712',
+    'SCO20ZA834554714',
+    'SCO20ZA834554716',
+    'SCO20ZA834554720',
+    'SCO20ZA834554722',
+    'SCO20ZA885104212',
+    'SCO20ZA885104214',
+    'SCO20ZA885104216',
+    'SCO20ZA885104218',
+    'SCO20ZA885104220',
+    'SCO20ZA885104222',
+    'SCO20ZA894588910',
+    'SCO20ZA894588912',
+    'SCO20ZA894588914',
+    'SCO20ZA894588916',
+    'SCO20ZA894588918',
+    'SCO20ZA894588920',
+    'SCO20ZA894588922',
+    'SCO21ZA208101712',
+    'SCO21ZA208101720',
+    'SCO21ZA208101722',
+    'SCO21ZA603101740',
+    'SCO21ZA603101750',
+    'SCO21ZA603101760',
+    'SCO21ZA603101770',
+    'SCO21ZA605502460',
+    'SCO21ZA950656822',
+    'SCO22ZA595656520',
+    'SCO22ZA599656512',
+    'SCO22ZA599656514',
+    'SCO22ZA814165930',
+    'SCO22ZA814165950',
+    'SCO22ZA817100012',
+    'SCO22ZA817100014',
+    'SCO22ZA817100016',
+    'SCO22ZA817100018',
+    'SCO22ZA817100020',
+    'SCO22ZA817100022',
+    'SCO22ZA817209810',
+    'SCO22ZA817209812',
+    'SCO22ZA817209814',
+    'SCO22ZA817209816',
+    'SCO22ZA817209818',
+    'SCO22ZA817209820',
+    'SCO22ZA817209822',
+    'SCO22ZA818101950',
+    'SCO22ZA826200640',
+    'SCO22ZA826200670',
+    'SCO22ZA828727310',
+    'SCO22ZA828727330',
+    'SCO22ZA836727510',
+    'SCO22ZA836727520',
+    'SCO22ZA836727530',
+    'SCO22ZA836727540',
+    'SCO22ZA836727550',
+    'SCO22ZA836727560',
+    'SCO22ZA836727580',
+    'SCO22ZA905101910',
+    'SCO22ZA905101912',
+    'SCO22ZA905101914',
+    'SCO22ZA905101916',
+    'SCO22ZA905101918',
+    'SCO22ZA905101920',
+    'SCOZA5627552410',
+    'SCOZA5627552420',
+    'SCOZA5627552430',
+    'SCOZA5627552440',
+    'SCOZA605-5544340',
+    'SCOZA605-5544350',
+    'SCOZA605-5544360',
+    'SCOZA8127663400',
+    'SCOZA8127663410',
+    'SCOZA8127663430',
+    'SCOZA8127663440',
+    'SCOZA8127663460',
+}
+
+REFERENCIAS_DEAL_CASCOS_2025 = {
+    '288584-1035010',
+    'SCO20CA192651306',
+    'SCO20CA192651307',
+    'SCO20CA192651308',
+    'SCO20CA192651606',
+    'SCO20CA192651607',
+    'SCO20CA195000106',
+    'SCO20CA195651806',
+    'SCO20CA195651906',
+    'SCO20CA195651907',
+    'SCO20CA205000106',
+    'SCO20CA205103506',
+    'SCO20CA205103507',
+    'SCO21CA195009606',
+    'SCO21CA218424422',
+    'SCO21CA405691706',
+    'SCO22CA195726006',
+    'SCO22CA195726007',
+    'SCO22CA195726008',
+    'SCO22CA584651306',
+    'SCO22CA584692206',
+    'SCO2752080002015',
+    'SCO2752080091015',
+    'SCO2752080091017',
+    'SCO2752080096015',
+    'SCO2752080135015',
+    'SCO2752086519015',
+    'SCO2752086909015',
+    'SCO2752086909017',
+    'SCO2752120001222',
+    'SCO2752124310222',
+    'SCO2752126505222',
+    'SCO2752126867222',
+    'SCO2752126927222',
+    'SCO2752126928222',
+    'SCO2752127017222',
+    'SCO2752180135222',
+    'SCO2752184244222',
+    'SCO2752326530222',
+    'SCO2752326823222',
+    'SCO2752356909222',
+    'SCOCA205-6322006',
+    'SCOCA218-0096222',
+    'SCOCA2326522222',
+}
+
+REFERENCIAS_VOLTAGE_ERIDE = {
+    '293210-006',
+    '293210-008',
+    '293210-010',
+    '293290-006',
+    '293290-06',
+    '293292-008',
+    '293292-010',
+    'SBI23BI29321006',
+    'SBI23BI29321008',
+    'SBI23BI29321010',
+    'SBI23BI29329008',
+    'SBI23BI29329010',
+    'SBI23BI293292008',
+    'SBI23BI293292010',
+    'SBI24BI29329008',
+}
+
+CAMPANAS_PRODUCTOS_OFERTADOS = [
+    {
+        'nombre': 'SPRING_SALE_2026',
+        'inicio': '2026-02-16',
+        'fin': '2026-04-30',
+        'referencias': REFERENCIAS_SPRING_SALE_2026,
+        'porcentaje': 1.0
+    },
+    {
+        'nombre': 'DEAL_IRRESISTIBLE_NAVIDAD_2025',
+        'inicio': '2025-10-15',
+        'fin': '2025-12-31',
+        'referencias': (
+            REFERENCIAS_DEAL_IRRESISTIBLE_2025 |
+            REFERENCIAS_DEAL_NAVIDAD_KIDS_2025 |
+            REFERENCIAS_DEAL_ZAPATOS_2025 |
+            REFERENCIAS_DEAL_CASCOS_2025
+        ),
+        'porcentaje': 1.0
+    },
+    {
+        'nombre': 'VITTORIA_OFF_SEASON_2026',
+        'inicio': '2026-04-01',
+        'fin': '2026-05-30',
+        'referencias': REFERENCIAS_VITTORIA_OFF_SEASON_2026,
+        'porcentaje': 1.0
+    },
+    {
+        'nombre': 'SYNCROS_2X1_TUBELESS_2026',
+        'inicio': '2026-02-16',
+        'fin': '2026-03-31',
+        'referencias': REFERENCIAS_SYNCROS_2X1_TUBELESS_2026,
+        'porcentaje': 1.0
+    },
+    {
+        'nombre': 'VOLTAGE_ERIDE_MIX_PROMOS',
+        'inicio': '2025-11-28',
+        'fin': '2026-06-30',
+        'referencias': REFERENCIAS_VOLTAGE_ERIDE,
+        'porcentaje': 1.0
+    }
+]
+
+
+def normalizar_referencia_producto(ref):
+    """
+    Normaliza referencia interna para comparación:
+    - mayúsculas
+    - quita espacios
+    - conserva guiones para mostrar, pero genera variantes para comparar
+    """
+    return str(ref or '').strip().upper().replace(' ', '')
+
+
+def variantes_referencia_producto(ref):
+    """
+    Genera variantes para casos como:
+    293290-006 vs 293290-06
+    SBI23BI29329008 vs SBI23BI29329008
+    """
+    ref = normalizar_referencia_producto(ref)
+
+    if not ref:
+        return set()
+
+    variantes = {ref, ref.replace('-', '')}
+
+    if '-' in ref:
+        base, sufijo = ref.split('-', 1)
+
+        if sufijo.isdigit():
+            variantes.add(f"{base}-{sufijo.zfill(3)}")
+            variantes.add(f"{base}-{str(int(sufijo))}")
+            variantes.add(f"{base}{sufijo.zfill(3)}")
+            variantes.add(f"{base}{str(int(sufijo))}")
+
+    return {v for v in variantes if v}
+
+
+def construir_indice_campanas_productos():
+    """
+    Convierte las referencias de campañas en un índice por variante normalizada.
+    Así una referencia puede compararse aunque venga con/sin guion o con cero distinto.
+    """
+    indice = {}
+
+    for campana in CAMPANAS_PRODUCTOS_OFERTADOS:
+        for ref in campana.get('referencias', set()):
+            for variante in variantes_referencia_producto(ref):
+                if variante not in indice:
+                    indice[variante] = []
+
+                indice[variante].append(campana)
+
+    return indice
+
+
+INDICE_CAMPANAS_PRODUCTOS = construir_indice_campanas_productos()
+
+
+def encontrar_campana_producto_ofertado(referencia, fecha_factura):
+    """
+    Devuelve la primera campaña aplicable para referencia + fecha.
+    Si una referencia cae en dos campañas, se toma una sola vez para no duplicar.
+    """
+    if not referencia or not fecha_factura:
+        return None
+
+    fecha_factura = str(fecha_factura)[:10]
+
+    campanas_posibles = []
+
+    for variante in variantes_referencia_producto(referencia):
+        campanas_posibles.extend(INDICE_CAMPANAS_PRODUCTOS.get(variante, []))
+
+    for campana in campanas_posibles:
+        if campana['inicio'] <= fecha_factura <= campana['fin']:
+            return campana
+
+    return None
+
+
+def obtener_lineas_factura_productos_ofertados(models, uid, lista_ids_validos, min_date, max_date):
+    """
+    Replica la exportación validada en Odoo:
+    Contabilidad -> Apuntes contables
+      Publicado
+      Factura de cliente
+      Cuenta 401.01.01
+      Producto establecido
+      Fecha de factura en rango
+    """
+    fecha_inicio = max(min_date, FECHA_MINIMA_PRODUCTOS_OFERTADOS)
+
+    domain = [
+        ('move_id.move_type', '=', 'out_invoice'),
+        ('move_id.state', '=', 'posted'),
+        ('move_id.invoice_date', '>=', fecha_inicio),
+        ('move_id.invoice_date', '<=', max_date),
+        ('account_id.code', '=', '401.01.01'),
+        ('product_id', '!=', False),
+        ('partner_id', 'in', lista_ids_validos)
+    ]
+
+    return fetch_all_odoo(
+        models,
+        uid,
+        'account.move.line',
+        domain,
+        [
+            'id',
+            'date',
+            'move_id',
+            'partner_id',
+            'account_id',
+            'name',
+            'product_id',
+            'quantity',
+            'price_unit',
+            'price_subtotal',
+            'price_total'
+        ],
+        order='date asc'
+    )
+
+
+def calcular_productos_ofertados_por_campanas(models, uid, lista_ids_validos, min_date, max_date, odoo_id_to_clave, fechas_por_clave):
+    """
+    Calcula productos ofertados usando facturas reales de Odoo por referencia interna y fecha.
+    Retorna un diccionario con total con IVA tomado por clave.
+    """
+    lineas = obtener_lineas_factura_productos_ofertados(
+        models,
+        uid,
+        lista_ids_validos,
+        min_date,
+        max_date
+    )
+
+    product_ids = list({
+        obtener_id_m2o(linea.get('product_id'))
+        for linea in lineas
+        if obtener_id_m2o(linea.get('product_id'))
+    })
+
+    productos = obtener_productos_por_ids(models, uid, product_ids)
+    producto_por_id = {p['id']: p for p in productos}
+
+    totales_por_clave = {}
+    detalle = []
+
+    for linea in lineas:
+        partner = linea.get('partner_id')
+
+        if not partner:
+            continue
+
+        partner_id = partner[0]
+        clave = odoo_id_to_clave.get(partner_id)
+
+        if not clave:
+            continue
+
+        fecha_factura = str(linea.get('date') or '')[:10]
+
+        if not fecha_factura:
+            continue
+
+        if fecha_factura < FECHA_MINIMA_PRODUCTOS_OFERTADOS:
+            continue
+
+        rango = fechas_por_clave.get(clave)
+
+        if rango and rango.get('inicio') and rango.get('fin'):
+            fecha_inicio_real = max(rango['inicio'], FECHA_MINIMA_PRODUCTOS_OFERTADOS)
+
+            if not (fecha_inicio_real <= fecha_factura <= rango['fin']):
+                continue
+
+        product_id = obtener_id_m2o(linea.get('product_id'))
+        producto_info = producto_por_id.get(product_id, {})
+        referencia = normalizar_referencia_producto(producto_info.get('default_code'))
+
+        campana = encontrar_campana_producto_ofertado(referencia, fecha_factura)
+
+        if not campana:
+            continue
+
+        total_con_iva = float(linea.get('price_total') or 0)
+        porcentaje = float(campana.get('porcentaje') or 1.0)
+        monto_tomado = total_con_iva * porcentaje
+
+        if monto_tomado <= 0:
+            continue
+
+        totales_por_clave[clave] = totales_por_clave.get(clave, 0.0) + monto_tomado
+
+        detalle.append({
+            'clave': clave,
+            'cliente': partner[1] if len(partner) > 1 else '',
+            'fecha_factura': fecha_factura,
+            'factura': obtener_nombre_m2o(linea.get('move_id')),
+            'referencia_interna': referencia,
+            'producto': obtener_nombre_m2o(linea.get('product_id')),
+            'cantidad': float(linea.get('quantity') or 0),
+            'precio_unitario_sin_iva': round(float(linea.get('price_unit') or 0), 2),
+            'subtotal_sin_iva': round(float(linea.get('price_subtotal') or 0), 2),
+            'total_con_iva': round(total_con_iva, 2),
+            'campana': campana['nombre'],
+            'porcentaje_tomado': porcentaje,
+            'monto_tomado': round(monto_tomado, 2)
+        })
+
+    return totales_por_clave, detalle
+
+
 # ==============================================================================
 # 1. FUNCIÓN MAESTRA: OBTENER DEDUCCIONES DESDE ODOO
 # ==============================================================================
@@ -771,77 +1764,24 @@ def obtener_deducciones_odoo(claves_db, fechas_por_clave):
         # ==========================================================================
         # B. PRODUCTOS OFERTADOS
         # ==========================================================================
-        datos_ofertados = obtener_registros_productos_ofertados(
+        # Nueva lógica:
+        # - Fuente: account.move.line / Apuntes contables
+        # - Filtros: facturas de cliente publicadas, cuenta 401.01.01, producto establecido
+        # - Cruce: referencia interna + fecha de campaña
+        # - Monto: price_total / total con IVA
+        productos_ofertados_por_clave, detalle_productos_ofertados = calcular_productos_ofertados_por_campanas(
             models,
             uid,
             lista_ids_validos,
             min_date,
-            max_date
+            max_date,
+            odoo_id_to_clave,
+            fechas_por_clave
         )
 
-        registros_ofertados = datos_ofertados['registros']
-        tags_ofertados = datos_ofertados['tags_ofertados']
-        tag_ids_ofertados = datos_ofertados['tag_ids_ofertados']
-
-        producto_por_id, plantilla_por_id, tag_por_id = preparar_productos_y_etiquetas(
-            models,
-            uid,
-            registros_ofertados,
-            tags_ofertados
-        )
-
-        for registro in registros_ofertados:
-            partner = registro.get('partner_id')
-
-            if not partner:
-                continue
-
-            partner_id = partner[0]
-            clave_encontrada = odoo_id_to_clave.get(partner_id)
-
-            if not clave_encontrada or clave_encontrada not in resultados_por_clave:
-                continue
-
-            fecha_registro = str(registro.get('date') or '')[:10]
-
-            if not fecha_registro:
-                continue
-
-            if fecha_registro < FECHA_MINIMA_PRODUCTOS_OFERTADOS:
-                continue
-
-            rango = fechas_por_clave.get(clave_encontrada)
-
-            if rango and rango.get('inicio') and rango.get('fin'):
-                fecha_inicio_real = max(rango['inicio'], FECHA_MINIMA_PRODUCTOS_OFERTADOS)
-
-                if not (fecha_inicio_real <= fecha_registro <= rango['fin']):
-                    continue
-
-            product_id = obtener_id_m2o(registro.get('product_id'))
-            producto_info = producto_por_id.get(product_id, {})
-
-            plantilla_id = obtener_id_m2o(registro.get('product_tmpl_id'))
-            plantilla_info = plantilla_por_id.get(plantilla_id, {})
-
-            etiquetas_producto = [
-                tag_por_id.get(tag_id, str(tag_id))
-                for tag_id in plantilla_info.get('product_tag_ids') or []
-                if tag_id in tag_ids_ofertados
-            ]
-
-            calculo = clasificar_producto_ofertado(
-                registro,
-                producto_info,
-                etiquetas_producto
-            )
-
-            monto = float(calculo.get('monto_descuento') or 0)
-
-            if monto <= 0:
-                continue
-
-            resultados_por_clave[clave_encontrada]['ofertado'] += monto
+        for clave_encontrada, monto_ofertado in productos_ofertados_por_clave.items():
+            if clave_encontrada in resultados_por_clave:
+                resultados_por_clave[clave_encontrada]['ofertado'] += float(monto_ofertado or 0)
 
         # ==========================================================================
         # B2. BICICLETAS DEMO
@@ -2508,6 +3448,350 @@ def debug_nc_garantias():
                 "garantias": round(sum(x["garantias"] for x in respuesta), 2),
                 "total_deducciones": round(sum(x["total_deducciones"] for x in respuesta), 2)
             }
+        }), 200
+
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({"error": str(e)}), 500
+
+    finally:
+        if cursor:
+            cursor.close()
+
+        if conexion:
+            conexion.close()
+
+@retroactivos_bp.route('/historial_facturas_productos_odoo', methods=['GET'])
+def historial_facturas_productos_odoo():
+    """
+    Historial de productos vendidos en facturas de cliente.
+    Replica la ruta de Odoo:
+    Contabilidad → Apuntes contables
+
+    Filtros:
+    - Publicado
+    - Tipo = Factura de cliente
+    - Cuenta = 401.01.01
+    - Producto establecido
+    - Fecha de factura entre inicio y fin
+
+    Uso:
+      /historial_facturas_productos_odoo
+      /historial_facturas_productos_odoo?inicio=2025-06-01&fin=2026-06-30
+      /historial_facturas_productos_odoo?inicio=2025-06-01&fin=2026-06-30&clave=GD380
+    """
+    resultado_odoo = get_odoo_models()
+    uid = resultado_odoo[0]
+    models = resultado_odoo[1]
+
+    if not uid:
+        return jsonify({"error": "No se pudo conectar a Odoo"}), 500
+
+    try:
+        fecha_inicio = request.args.get('inicio', '2025-06-01')
+        fecha_fin = request.args.get('fin', '2026-06-30')
+        clave = (request.args.get('clave', '') or '').strip().upper()
+
+        domain = [
+            ('move_id.move_type', '=', 'out_invoice'),
+            ('move_id.state', '=', 'posted'),
+            ('move_id.invoice_date', '>=', fecha_inicio),
+            ('move_id.invoice_date', '<=', fecha_fin),
+            ('account_id.code', '=', '401.01.01'),
+            ('product_id', '!=', False) 
+        ]
+
+        if clave:
+            domain += [
+                '|',
+                    ('partner_id.ref', 'ilike', clave),
+                    ('partner_id.name', 'ilike', clave)
+            ]
+
+        lineas = fetch_all_odoo(
+            models,
+            uid,
+            'account.move.line',
+            domain,
+            [
+                'id',
+                'date',
+                'move_id',
+                'partner_id',
+                'account_id',
+                'name',
+                'product_id',
+                'quantity',
+                'price_unit',
+                'price_subtotal',
+                'price_total'
+            ],
+            order='date asc'
+        )
+
+        product_ids = []
+
+        for linea in lineas:
+            product_id = obtener_id_m2o(linea.get('product_id'))
+
+            if product_id:
+                product_ids.append(product_id)
+
+        productos_por_id = {}
+
+        if product_ids:
+            productos = fetch_all_odoo(
+                models,
+                uid,
+                'product.product',
+                [('id', 'in', list(set(product_ids)))],
+                [
+                    'id',
+                    'name',
+                    'display_name',
+                    'default_code',
+                    'categ_id',
+                    'product_tmpl_id'
+                ],
+                batch_size=500
+            )
+
+            productos_por_id = {
+                p['id']: p
+                for p in productos
+            }
+
+        resultado = []
+
+        total_sin_iva = 0.0
+        total_con_iva = 0.0
+
+        for linea in lineas:
+            factura = linea.get('move_id') or []
+            cliente = linea.get('partner_id') or []
+            producto = linea.get('product_id') or []
+            cuenta = linea.get('account_id') or []
+
+            product_id = obtener_id_m2o(producto)
+            producto_info = productos_por_id.get(product_id, {})
+
+            cantidad = float(linea.get('quantity') or 0)
+            precio_unitario_sin_iva = float(linea.get('price_unit') or 0)
+            subtotal_sin_iva = float(linea.get('price_subtotal') or 0)
+            total_linea_con_iva = float(linea.get('price_total') or 0)
+
+            precio_unitario_con_iva = (
+                total_linea_con_iva / cantidad
+            ) if cantidad else 0.0
+
+            total_sin_iva += subtotal_sin_iva
+            total_con_iva += total_linea_con_iva
+
+            resultado.append({
+                "id_linea_odoo": linea.get('id'),
+
+                "numero_factura": factura[1] if len(factura) > 1 else "",
+                "fecha_factura": linea.get('date'),
+
+                "cliente": cliente[1] if len(cliente) > 1 else "",
+                "cliente_odoo_id": cliente[0] if cliente else None,
+
+                "producto": producto[1] if len(producto) > 1 else linea.get('name'),
+                "producto_odoo_id": product_id,
+                "referencia_interna": producto_info.get('default_code') or "",
+                "categoria_producto": obtener_nombre_m2o(producto_info.get('categ_id')),
+
+                "cantidad": cantidad,
+
+                "precio_unitario_sin_iva": round(precio_unitario_sin_iva, 2),
+                "precio_unitario_con_iva": round(precio_unitario_con_iva, 2),
+
+                "subtotal_sin_iva": round(subtotal_sin_iva, 2),
+                "total_con_iva": round(total_linea_con_iva, 2),
+
+                "cuenta": cuenta[1] if len(cuenta) > 1 else "",
+                "etiqueta": linea.get('name') or ""
+            })
+
+        return jsonify({
+            "periodo": {
+                "inicio": fecha_inicio,
+                "fin": fecha_fin,
+                "clave": clave or None
+            },
+            "filtros_replicados_odoo": {
+                "ruta": "Contabilidad → Apuntes contables",
+                "estado": "Publicado",
+                "tipo": "Factura de cliente",
+                "cuenta": "401.01.01 Ventas y/o servicios gravados a la tasa general",
+                "producto": "Producto establecido"
+            },
+            "registros": len(resultado),
+            "total_sin_iva": round(total_sin_iva, 2),
+            "total_con_iva": round(total_con_iva, 2),
+            "data": resultado
+        }), 200
+
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({"error": str(e)}), 500
+
+
+@retroactivos_bp.route('/debug_productos_ofertados_campanas', methods=['GET'])
+def debug_productos_ofertados_campanas():
+    resultado_odoo = get_odoo_models()
+    uid = resultado_odoo[0]
+    models = resultado_odoo[1]
+
+    if not uid:
+        return jsonify({"error": "No se pudo conectar a Odoo"}), 500
+
+    conexion = None
+    cursor = None
+
+    try:
+        fecha_inicio = request.args.get('inicio', '2025-06-01')
+        fecha_fin = request.args.get('fin', '2026-06-30')
+        clave_filtro = (request.args.get('clave', '') or '').strip().upper()
+        respetar_fechas_cliente = request.args.get('respetar_fechas_cliente', '1') == '1'
+
+        conexion = obtener_conexion()
+        cursor = conexion.cursor(dictionary=True)
+
+        cursor.execute("""
+            SELECT
+                clave,
+                nombre_cliente,
+                f_inicio,
+                f_fin
+            FROM clientes
+            WHERE clave IS NOT NULL
+        """)
+
+        clientes_db = cursor.fetchall()
+        claves_db = []
+        fechas_por_clave = {}
+
+        for c in clientes_db:
+            clave = str(c.get('clave') or '').strip().upper()
+
+            if not clave:
+                continue
+
+            if clave_filtro and clave != clave_filtro:
+                continue
+
+            claves_db.append(clave)
+
+            f_inicio = c.get('f_inicio')
+            f_fin = c.get('f_fin')
+
+            if isinstance(f_inicio, (date, datetime)):
+                f_inicio = f_inicio.strftime('%Y-%m-%d')
+
+            if isinstance(f_fin, (date, datetime)):
+                f_fin = f_fin.strftime('%Y-%m-%d')
+
+            fechas_por_clave[clave] = {
+                'inicio': f_inicio or fecha_inicio,
+                'fin': f_fin or fecha_fin
+            }
+
+        partners_odoo = models.execute_kw(
+            ODOO_DB,
+            uid,
+            ODOO_PASSWORD,
+            'res.partner',
+            'search_read',
+            [[]],
+            {'fields': ['id', 'name', 'ref', 'parent_id'], 'limit': 20000}
+        )
+
+        odoo_id_to_clave = {}
+
+        for p in partners_odoo:
+            ref_odoo = str(p.get('ref') or '').strip().upper()
+            name_odoo = str(p.get('name') or '').strip().upper()
+
+            for clave in claves_db:
+                if ref_odoo == clave or ref_odoo == f"{clave}-CA" or clave in name_odoo:
+                    odoo_id_to_clave[p['id']] = clave
+                    break
+
+        for p in partners_odoo:
+            if p['id'] not in odoo_id_to_clave and p.get('parent_id'):
+                parent_id = p['parent_id'][0] if isinstance(p['parent_id'], (list, tuple)) else p['parent_id']
+
+                if parent_id in odoo_id_to_clave:
+                    odoo_id_to_clave[p['id']] = odoo_id_to_clave[parent_id]
+
+        lista_ids_validos = list(odoo_id_to_clave.keys())
+
+        if not lista_ids_validos:
+            return jsonify({
+                "mensaje": "No se encontraron partners Odoo relacionados.",
+                "clave": clave_filtro or None
+            }), 200
+
+        if not respetar_fechas_cliente:
+            for clave in fechas_por_clave:
+                fechas_por_clave[clave] = {
+                    'inicio': fecha_inicio,
+                    'fin': fecha_fin
+                }
+
+        totales, detalle = calcular_productos_ofertados_por_campanas(
+            models,
+            uid,
+            lista_ids_validos,
+            fecha_inicio,
+            fecha_fin,
+            odoo_id_to_clave,
+            fechas_por_clave
+        )
+
+        resumen = []
+
+        for clave, total in totales.items():
+            resumen.append({
+                "clave": clave,
+                "total_productos_ofertados": round(float(total or 0), 2),
+                "registros": len([d for d in detalle if d.get('clave') == clave])
+            })
+
+        resumen = sorted(resumen, key=lambda x: x['total_productos_ofertados'], reverse=True)
+
+        return jsonify({
+            "periodo": {
+                "inicio": fecha_inicio,
+                "fin": fecha_fin,
+                "clave": clave_filtro or None,
+                "respetar_fechas_cliente": respetar_fechas_cliente
+            },
+            "fuente_odoo": {
+                "modelo": "account.move.line",
+                "ruta": "Contabilidad -> Apuntes contables",
+                "filtros": [
+                    "Publicado",
+                    "Asiento contable / Tipo = Factura de cliente",
+                    "Cuenta = 401.01.01",
+                    "Producto establecido",
+                    "Fecha de factura en rango"
+                ],
+                "monto": "price_total / Total con IVA"
+            },
+            "campanas": [
+                {
+                    "nombre": c['nombre'],
+                    "inicio": c['inicio'],
+                    "fin": c['fin'],
+                    "referencias": len(c.get('referencias', []))
+                }
+                for c in CAMPANAS_PRODUCTOS_OFERTADOS
+            ],
+            "total_general": round(sum(float(v or 0) for v in totales.values()), 2),
+            "resumen_por_cliente": resumen,
+            "detalle": detalle
         }), 200
 
     except Exception as e:
