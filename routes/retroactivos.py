@@ -1614,6 +1614,183 @@ def calcular_productos_ofertados_por_campanas(models, uid, lista_ids_validos, mi
     return totales_por_clave, detalle
 
 
+def calcular_productos_ofertados_por_etiqueta_sale_report(
+    models,
+    uid,
+    lista_ids_validos,
+    min_date,
+    max_date,
+    odoo_id_to_clave,
+    fechas_por_clave,
+    llaves_ya_tomadas=None
+):
+    """
+    Calcula productos ofertados desde:
+    Ventas -> Reportes -> Análisis de ventas
+
+    Filtros equivalentes en Odoo:
+    - Fecha de la orden dentro del rango
+    - Producto / Etiquetas de la plantilla del producto = Producto Ofertado
+    - Estado de factura = Facturado por completo
+    - Cliente dentro de los partners válidos
+
+    IMPORTANTE:
+    También respeta la fecha de inicio y fin del distribuidor desde clientes.f_inicio / clientes.f_fin.
+
+    Evita duplicar ventas ya tomadas por campañas/referencias usando:
+    clave + fecha + referencia + total_con_iva
+    """
+
+    llaves_ya_tomadas = llaves_ya_tomadas or set()
+
+    fecha_inicio_global = max(min_date, FECHA_MINIMA_PRODUCTOS_OFERTADOS)
+
+    tags_ofertados = obtener_tags_por_nombres(
+        models,
+        uid,
+        ['PRODUCTO OFERTADO']
+    )
+
+    tag_ids = [tag['id'] for tag in tags_ofertados]
+
+    if not tag_ids:
+        return {}, []
+
+    domain = [
+        ('date', '>=', f'{fecha_inicio_global} 00:00:00'),
+        ('date', '<=', f'{max_date} 23:59:59'),
+        ('partner_id', 'in', lista_ids_validos),
+        ('product_tmpl_id.product_tag_ids', 'in', tag_ids),
+        ('invoice_status', '=', 'invoiced')
+    ]
+
+    registros = fetch_all_odoo(
+        models,
+        uid,
+        'sale.report',
+        domain,
+        [
+            'id',
+            'date',
+            'name',
+            'order_reference',
+            'partner_id',
+            'commercial_partner_id',
+            'product_id',
+            'product_tmpl_id',
+            'categ_id',
+            'product_uom_qty',
+            'price_subtotal',
+            'price_total',
+            'discount_amount',
+            'invoice_status'
+        ],
+        order='date asc'
+    )
+
+    product_ids = list({
+        obtener_id_m2o(r.get('product_id'))
+        for r in registros
+        if obtener_id_m2o(r.get('product_id'))
+    })
+
+    productos = obtener_productos_por_ids(models, uid, product_ids)
+    producto_por_id = {
+        p['id']: p
+        for p in productos
+    }
+
+    totales_por_clave = {}
+    detalle = []
+
+    for registro in registros:
+        partner = registro.get('partner_id')
+        commercial_partner = registro.get('commercial_partner_id')
+
+        partner_id = obtener_id_m2o(partner)
+        commercial_partner_id = obtener_id_m2o(commercial_partner)
+
+        clave = None
+
+        # Primero intentamos con el contacto de la venta.
+        if partner_id:
+            clave = odoo_id_to_clave.get(partner_id)
+
+        # Si no se encontró, intentamos con el commercial_partner_id.
+        # Esto ayuda cuando Odoo muestra contactos hijos tipo "Cycling riding B2B".
+        if not clave and commercial_partner_id:
+            clave = odoo_id_to_clave.get(commercial_partner_id)
+
+        if not clave:
+            continue
+
+        fecha_orden = str(registro.get('date') or '')[:10]
+
+        if not fecha_orden:
+            continue
+
+        if fecha_orden < FECHA_MINIMA_PRODUCTOS_OFERTADOS:
+            continue
+
+        # ==========================================================
+        # VALIDACIÓN DE FECHA DEL DISTRIBUIDOR
+        # ==========================================================
+        rango = fechas_por_clave.get(clave)
+
+        if rango and rango.get('inicio') and rango.get('fin'):
+            fecha_inicio_real = max(
+                rango['inicio'],
+                FECHA_MINIMA_PRODUCTOS_OFERTADOS
+            )
+
+            if not (fecha_inicio_real <= fecha_orden <= rango['fin']):
+                continue
+
+        product_id = obtener_id_m2o(registro.get('product_id'))
+        producto_info = producto_por_id.get(product_id, {})
+
+        referencia = normalizar_referencia_producto(
+            producto_info.get('default_code')
+        )
+
+        total_con_iva = float(registro.get('price_total') or 0)
+
+        if total_con_iva <= 0:
+            continue
+
+        # Evita duplicar contra lo ya tomado por campañas/referencias.
+        llave_dedupe = (
+            str(clave).strip().upper(),
+            fecha_orden,
+            referencia,
+            round(total_con_iva, 2)
+        )
+
+        if llave_dedupe in llaves_ya_tomadas:
+            continue
+
+        totales_por_clave[clave] = (
+            totales_por_clave.get(clave, 0.0) + total_con_iva
+        )
+
+        detalle.append({
+            'clave': clave,
+            'cliente': obtener_nombre_m2o(partner),
+            'fecha_orden': fecha_orden,
+            'orden': obtener_nombre_m2o(registro.get('order_reference')),
+            'referencia_interna': referencia,
+            'producto': obtener_nombre_m2o(registro.get('product_id')),
+            'cantidad': float(registro.get('product_uom_qty') or 0),
+            'subtotal_sin_iva': round(float(registro.get('price_subtotal') or 0), 2),
+            'total_con_iva': round(total_con_iva, 2),
+            'fuente': 'SALE_REPORT_ETIQUETA_PRODUCTO_OFERTADO',
+            'etiqueta': 'Producto Ofertado',
+            'monto_tomado': round(total_con_iva, 2)
+        })
+
+    return totales_por_clave, detalle
+
+
 # ==============================================================================
 # 1. FUNCIÓN MAESTRA: OBTENER DEDUCCIONES DESDE ODOO
 # ==============================================================================
@@ -1764,11 +1941,10 @@ def obtener_deducciones_odoo(claves_db, fechas_por_clave):
         # ==========================================================================
         # B. PRODUCTOS OFERTADOS
         # ==========================================================================
-        # Nueva lógica:
-        # - Fuente: account.move.line / Apuntes contables
-        # - Filtros: facturas de cliente publicadas, cuenta 401.01.01, producto establecido
-        # - Cruce: referencia interna + fecha de campaña
-        # - Monto: price_total / total con IVA
+        # Fuente 1:
+        # account.move.line / Apuntes contables
+        # Cruce por referencia interna + fecha de campaña.
+        # Respeta fechas del distribuidor por fechas_por_clave.
         productos_ofertados_por_clave, detalle_productos_ofertados = calcular_productos_ofertados_por_campanas(
             models,
             uid,
@@ -1779,9 +1955,50 @@ def obtener_deducciones_odoo(claves_db, fechas_por_clave):
             fechas_por_clave
         )
 
+        # Llaves para evitar duplicar contra sale.report.
+        # Formato:
+        # clave + fecha + referencia + total_con_iva
+        llaves_ya_tomadas = set()
+
+        for item in detalle_productos_ofertados:
+            llaves_ya_tomadas.add((
+                str(item.get('clave') or '').strip().upper(),
+                str(item.get('fecha_factura') or '')[:10],
+                normalizar_referencia_producto(item.get('referencia_interna')),
+                round(float(item.get('total_con_iva') or 0), 2)
+            ))
+
+        # Fuente 2:
+        # Ventas -> Reportes -> Análisis de ventas
+        # Producto / Etiquetas de plantilla = Producto Ofertado
+        # Estado factura = Facturado por completo.
+        # También respeta fechas del distribuidor por fechas_por_clave.
+        productos_ofertados_etiqueta_por_clave, detalle_productos_ofertados_etiqueta = calcular_productos_ofertados_por_etiqueta_sale_report(
+            models,
+            uid,
+            lista_ids_validos,
+            min_date,
+            max_date,
+            odoo_id_to_clave,
+            fechas_por_clave,
+            llaves_ya_tomadas
+        )
+
+        # Sumamos fuente 1: campañas por referencia interna.
         for clave_encontrada, monto_ofertado in productos_ofertados_por_clave.items():
             if clave_encontrada in resultados_por_clave:
                 resultados_por_clave[clave_encontrada]['ofertado'] += float(monto_ofertado or 0)
+
+        # Sumamos fuente 2: etiqueta Producto Ofertado desde Análisis de ventas.
+        for clave_encontrada, monto_ofertado in productos_ofertados_etiqueta_por_clave.items():
+            if clave_encontrada in resultados_por_clave:
+                resultados_por_clave[clave_encontrada]['ofertado'] += float(monto_ofertado or 0)
+
+        # Debug opcional para validar Cycling Riding / GD380.
+        if 'GD380' in resultados_por_clave:
+            print("DEBUG OFERTADOS GD380 CAMPANAS:", round(productos_ofertados_por_clave.get('GD380', 0), 2))
+            print("DEBUG OFERTADOS GD380 ETIQUETA:", round(productos_ofertados_etiqueta_por_clave.get('GD380', 0), 2))
+            print("DEBUG OFERTADOS GD380 TOTAL:", round(resultados_por_clave['GD380']['ofertado'], 2))
 
         # ==========================================================================
         # B2. BICICLETAS DEMO
@@ -2071,26 +2288,17 @@ def ejecutar_sincronizacion_y_calculos():
         cursor.execute("""
             UPDATE tabla_retroactivos
             SET 
-                TOTAL_ACUMULADO = (
-                    COALESCE(COMPRA_GLOBAL_SCOTT, 0) + 
-                    COALESCE(COMPRA_GLOBAL_APPAREL, 0)
-                ),
+                TOTAL_ACUMULADO = COALESCE(COMPRAS_TOTALES_CRUDO, 0),
 
                 compra_anual_crudo = (
-                    (
-                        COALESCE(COMPRA_GLOBAL_SCOTT, 0) + 
-                        COALESCE(COMPRA_GLOBAL_APPAREL, 0)
-                    ) -
+                    COALESCE(COMPRAS_TOTALES_CRUDO, 0) -
                     COALESCE(notas_credito, 0) -
                     COALESCE(garantias, 0)
                 ),
 
                 compra_adicional = (
                     (
-                        (
-                            COALESCE(COMPRA_GLOBAL_SCOTT, 0) + 
-                            COALESCE(COMPRA_GLOBAL_APPAREL, 0)
-                        ) -
+                        COALESCE(COMPRAS_TOTALES_CRUDO, 0) -
                         COALESCE(notas_credito, 0) -
                         COALESCE(garantias, 0)
                     ) - COALESCE(COMPRA_MINIMA_ANUAL, 0)
@@ -2263,7 +2471,11 @@ def obtener_retroactivos():
             )
 
             fila['acumulado_global_calculado'] = (
-                (fila.get('COMPRA_GLOBAL_SCOTT', 0) + fila.get('COMPRA_GLOBAL_APPAREL', 0)) -
+                (
+                    fila.get('COMPRA_GLOBAL_SCOTT', 0) +
+                    fila.get('COMPRA_GLOBAL_APPAREL', 0) +
+                    fila.get('COMPRA_GLOBAL_BOLD', 0)
+                ) -
                 fila.get('notas_credito', 0) -
                 fila.get('garantias', 0)
             )
@@ -2352,7 +2564,11 @@ def obtener_retroactivo_individual(identificador):
         )
 
         cliente_data['acumulado_global_calculado'] = (
-            (cliente_data.get('COMPRA_GLOBAL_SCOTT', 0) + cliente_data.get('COMPRA_GLOBAL_APPAREL', 0)) -
+            (
+                cliente_data.get('COMPRA_GLOBAL_SCOTT', 0) +
+                cliente_data.get('COMPRA_GLOBAL_APPAREL', 0) +
+                cliente_data.get('COMPRA_GLOBAL_BOLD', 0)
+            ) -
             cliente_data.get('notas_credito', 0) -
             cliente_data.get('garantias', 0)
         )

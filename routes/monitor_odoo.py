@@ -798,6 +798,16 @@ def _recalcular_acumulados_previo(conexion, cursor):
         )
     """
 
+    MARCAS_VALIDAS_COND = """
+        UPPER(TRIM(COALESCE(m.marca, ''))) IN (
+            'SCOTT',
+            'MEGAMO',
+            'BOLD',
+            'SYNCROS',
+            'VITTORIA'
+        )
+    """
+
     cursor.execute(f"""
         SELECT
             m.contacto_referencia AS clave,
@@ -808,12 +818,18 @@ def _recalcular_acumulados_previo(conexion, cursor):
             SUM(CASE WHEN m.marca = 'VITTORIA' THEN m.venta_total ELSE 0 END)          AS vittoria,
             SUM(
                 CASE 
-                    WHEN UPPER(TRIM(m.marca)) = 'BOLD'
-                    AND UPPER(TRIM(m.subcategoria)) = 'BICICLETA'
+                    WHEN UPPER(TRIM(COALESCE(m.marca, ''))) = 'BOLD'
                     THEN COALESCE(m.venta_total, 0)
                     ELSE 0
                 END
             ) AS bold,
+            SUM(
+                CASE 
+                    WHEN {MARCAS_VALIDAS_COND}
+                    THEN COALESCE(m.venta_total, 0)
+                    ELSE 0
+                END
+            ) AS avance_marcas_validas,
             -- SCOTT bicicletas: total y por periodo
             SUM(CASE WHEN {SCOTT_COND} THEN m.venta_total ELSE 0 END)                  AS scott,
             SUM(CASE WHEN m.fecha_factura <= '2025-08-31'
@@ -914,6 +930,7 @@ def _recalcular_acumulados_previo(conexion, cursor):
             vittoria = sf(claves, 'vittoria')
             bold     = sf(claves, 'bold')
             scott    = sf(claves, 'scott')
+            avance_marcas_validas = sf(claves, 'avance_marcas_validas')
             p_syncros  = {p: sf(claves, f'syncros_{p}')  for p in PERIODS}
             p_apparel  = {p: sf(claves, f'apparel_{p}')  for p in PERIODS}
             p_vittoria = {p: sf(claves, f'vittoria_{p}') for p in PERIODS}
@@ -925,14 +942,15 @@ def _recalcular_acumulados_previo(conexion, cursor):
             vittoria = flt(row.get('vittoria'))
             bold     = flt(row.get('bold'))
             scott    = flt(row.get('scott'))
+            avance_marcas_validas = flt(row.get('avance_marcas_validas'))
             p_syncros  = {p: flt(row.get(f'syncros_{p}'))  for p in PERIODS}
             p_apparel  = {p: flt(row.get(f'apparel_{p}'))  for p in PERIODS}
             p_vittoria = {p: flt(row.get(f'vittoria_{p}')) for p in PERIODS}
             p_scott    = {p: flt(row.get(f'scott_{p}'))    for p in PERIODS}
 
-        # APP = SYNCROS + APPAREL + VITTORIA (componentes/kits/remplazos NO cuentan)
+
         app_global = round(syncros + apparel + vittoria, 2)
-        acum_total = round(scott + app_global, 2)
+        acum_total = round(avance_marcas_validas, 2)
         p_app = {p: round(p_syncros[p] + p_apparel[p] + p_vittoria[p], 2) for p in PERIODS}
 
         cm_ini = flt(fila.get('compra_minima_inicial'))
