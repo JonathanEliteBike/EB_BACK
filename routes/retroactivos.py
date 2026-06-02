@@ -953,16 +953,25 @@ def obtener_deducciones_odoo(claves_db, fechas_por_clave):
         for nc in todas_nc_moves:
             if nc['id'] in move_ids_garantia:
                 continue  # Es garantía, ya contada arriba
+
             pid = nc['partner_id'][0] if nc['partner_id'] else None
+
             if not pid:
                 continue
+
             ref_texto = (str(nc.get('name') or '') + ' ' + str(nc.get('ref') or '')).upper()
-            if 'APLANT' in ref_texto or 'ANTICIPO' in ref_texto:
-                continue
-            agregar_valor(pid, 'nc', nc['amount_total'], nc.get('invoice_date'))
+
+            agregar_valor(
+                pid,
+                'nc',
+                nc['amount_total'],
+                nc.get('invoice_date')
+            )
+
+        if 'GD380' in resultados_por_clave:
+            print("DEBUG FINAL SINCRONIZAR GD380:", resultados_por_clave['GD380'])
 
         return resultados_por_clave
-
     except Exception as e:
         print(f"❌ Error Odoo: {e}")
         traceback.print_exc()
@@ -1117,8 +1126,8 @@ def ejecutar_sincronizacion_y_calculos():
                 ))
 
         # ==========================================================================
-# CÁLCULOS BASE
-# ==========================================================================
+        # CÁLCULOS BASE
+        # ==========================================================================
         cursor.execute("""
             UPDATE tabla_retroactivos
             SET 
@@ -1145,20 +1154,6 @@ def ejecutar_sincronizacion_y_calculos():
                         COALESCE(notas_credito, 0) -
                         COALESCE(garantias, 0)
                     ) - COALESCE(COMPRA_MINIMA_ANUAL, 0)
-                ),
-
-                importe_final = (
-                    (
-                        (
-                            COALESCE(COMPRA_GLOBAL_SCOTT, 0) + 
-                            COALESCE(COMPRA_GLOBAL_APPAREL, 0)
-                        ) -
-                        COALESCE(notas_credito, 0) -
-                        COALESCE(garantias, 0)
-                    ) -
-                    COALESCE(productos_ofertados, 0) -
-                    COALESCE(bicicleta_demo, 0) -
-                    COALESCE(bicicletas_bold, 0)
                 )
         """)
 
@@ -2151,3 +2146,377 @@ def debug_buscar_deal_navideno():
     except Exception as e:
         traceback.print_exc()
         return jsonify({"error": str(e)}), 500
+
+@retroactivos_bp.route('/debug_nc_garantias', methods=['GET'])
+def debug_nc_garantias():
+    """
+    Debug de notas de crédito y garantías por cliente.
+    NO actualiza BD. Solo consulta Odoo y devuelve totales + detalle.
+    Uso:
+      /debug_nc_garantias
+      /debug_nc_garantias?clave=GD380
+      /debug_nc_garantias?inicio=2025-05-01&fin=2026-06-30
+    """
+    resultado_odoo = get_odoo_models()
+    uid = resultado_odoo[0]
+    models = resultado_odoo[1]
+
+    if not uid:
+        return jsonify({"error": "No se pudo conectar a Odoo"}), 500
+
+    conexion = None
+    cursor = None
+
+    try:
+        fecha_inicio = request.args.get('inicio', FECHA_MINIMA_RETROACTIVOS)
+        fecha_fin = request.args.get('fin', '2026-06-30')
+        clave_filtro = (request.args.get('clave', '') or '').strip().upper()
+
+        conexion = obtener_conexion()
+        cursor = conexion.cursor(dictionary=True)
+
+        cursor.execute("""
+            SELECT 
+                clave,
+                nombre_cliente,
+                f_inicio,
+                f_fin
+            FROM clientes
+            WHERE clave IS NOT NULL
+        """)
+
+        clientes_db = cursor.fetchall()
+
+        claves_db = []
+        fechas_por_clave = {}
+        cliente_por_clave = {}
+
+        for c in clientes_db:
+            clave = str(c.get('clave') or '').strip().upper()
+
+            if not clave:
+                continue
+
+            if clave_filtro and clave != clave_filtro:
+                continue
+
+            f_inicio = c.get('f_inicio')
+            f_fin = c.get('f_fin')
+
+            if isinstance(f_inicio, (date, datetime)):
+                f_inicio = f_inicio.strftime('%Y-%m-%d')
+
+            if isinstance(f_fin, (date, datetime)):
+                f_fin = f_fin.strftime('%Y-%m-%d')
+
+            claves_db.append(clave)
+
+            fechas_por_clave[clave] = {
+                'inicio': f_inicio or fecha_inicio,
+                'fin': f_fin or fecha_fin
+            }
+
+            cliente_por_clave[clave] = c.get('nombre_cliente') or ''
+
+        if not claves_db:
+            return jsonify({
+                "mensaje": "No se encontraron clientes para el filtro.",
+                "clave_filtro": clave_filtro
+            }), 200
+
+        # ==========================================================
+        # MAPEAR PARTNERS ODOO -> CLAVE
+        # ==========================================================
+        partners_odoo = models.execute_kw(
+            ODOO_DB,
+            uid,
+            ODOO_PASSWORD,
+            'res.partner',
+            'search_read',
+            [[]],
+            {
+                'fields': ['id', 'name', 'ref', 'parent_id'],
+                'limit': 10000
+            }
+        )
+
+        odoo_id_to_clave = {}
+
+        for p in partners_odoo:
+            ref_odoo = str(p.get('ref') or '').strip().upper()
+            name_odoo = str(p.get('name') or '').strip().upper()
+
+            for clave in claves_db:
+                clave_limpia = str(clave).strip().upper()
+
+                if (
+                    ref_odoo == clave_limpia or
+                    ref_odoo == f"{clave_limpia}-CA" or
+                    clave_limpia in name_odoo
+                ):
+                    odoo_id_to_clave[p['id']] = clave_limpia
+                    break
+
+        redirecciones = {
+            'VICTOR HUGO VILLANUEVA GUZMAN': 'LC657',
+            'BICICLETAS SCJM': 'LC657',
+            'MARCO TULIO ANDRADE NAVARRO': 'JC539',
+            'NARUCO': 'LC625'
+        }
+
+        for p in partners_odoo:
+            name_odoo = str(p.get('name') or '').strip().upper()
+
+            if p['id'] not in odoo_id_to_clave and name_odoo in redirecciones:
+                clave_redirect = redirecciones[name_odoo]
+
+                if clave_redirect in claves_db:
+                    odoo_id_to_clave[p['id']] = clave_redirect
+
+        # Mapear contactos hijos al padre
+        for p in partners_odoo:
+            if p['id'] not in odoo_id_to_clave and p.get('parent_id'):
+                parent_id = p['parent_id'][0] if isinstance(p['parent_id'], (list, tuple)) else p['parent_id']
+
+                if parent_id in odoo_id_to_clave:
+                    odoo_id_to_clave[p['id']] = odoo_id_to_clave[parent_id]
+
+        lista_ids_validos = list(odoo_id_to_clave.keys())
+
+        if not lista_ids_validos:
+            return jsonify({
+                "mensaje": "No se encontraron partners Odoo relacionados a las claves.",
+                "claves": claves_db
+            }), 200
+
+        resumen = {}
+
+        for clave in claves_db:
+            resumen[clave] = {
+                "clave": clave,
+                "cliente": cliente_por_clave.get(clave, ''),
+                "notas_credito": 0.0,
+                "garantias": 0.0,
+                "total_deducciones": 0.0,
+                "detalle_notas_credito": [],
+                "detalle_garantias": []
+            }
+
+        def fecha_valida_para_clave(clave, fecha_linea):
+            if not fecha_linea:
+                return False
+
+            fecha_linea = str(fecha_linea)[:10]
+
+            if fecha_linea < FECHA_MINIMA_RETROACTIVOS:
+                return False
+
+            rango = fechas_por_clave.get(clave)
+
+            if rango and rango.get('inicio') and rango.get('fin'):
+                inicio_real = max(rango['inicio'], FECHA_MINIMA_RETROACTIVOS)
+
+                if not (inicio_real <= fecha_linea <= rango['fin']):
+                    return False
+
+            if not (fecha_inicio <= fecha_linea <= fecha_fin):
+                return False
+
+            return True
+
+        # ==========================================================
+        # GARANTÍAS
+        # ==========================================================
+        ids_cuenta_garantia = models.execute_kw(
+            ODOO_DB,
+            uid,
+            ODOO_PASSWORD,
+            'account.account',
+            'search',
+            [[('code', '=', '402.01.05')]]
+        )
+
+        lineas_garantia_raw = models.execute_kw(
+            ODOO_DB,
+            uid,
+            ODOO_PASSWORD,
+            'account.move.line',
+            'search_read',
+            [[
+                ('move_id.move_type', '=', 'out_refund'),
+                ('move_id.state', '=', 'posted'),
+                ('move_id.invoice_date', '>=', fecha_inicio),
+                ('move_id.invoice_date', '<=', fecha_fin),
+                ('partner_id', 'in', lista_ids_validos),
+                ('account_id', 'in', ids_cuenta_garantia)
+            ]],
+            {
+                'fields': ['move_id', 'partner_id', 'date', 'account_id', 'name'],
+                'limit': 10000
+            }
+        )
+
+        move_ids_garantia = set()
+        move_meta_garantia = {}
+
+        for linea in lineas_garantia_raw:
+            move = linea.get('move_id')
+            partner = linea.get('partner_id')
+
+            if not move or not partner:
+                continue
+
+            move_id = move[0]
+            partner_id = partner[0]
+            clave = odoo_id_to_clave.get(partner_id)
+            fecha = str(linea.get('date') or '')[:10]
+
+            if not clave or clave not in resumen:
+                continue
+
+            if not fecha_valida_para_clave(clave, fecha):
+                continue
+
+            move_ids_garantia.add(move_id)
+            move_meta_garantia[move_id] = {
+                "partner_id": partner_id,
+                "partner_nombre": partner[1],
+                "clave": clave,
+                "fecha": fecha,
+                "linea": linea.get('name'),
+                "cuenta": linea.get('account_id')
+            }
+
+        if move_ids_garantia:
+            facturas_garantia = models.execute_kw(
+                ODOO_DB,
+                uid,
+                ODOO_PASSWORD,
+                'account.move',
+                'read',
+                [list(move_ids_garantia)],
+                {
+                    'fields': ['id', 'name', 'ref', 'amount_total', 'invoice_date']
+                }
+            )
+
+            for factura in facturas_garantia:
+                meta = move_meta_garantia.get(factura['id'])
+
+                if not meta:
+                    continue
+
+                clave = meta['clave']
+                monto = abs(float(factura.get('amount_total') or 0))
+
+                resumen[clave]["garantias"] += monto
+                resumen[clave]["detalle_garantias"].append({
+                    "move_id": factura.get('id'),
+                    "numero": factura.get('name'),
+                    "referencia": factura.get('ref'),
+                    "fecha": factura.get('invoice_date') or meta.get('fecha'),
+                    "partner_id": meta.get('partner_id'),
+                    "partner_nombre": meta.get('partner_nombre'),
+                    "cuenta": meta.get('cuenta'),
+                    "linea": meta.get('linea'),
+                    "monto": round(monto, 2)
+                })
+
+        # ==========================================================
+        # NOTAS DE CRÉDITO
+        # ==========================================================
+        todas_nc_moves = models.execute_kw(
+            ODOO_DB,
+            uid,
+            ODOO_PASSWORD,
+            'account.move',
+            'search_read',
+            [[
+                ('move_type', '=', 'out_refund'),
+                ('state', '=', 'posted'),
+                ('invoice_date', '>=', fecha_inicio),
+                ('invoice_date', '<=', fecha_fin),
+                ('partner_id', 'in', lista_ids_validos)
+            ]],
+            {
+                'fields': ['id', 'partner_id', 'amount_total', 'invoice_date', 'name', 'ref'],
+                'limit': 10000
+            }
+        )
+
+        for nc in todas_nc_moves:
+            if nc['id'] in move_ids_garantia:
+                continue
+
+            partner = nc.get('partner_id')
+
+            if not partner:
+                continue
+
+            partner_id = partner[0]
+            clave = odoo_id_to_clave.get(partner_id)
+
+            if not clave or clave not in resumen:
+                continue
+
+            fecha_nc = str(nc.get('invoice_date') or '')[:10]
+
+            if not fecha_valida_para_clave(clave, fecha_nc):
+                continue
+
+            ref_texto = (str(nc.get('name') or '') + ' ' + str(nc.get('ref') or '')).upper()
+
+            if 'APLANT' in ref_texto or 'ANTICIPO' in ref_texto:
+                continue
+
+            monto = abs(float(nc.get('amount_total') or 0))
+
+            resumen[clave]["notas_credito"] += monto
+            resumen[clave]["detalle_notas_credito"].append({
+                "move_id": nc.get('id'),
+                "numero": nc.get('name'),
+                "referencia": nc.get('ref'),
+                "fecha": nc.get('invoice_date'),
+                "partner_id": partner_id,
+                "partner_nombre": partner[1],
+                "monto": round(monto, 2)
+            })
+
+        respuesta = []
+
+        for item in resumen.values():
+            item["notas_credito"] = round(item["notas_credito"], 2)
+            item["garantias"] = round(item["garantias"], 2)
+            item["total_deducciones"] = round(item["notas_credito"] + item["garantias"], 2)
+            respuesta.append(item)
+
+        respuesta = sorted(
+            respuesta,
+            key=lambda x: x["total_deducciones"],
+            reverse=True
+        )
+
+        return jsonify({
+            "periodo": {
+                "inicio": fecha_inicio,
+                "fin": fecha_fin,
+                "clave": clave_filtro or None
+            },
+            "resumen": respuesta,
+            "totales_generales": {
+                "notas_credito": round(sum(x["notas_credito"] for x in respuesta), 2),
+                "garantias": round(sum(x["garantias"] for x in respuesta), 2),
+                "total_deducciones": round(sum(x["total_deducciones"] for x in respuesta), 2)
+            }
+        }), 200
+
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({"error": str(e)}), 500
+
+    finally:
+        if cursor:
+            cursor.close()
+
+        if conexion:
+            conexion.close()
