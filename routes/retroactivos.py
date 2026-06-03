@@ -1830,8 +1830,15 @@ def obtener_deducciones_odoo(claves_db, fechas_por_clave):
     for p in partners_odoo:
         name_odoo = str(p.get('name', '')).strip().upper()
 
-        if p['id'] not in odoo_id_to_clave and name_odoo in redirecciones:
-            odoo_id_to_clave[p['id']] = redirecciones[name_odoo]
+        if name_odoo in redirecciones:
+            clave_redirect = redirecciones[name_odoo]
+
+            if clave_redirect in claves_db:
+                odoo_id_to_clave[p['id']] = clave_redirect
+                print(
+                    f"DEBUG REDIRECCION FORZADA: partner_id={p['id']} "
+                    f"name={name_odoo} -> clave={clave_redirect}"
+                )
 
     # Segunda pasada: mapear cuentas hijas (contactos secundarios) al mismo CLAVE del padre.
     # Esto cubre casos como "Cycling riding B2B" que es hija de CYCLING RIDING DE MEXICO (GD380).
@@ -1995,10 +2002,11 @@ def obtener_deducciones_odoo(claves_db, fechas_por_clave):
                 resultados_por_clave[clave_encontrada]['ofertado'] += float(monto_ofertado or 0)
 
         # Debug opcional para validar Cycling Riding / GD380.
-        if 'GD380' in resultados_por_clave:
-            print("DEBUG OFERTADOS GD380 CAMPANAS:", round(productos_ofertados_por_clave.get('GD380', 0), 2))
-            print("DEBUG OFERTADOS GD380 ETIQUETA:", round(productos_ofertados_etiqueta_por_clave.get('GD380', 0), 2))
-            print("DEBUG OFERTADOS GD380 TOTAL:", round(resultados_por_clave['GD380']['ofertado'], 2))
+        for clave_debug in ['GD380', 'LC657']:
+            if clave_debug in resultados_por_clave:
+                print(f"DEBUG OFERTADOS {clave_debug} CAMPANAS:", round(productos_ofertados_por_clave.get(clave_debug, 0), 2))
+                print(f"DEBUG OFERTADOS {clave_debug} ETIQUETA:", round(productos_ofertados_etiqueta_por_clave.get(clave_debug, 0), 2))
+                print(f"DEBUG OFERTADOS {clave_debug} TOTAL:", round(resultados_por_clave[clave_debug]['ofertado'], 2))
 
         # ==========================================================================
         # B2. BICICLETAS DEMO
@@ -2186,6 +2194,11 @@ def ejecutar_sincronizacion_y_calculos():
 
         datos_por_clave = obtener_deducciones_odoo(claves_db, fechas_por_clave)
 
+        if 'LC657' in datos_por_clave:
+            print("DEBUG SINCRONIZAR LC657 datos_por_clave:", datos_por_clave['LC657'])
+        else:
+            print("DEBUG SINCRONIZAR LC657 NO EXISTE EN datos_por_clave")
+
         cursor.execute("""
             UPDATE tabla_retroactivos 
             SET 
@@ -2200,30 +2213,27 @@ def ejecutar_sincronizacion_y_calculos():
         """)
 
         for clave, valores in datos_por_clave.items():
-            if (
-                valores['nc'] != 0 or
-                valores['garantia'] != 0 or
-                valores['ofertado'] != 0 or
-                valores['demo'] != 0 or
-                valores['bold'] != 0
-            ):
-                cursor.execute("""
-                    UPDATE tabla_retroactivos 
-                    SET 
-                        notas_credito = %s,
-                        garantias = %s,
-                        productos_ofertados = %s,
-                        bicicleta_demo = %s,
-                        bicicletas_bold = %s
-                    WHERE CLAVE = %s
-                """, (
-                    valores['nc'],
-                    valores['garantia'],
-                    valores['ofertado'],
-                    valores['demo'],
-                    valores['bold'],
-                    clave
-                ))
+            cursor.execute("""
+                UPDATE tabla_retroactivos 
+                SET 
+                    notas_credito = %s,
+                    garantias = %s,
+                    productos_ofertados = %s,
+                    bicicleta_demo = %s,
+                    bicicletas_bold = %s
+                WHERE UPPER(TRIM(CLAVE)) = UPPER(TRIM(%s))
+            """, (
+                float(valores.get('nc') or 0),
+                float(valores.get('garantia') or 0),
+                float(valores.get('ofertado') or 0),
+                float(valores.get('demo') or 0),
+                float(valores.get('bold') or 0),
+                clave
+            ))
+
+            if clave == 'LC657':
+                print("DEBUG UPDATE LC657 rowcount:", cursor.rowcount)
+                print("DEBUG UPDATE LC657 productos_ofertados:", float(valores.get('ofertado') or 0))
 
         # ==========================================================================
         # BOLD
@@ -2393,12 +2403,29 @@ def ejecutar_sincronizacion_y_calculos():
         conexion.commit()
         print("✅ Sincronización y cálculos terminados correctamente.")
 
+        cursor_dict.execute("""
+            SELECT 
+                CLAVE,
+                CLIENTE,
+                productos_ofertados,
+                notas_credito,
+                garantias
+            FROM tabla_retroactivos
+            WHERE UPPER(TRIM(CLAVE)) = 'LC657'
+            LIMIT 1
+        """)
+
+        debug_lc657_db = cursor_dict.fetchone()
+        print("DEBUG DB LC657 DESPUÉS DE COMMIT:", debug_lc657_db)
+
     except Exception as e:
         if conexion:
             conexion.rollback()
 
         print(f"❌ Error en auto-sync: {e}")
         traceback.print_exc()
+
+        raise
 
     finally:
         if cursor_dict:
@@ -2494,15 +2521,47 @@ def obtener_retroactivos():
         if conexion:
             conexion.close()
 
-
 # ==============================================================================
 # 4. ENDPOINT POST MANUAL
 # ==============================================================================
 @retroactivos_bp.route('/sincronizar_notas', methods=['POST'])
 def sincronizar_notas_odoo():
-    ejecutar_sincronizacion_y_calculos()
-    return jsonify({"mensaje": "Sincronización exitosa"}), 200
+    try:
+        ejecutar_sincronizacion_y_calculos()
 
+        conexion = obtener_conexion()
+        cursor = conexion.cursor(dictionary=True)
+
+        cursor.execute("""
+            SELECT 
+                CLAVE,
+                CLIENTE,
+                productos_ofertados,
+                notas_credito,
+                garantias,
+                importe_final
+            FROM tabla_retroactivos
+            WHERE UPPER(TRIM(CLAVE)) = 'LC657'
+            LIMIT 1
+        """)
+
+        debug_lc657 = cursor.fetchone()
+
+        cursor.close()
+        conexion.close()
+
+        return jsonify({
+            "success": True,
+            "mensaje": "Sincronización ejecutada correctamente.",
+            "debug_lc657": serializar_fila(debug_lc657) if debug_lc657 else None
+        }), 200
+
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({
+            "success": False,
+            "error": str(e)
+        }), 500
 
 # ==============================================================================
 # 5. ENDPOINT GET INDIVIDUAL
@@ -4020,3 +4079,239 @@ def debug_productos_ofertados_campanas():
 
         if conexion:
             conexion.close()
+
+@retroactivos_bp.route('/debug_facturas_producto_ofertado/<clave>', methods=['GET'])
+def debug_facturas_producto_ofertado(clave):
+    """
+    Devuelve el detalle de facturas/órdenes que entran como producto ofertado
+    para un cliente específico.
+
+    Incluye:
+    - Campañas por referencia interna desde account.move.line
+    - Etiqueta Producto Ofertado desde sale.report
+    - Respeta f_inicio / f_fin del distribuidor
+    - Evita duplicados entre ambas fuentes
+
+    Ejemplo:
+    /debug_facturas_producto_ofertado/LC657
+    """
+
+    clave = str(clave or '').strip().upper()
+
+    if not clave:
+        return jsonify({
+            "success": False,
+            "error": "Debes mandar una clave válida"
+        }), 400
+
+    resultado_odoo = get_odoo_models()
+    uid = resultado_odoo[0]
+    models = resultado_odoo[1]
+
+    if not uid:
+        return jsonify({
+            "success": False,
+            "error": "No se pudo conectar a Odoo"
+        }), 500
+
+    conexion = obtener_conexion()
+    cursor = conexion.cursor(dictionary=True)
+
+    try:
+        cursor.execute("""
+            SELECT 
+                tr.CLAVE,
+                tr.CLIENTE,
+                c.f_inicio,
+                c.f_fin
+            FROM tabla_retroactivos tr
+            LEFT JOIN clientes c 
+                ON UPPER(TRIM(tr.CLAVE)) = UPPER(TRIM(c.clave))
+            WHERE UPPER(TRIM(tr.CLAVE)) = %s
+            LIMIT 1
+        """, (clave,))
+
+        cliente = cursor.fetchone()
+
+        if not cliente:
+            return jsonify({
+                "success": False,
+                "error": f"No encontré el cliente {clave} en tabla_retroactivos"
+            }), 404
+
+        fecha_inicio = (
+            cliente['f_inicio'].strftime('%Y-%m-%d')
+            if isinstance(cliente.get('f_inicio'), (date, datetime))
+            else (cliente.get('f_inicio') or '2025-06-01')
+        )
+
+        fecha_fin = (
+            cliente['f_fin'].strftime('%Y-%m-%d')
+            if isinstance(cliente.get('f_fin'), (date, datetime))
+            else (cliente.get('f_fin') or '2026-06-30')
+        )
+
+        fechas_por_clave = {
+            clave: {
+                'inicio': fecha_inicio,
+                'fin': fecha_fin
+            }
+        }
+
+        # ==========================================================
+        # MAPEO DE PARTNERS ODOO A CLAVE
+        # ==========================================================
+        partners_odoo = models.execute_kw(
+            ODOO_DB,
+            uid,
+            ODOO_PASSWORD,
+            'res.partner',
+            'search_read',
+            [[]],
+            {
+                'fields': ['id', 'name', 'ref', 'parent_id'],
+                'limit': 100000
+            }
+        )
+
+        odoo_id_to_clave = {}
+
+        for p in partners_odoo:
+            ref_odoo = str(p.get('ref') or '').strip().upper()
+            name_odoo = str(p.get('name') or '').strip().upper()
+            clave_limpia = clave.strip().upper()
+
+            if (
+                ref_odoo == clave_limpia or
+                ref_odoo == f"{clave_limpia}-CA" or
+                clave_limpia in name_odoo
+            ):
+                odoo_id_to_clave[p['id']] = clave_limpia
+
+        # Redirecciones especiales
+        redirecciones = {
+            'VICTOR HUGO VILLANUEVA GUZMAN': 'LC657',
+            'BICICLETAS SCJM': 'LC657',
+            'MARCO TULIO ANDRADE NAVARRO': 'JC539',
+            'NARUCO': 'LC625'
+        }
+
+        for p in partners_odoo:
+            name_odoo = str(p.get('name') or '').strip().upper()
+
+            if name_odoo in redirecciones:
+                clave_redirect = redirecciones[name_odoo]
+
+                if clave_redirect == clave:
+                    odoo_id_to_clave[p['id']] = clave
+                    print(
+                        f"DEBUG REDIRECCION DEBUG ENDPOINT: partner_id={p['id']} "
+                        f"name={name_odoo} -> clave={clave}"
+                    )
+
+        # Mapear contactos hijos al cliente padre
+        for p in partners_odoo:
+            if p['id'] not in odoo_id_to_clave and p.get('parent_id'):
+                parent_id = p['parent_id'][0] if isinstance(p['parent_id'], (list, tuple)) else p['parent_id']
+
+                if parent_id and parent_id in odoo_id_to_clave:
+                    odoo_id_to_clave[p['id']] = odoo_id_to_clave[parent_id]
+
+        lista_ids_validos = list(odoo_id_to_clave.keys())
+
+        if not lista_ids_validos:
+            return jsonify({
+                "success": False,
+                "error": f"No encontré partners de Odoo relacionados con {clave}",
+                "cliente": cliente
+            }), 404
+
+        min_date = max(fecha_inicio, FECHA_MINIMA_RETROACTIVOS)
+        max_date = fecha_fin
+
+        # ==========================================================
+        # FUENTE 1: CAMPAÑAS POR REFERENCIA
+        # ==========================================================
+        productos_ofertados_por_clave, detalle_campanas = calcular_productos_ofertados_por_campanas(
+            models,
+            uid,
+            lista_ids_validos,
+            min_date,
+            max_date,
+            odoo_id_to_clave,
+            fechas_por_clave
+        )
+
+        llaves_ya_tomadas = set()
+
+        for item in detalle_campanas:
+            llaves_ya_tomadas.add((
+                str(item.get('clave') or '').strip().upper(),
+                str(item.get('fecha_factura') or '')[:10],
+                normalizar_referencia_producto(item.get('referencia_interna')),
+                round(float(item.get('total_con_iva') or 0), 2)
+            ))
+
+        # ==========================================================
+        # FUENTE 2: ETIQUETA PRODUCTO OFERTADO EN SALE.REPORT
+        # ==========================================================
+        productos_ofertados_etiqueta_por_clave, detalle_etiqueta = calcular_productos_ofertados_por_etiqueta_sale_report(
+            models,
+            uid,
+            lista_ids_validos,
+            min_date,
+            max_date,
+            odoo_id_to_clave,
+            fechas_por_clave,
+            llaves_ya_tomadas
+        )
+
+        total_campanas = round(float(productos_ofertados_por_clave.get(clave, 0) or 0), 2)
+        total_etiqueta = round(float(productos_ofertados_etiqueta_por_clave.get(clave, 0) or 0), 2)
+        total_general = round(total_campanas + total_etiqueta, 2)
+
+        detalle_campanas_filtrado = [
+            item for item in detalle_campanas
+            if str(item.get('clave') or '').strip().upper() == clave
+        ]
+
+        detalle_etiqueta_filtrado = [
+            item for item in detalle_etiqueta
+            if str(item.get('clave') or '').strip().upper() == clave
+        ]
+
+        return jsonify({
+            "success": True,
+            "clave": clave,
+            "cliente": cliente.get('CLIENTE'),
+            "periodo": {
+                "inicio_cliente": fecha_inicio,
+                "fin_cliente": fecha_fin,
+                "inicio_efectivo_productos_ofertados": max(fecha_inicio, FECHA_MINIMA_PRODUCTOS_OFERTADOS),
+                "fin": fecha_fin
+            },
+            "partners_odoo_encontrados": len(lista_ids_validos),
+            "totales": {
+                "campanas_por_referencia": total_campanas,
+                "etiqueta_producto_ofertado": total_etiqueta,
+                "total_productos_ofertados": total_general
+            },
+            "registros": {
+                "campanas": len(detalle_campanas_filtrado),
+                "etiqueta_producto_ofertado": len(detalle_etiqueta_filtrado),
+                "total": len(detalle_campanas_filtrado) + len(detalle_etiqueta_filtrado)
+            },
+            "detalle_campanas": detalle_campanas_filtrado,
+            "detalle_etiqueta_producto_ofertado": detalle_etiqueta_filtrado
+        }), 200
+
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({
+            "success": False,
+            "error": str(e)
+        }), 500
+
+    finally:
+        cursor.close()
+        conexion.close()
