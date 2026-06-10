@@ -20,3 +20,4 @@ analizar_diferencia.py
 tests/demo.py
 tests/test_calculo_scott.py
 .env.backup
+app.py.respaldo_antes_rebase
