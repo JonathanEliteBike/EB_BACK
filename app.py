@@ -93,6 +93,11 @@ def create_app():
                 response.headers['Access-Control-Allow-Credentials'] = 'true'
                 response.headers['Access-Control-Expose-Headers'] = 'Content-Disposition, Content-Type'
                 response.headers['Vary'] = 'Origin'
+
+                # Chrome Private Network Access: permite requests desde sitios públicos a IPs privadas
+                if request.headers.get('Access-Control-Request-Private-Network'):
+                    response.headers['Access-Control-Allow-Private-Network'] = 'true'
+
                 return response
 
     @app.after_request
@@ -113,6 +118,10 @@ def create_app():
             response.headers['Access-Control-Expose-Headers'] = 'Content-Disposition, Content-Type'
             response.headers['Access-Control-Allow-Headers'] = 'Authorization, Content-Type'
             response.headers['Access-Control-Allow-Methods'] = 'GET,POST,PUT,DELETE,OPTIONS'
+
+            # Chrome Private Network Access
+            if request.headers.get('Access-Control-Request-Private-Network'):
+                response.headers['Access-Control-Allow-Private-Network'] = 'true'
 
         return response
 
@@ -159,19 +168,7 @@ def create_app():
 
 app = create_app()
 
-# ── Pre-calentamiento automático del caché Redis ──────────────────────────────
-# Se lanza en segundo plano al arrancar para que los clientes estén listos
-# antes de que los usuarios abran el monitor. use_reloader=False garantiza
-# que solo corre una vez (no en el proceso hijo del reloader).
-import threading as _threading
-
-def _autostart_warmup():
-    import time as _t
-    _t.sleep(5)  # espera a que Flask termine de arrancar
-    from routes.caratulas import iniciar_precalentamiento
-    iniciar_precalentamiento()
-
-_threading.Thread(target=_autostart_warmup, daemon=True).start()
+# Pre-calentamiento disponible vía POST /precalentar-monitor (no automático en producción)
 
 if __name__ == '__main__':
     socketio.run(
