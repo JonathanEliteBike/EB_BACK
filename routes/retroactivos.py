@@ -17,7 +17,7 @@ retroactivos_bp = Blueprint('retroactivos', __name__, url_prefix='')
 # ==============================================================================
 FECHA_MINIMA_RETROACTIVOS = '2025-05-01'
 FECHA_MINIMA_PRODUCTOS_OFERTADOS = '2025-06-01'
-FECHA_CORTE = '2026-06-03'
+FECHA_CORTE = '2026-06-30'
 
 FECHA_INICIO_CASCOS_PROMO = '2025-10-15'
 FECHA_FIN_CASCOS_PROMO = '2025-12-31'

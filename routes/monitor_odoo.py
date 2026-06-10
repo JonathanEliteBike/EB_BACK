@@ -874,7 +874,7 @@ def _recalcular_acumulados_previo(conexion, cursor):
     Retorna el número de filas actualizadas.
     """
     DEFAULT_INICIO = '2025-07-01'
-    FECHA_CORTE    = '2026-06-03'   # corte temporal para alinear con hoja demo
+    FECHA_CORTE    = '2026-06-30'   # cierre temporada MY26
 
     SCOTT_COND = """
         (
