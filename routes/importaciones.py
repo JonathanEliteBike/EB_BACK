@@ -18,7 +18,7 @@ def _serialize(row: dict) -> dict:
     return row
 
 
-def _calc_dias(fecha_desde, fecha_hasta) -> int | None:
+def _calc_dias(fecha_desde, fecha_hasta):
     if fecha_desde and fecha_hasta:
         try:
             if isinstance(fecha_desde, str):

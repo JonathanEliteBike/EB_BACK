@@ -737,7 +737,7 @@ def _clean_producto(descripcion: str, color: str, talla: str) -> str:
     return name
 
 
-def _get_client_id(clave_cliente: str) -> int | None:
+def _get_client_id(clave_cliente: str):
     conn = obtener_conexion()
     cur = conn.cursor(dictionary=True)
     try:

@@ -105,10 +105,10 @@ def _build_consolidation_map(partner_totals: dict, models, uid) -> dict:
 
 # ── Helpers para suplemento Odoo en integrales ────────────────────────────────
 
-_monitor_start_cache: str | None = None
+_monitor_start_cache = None
 
 
-def _get_monitor_start() -> str | None:
+def _get_monitor_start():
     """Devuelve la fecha más antigua en la tabla monitor (cacheada)."""
     global _monitor_start_cache
     if _monitor_start_cache:
@@ -285,7 +285,7 @@ def _group_count(g: dict, field: str) -> int:
 
 
 # ── Cache en memoria para años disponibles ────────────────────────────────────
-_anios_cache: dict | None = None
+_anios_cache = None
 _anios_cache_ts: float = 0.0
 _ANIOS_TTL = 6 * 3600  # 6 horas — los años de facturación no cambian con frecuencia
 

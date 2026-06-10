@@ -1440,7 +1440,7 @@ def detalle_compras_odoo():
                 logging.warning('detalle_compras_odoo: error al leer POL fallback: %s', _ex_fb)
 
 
-        def estatus_por_producto(order_name: str, product_id) -> str | None:
+        def estatus_por_producto(order_name: str, product_id):
             """Devuelve el estatus de entrega de un producto específico en una orden.
 
             Prioridad revisada para almacenes multi-paso (Pick + Ship):

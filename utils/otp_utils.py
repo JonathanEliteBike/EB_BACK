@@ -63,7 +63,7 @@ def generar_otp(usuario_id: int, tipo: str = 'super') -> str:
     return codigo
 
 
-def verificar_otp(codigo: str) -> str | None:
+def verificar_otp(codigo: str):
     """Verifica el código y lo marca como usado. Retorna el tipo ('super'/'eliminar'/'meses') o None si inválido."""
     _ensure_table()
     conn = obtener_conexion()
@@ -85,7 +85,7 @@ def verificar_otp(codigo: str) -> str | None:
     return None
 
 
-def otp_activo(usuario_id: int = None, tipo: str = None) -> dict | None:
+def otp_activo(usuario_id: int = None, tipo: str = None):
     """Devuelve el OTP vigente más reciente de un usuario/tipo, o None si no hay."""
     _ensure_table()
     conn = obtener_conexion()
