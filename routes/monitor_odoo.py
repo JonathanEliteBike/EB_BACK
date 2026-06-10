@@ -145,7 +145,7 @@ def importar_facturas():
             }), 400
 
         # Renombrar columnas
-        df = df.rename(columns={
+        rename_map = {
             'Líneas de factura/Número': 'numero_factura',
             'Líneas de factura/Producto/Referencia interna': 'referencia_interna',
             'Líneas de factura/Producto/Nombre': 'nombre_producto',
@@ -155,8 +155,14 @@ def importar_facturas():
             'Líneas de factura/Precio unitario': 'precio_unitario',
             'Líneas de factura/Cantidad': 'cantidad',
             'Líneas de factura/Producto/Categoría del producto': 'categoria_producto',
-            'Líneas de factura/Estado': 'estado_factura'
-        })
+            'Líneas de factura/Estado': 'estado_factura',
+        }
+        # Columna opcional: total con IVA ya calculado por Odoo
+        EXCEL_TOTAL_COL = 'Líneas de factura/Total'
+        tiene_total_col = EXCEL_TOTAL_COL in df.columns
+        if tiene_total_col:
+            rename_map[EXCEL_TOTAL_COL] = 'total_con_iva'
+        df = df.rename(columns=rename_map)
 
         df = df.where(pd.notna(df), None)
 
@@ -348,7 +354,11 @@ def importar_facturas():
             try:
                 precio = float(fila['precio_unitario']) if fila['precio_unitario'] else 0.0
                 cantidad = int(fila['cantidad']) if fila['cantidad'] else 0
-                venta_total = round((precio * cantidad) * 1.16, 2)
+                total_odoo = fila.get('total_con_iva') if tiene_total_col else None
+                if total_odoo is not None and pd.notna(total_odoo) and float(total_odoo) > 0:
+                    venta_total = round(float(total_odoo), 2)
+                else:
+                    venta_total = round((precio * cantidad) * 1.16, 2)
             except (ValueError, TypeError):
                 precio, cantidad, venta_total = 0.0, 0, 0.0
 
@@ -589,28 +599,39 @@ def sync_monitor_odoo():
         if not all_line_ids:
             return jsonify({'success': True, 'message': 'No hay líneas de factura', 'count': 0})
 
-        # ── 3. Líneas en batch ────────────────────────────────────────────────
-        lines_raw = models.execute_kw(
-            ODOO_DB, uid, ODOO_PASSWORD,
-            'account.move.line', 'read',
-            [all_line_ids],
-            {'fields': ['id', 'product_id', 'price_unit', 'quantity', 'display_type']}
-        )
-        # Solo líneas de producto (sin secciones/notas)
-        lines = [l for l in lines_raw if l.get('product_id') and not l.get('display_type')]
+        # ── 3. Líneas en batches de 2000 (evita timeout con 27k+ IDs) ───────────
+        _LINE_BATCH = 2000
+        lines_raw = []
+        for _i in range(0, len(all_line_ids), _LINE_BATCH):
+            lines_raw.extend(models.execute_kw(
+                ODOO_DB, uid, ODOO_PASSWORD,
+                'account.move.line', 'read',
+                [all_line_ids[_i:_i + _LINE_BATCH]],
+                {'fields': ['id', 'product_id', 'price_unit', 'price_total', 'quantity', 'display_type']}
+            ))
+        # Solo líneas de producto (excluir secciones y notas)
+        lines = [l for l in lines_raw if l.get('product_id') and l.get('display_type') not in ('line_section', 'line_note')]
 
-        # ── 4. Productos en batch ─────────────────────────────────────────────
+        # ── 4. Categorías vía sale.report (product.product está restringido) ──
+        # sale.report tiene product_id → categ_id sin necesitar acceso a product.product
         product_ids = list({l['product_id'][0] for l in lines})
-        products_raw = models.execute_kw(
-            ODOO_DB, uid, ODOO_PASSWORD,
-            'product.product', 'read',
-            [product_ids],
-            {'fields': ['id', 'default_code', 'name', 'categ_id']}
-        )
-        products_map = {p['id']: p for p in products_raw}
+        product_categ_map = {}  # product_id → categ_id
+        _SR_BATCH = 500
+        for _i in range(0, len(product_ids), _SR_BATCH):
+            chunk = product_ids[_i:_i + _SR_BATCH]
+            sr = models.execute_kw(
+                ODOO_DB, uid, ODOO_PASSWORD,
+                'sale.report', 'search_read',
+                [[['product_id', 'in', chunk]]],
+                {'fields': ['product_id', 'categ_id']}
+            )
+            for r in sr:
+                pid = r['product_id'][0]
+                if pid not in product_categ_map and r.get('categ_id'):
+                    product_categ_map[pid] = r['categ_id'][0]
 
         # ── 5. Categorías en batch ────────────────────────────────────────────
-        categ_ids = list({p['categ_id'][0] for p in products_raw if p.get('categ_id')})
+        categ_ids = list(set(product_categ_map.values()))
         categs_raw = models.execute_kw(
             ODOO_DB, uid, ODOO_PASSWORD,
             'product.category', 'read',
@@ -628,14 +649,37 @@ def sync_monitor_odoo():
             categs_map[c['id']] = nombre.strip()
 
         # ── 6. Partners en batch ──────────────────────────────────────────────
+        # Mapeo manual para partners sin ref en Odoo.
+        # Agregar aquí cuando un partner tenga facturas pero no tenga ref configurada en Odoo.
+        # La solución permanente es configurar la ref directamente en Odoo.
+        _NOMBRE_A_CLAVE = {
+            'RAUL INFANTE MIRANDA':               '00002',
+            'BROTHERS BIKE':                      'KA578',
+            'FELIPE ENRIQUEZ ROJAS':              '5GEG6',
+            'MANUEL ALEJANDRO NAVARRO GONZALEZ':  'KC612',
+            'JOSE ANGEL DIAZ CORTES':             'FD324',
+            'PAULIN FIGUEROA DURAN':              '35754',
+            'FRANCISCO CUADRADO ALARCON':         '34241',
+            'JONATHAN SANDOVAL ULLOA':            '56445',
+            'GO LEMON':                           'GA378',
+        }
+
         partner_ids = list({ctx['partner_id'] for ctx in line_context.values() if ctx['partner_id']})
         partners_raw = models.execute_kw(
             ODOO_DB, uid, ODOO_PASSWORD,
             'res.partner', 'read',
             [partner_ids],
-            {'fields': ['id', 'ref', 'name']}
+            {'fields': ['id', 'ref', 'name', 'parent_id']}
         )
         partners_map = {p['id']: p for p in partners_raw}
+
+        # Si ref vacío: heredar ref del padre (cubre cuentas B2B/portal sin ref propia)
+        for p in partners_raw:
+            if not p.get('ref') and p.get('parent_id'):
+                parent_id = p['parent_id'][0] if isinstance(p['parent_id'], (list, tuple)) else p['parent_id']
+                parent_ref = (partners_map.get(parent_id) or {}).get('ref') or ''
+                if parent_ref:
+                    p['ref'] = parent_ref
 
         # ── 7. Preparar lógica EVAC ───────────────────────────────────────────
         conexion = obtener_conexion()
@@ -644,8 +688,32 @@ def sync_monitor_odoo():
         buscar_evac = _construir_buscar_evac(cursor.fetchall())
 
         # ── 8. Truncar e insertar ─────────────────────────────────────────────
+        # El código del producto se extrae del display_name: "[CODE] Nombre producto"
+        _CODE_RE = re.compile(r'^\[([^\]]+)\]\s*(.*)')
+        _PREFIJOS_EXCLUIDOS = ('FLE', 'SERV', 'APLANT', 'ANTI', 'DESC', 'GARANT', 'LEYENDA')
+        _PALABRAS_EXCLUIDAS = (
+            'standard delivery', 'descuento', 'garantia', 'garantía',
+            'anticipo', 'aplant', 'flete', 'felet', 'servicio',
+            ' desc ', 'cargo por', 'bonificacion', 'bonificación',
+        )
+
+        # Pre-paso: acumular totales negativos por factura.
+        # Cuando en Odoo se "avanza" un descuento, queda como línea separada con
+        # price_total < 0. Estos montos se distribuirán proporcionalmente entre los
+        # productos de la misma factura para reflejar el precio efectivo real.
+        invoice_neg_totals = {}
+        for _ln in lines:
+            _pt = float(_ln.get('price_total') or 0)
+            if _pt >= 0:
+                continue
+            _ctx = line_context.get(_ln['id'])
+            if _ctx:
+                _inv = _ctx['invoice_name']
+                invoice_neg_totals[_inv] = invoice_neg_totals.get(_inv, 0) + _pt
+
         cursor.execute("TRUNCATE TABLE monitor")
         total_insertados = 0
+        invoice_pos_totals = {}  # factura → suma de venta_total insertada
 
         for line in lines:
             ctx = line_context.get(line['id'])
@@ -656,28 +724,38 @@ def sync_monitor_odoo():
             if not fecha_str or str(fecha_str) < FECHA_INICIO:
                 continue
 
-            prod = products_map.get(line['product_id'][0])
-            if not prod:
-                continue
-
-            categ_id = prod['categ_id'][0] if prod.get('categ_id') else None
+            categ_id = product_categ_map.get(line['product_id'][0])
             categoria = _normalizar_categoria_shared(categs_map.get(categ_id, '') if categ_id else '')
 
             if not categoria or 'SERVICIOS' in categoria.upper():
                 continue
 
-            code = (prod.get('default_code') or '').strip().upper()
-            name_prod = (prod.get('name') or '').strip().lower()
-            if code.startswith('FLE') or 'standard delivery' in name_prod or 'descuento' in name_prod:
+            # Extraer código y nombre del display_name del producto
+            prod_display = line['product_id'][1] if line.get('product_id') else ''
+            m = _CODE_RE.match(prod_display)
+            code = m.group(1).strip().upper() if m else ''
+            name_prod_display = m.group(2).strip() if m else prod_display.strip()
+            name_prod_lower = name_prod_display.lower()
+
+            if any(code.startswith(p) for p in _PREFIJOS_EXCLUIDOS):
+                continue
+
+            if any(kw in name_prod_lower for kw in _PALABRAS_EXCLUIDAS):
+                continue
+
+            # Líneas sin monto real (gratuitas, canceladas o de cantidad 0)
+            venta_total = round(float(line.get('price_total') or 0), 2)
+            if venta_total <= 0:
                 continue
 
             partner = partners_map.get(ctx['partner_id'], {})
             contacto_referencia = (partner.get('ref') or '').strip().upper()
             contacto_nombre = (partner.get('name') or '').strip()
+            if not contacto_referencia:
+                contacto_referencia = _NOMBRE_A_CLAVE.get(contacto_nombre.upper().strip(), '')
 
             precio = float(line.get('price_unit') or 0)
             cantidad = int(float(line.get('quantity') or 0))
-            venta_total = round(precio * cantidad * 1.16, 2)
 
             partes = [p.strip() for p in categoria.split('/')]
             marca = partes[0] if partes else None
@@ -686,6 +764,9 @@ def sync_monitor_odoo():
             eride = 'SI' if 'ERIDE' in categoria.upper() else 'NO'
 
             evac = buscar_evac(contacto_referencia, contacto_nombre)
+
+            inv_name = ctx['invoice_name']
+            invoice_pos_totals[inv_name] = invoice_pos_totals.get(inv_name, 0) + venta_total
 
             cursor.execute("""
                 INSERT INTO monitor (
@@ -696,9 +777,9 @@ def sync_monitor_odoo():
                     categoria_producto, estado_factura
                 ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             """, (
-                ctx['invoice_name'],
-                code or prod.get('name', ''),
-                prod.get('name', ''),
+                inv_name,
+                code or name_prod_display,
+                name_prod_display,
                 contacto_referencia,
                 contacto_nombre,
                 str(fecha_str),
@@ -714,6 +795,23 @@ def sync_monitor_odoo():
                 'posted',
             ))
             total_insertados += 1
+
+        # Distribuir descuentos de líneas negativas proporcionalmente por factura.
+        # Cubre el caso donde en Odoo se aplica un descuento como línea adicional
+        # en lugar de directo en el producto (precio_total < 0 en esa línea).
+        desc_facturas = 0
+        for inv_name, neg_total in invoice_neg_totals.items():
+            pos_total = invoice_pos_totals.get(inv_name, 0)
+            if pos_total <= 0 or neg_total >= 0:
+                continue
+            cursor.execute("""
+                UPDATE monitor
+                SET descuento_distribuido = ROUND(venta_total / %s * %s, 2)
+                WHERE numero_factura = %s
+            """, (pos_total, neg_total, inv_name))
+            desc_facturas += 1
+        if desc_facturas:
+            print(f'[INFO] Descuentos de línea distribuidos en {desc_facturas} facturas')
 
         conexion.commit()
 
@@ -776,6 +874,7 @@ def _recalcular_acumulados_previo(conexion, cursor):
     Retorna el número de filas actualizadas.
     """
     DEFAULT_INICIO = '2025-07-01'
+    FECHA_CORTE    = '2026-06-03'   # corte temporal para alinear con hoja demo
 
     SCOTT_COND = """
         (
@@ -814,11 +913,14 @@ def _recalcular_acumulados_previo(conexion, cursor):
             -- Acumulados de sub-marcas (sin filtro de fecha mas alla de f_inicio)
             SUM(m.venta_total)                                                          AS total_bruto,
             SUM(CASE WHEN m.marca = 'SYNCROS'  THEN m.venta_total ELSE 0 END)          AS syncros,
-            SUM(CASE WHEN m.apparel = 'SI'     THEN m.venta_total ELSE 0 END)          AS apparel,
+            SUM(CASE WHEN m.apparel = 'SI'
+                          OR (m.marca = 'BOLD' AND UPPER(TRIM(COALESCE(m.subcategoria,''))) != 'BICICLETA')
+                     THEN m.venta_total ELSE 0 END)                                     AS apparel,
             SUM(CASE WHEN m.marca = 'VITTORIA' THEN m.venta_total ELSE 0 END)          AS vittoria,
             SUM(
-                CASE 
+                CASE
                     WHEN UPPER(TRIM(COALESCE(m.marca, ''))) = 'BOLD'
+                    AND UPPER(TRIM(COALESCE(m.subcategoria, ''))) = 'BICICLETA'
                     THEN COALESCE(m.venta_total, 0)
                     ELSE 0
                 END
@@ -857,19 +959,25 @@ def _recalcular_acumulados_previo(conexion, cursor):
                           AND m.marca = 'SYNCROS' THEN m.venta_total ELSE 0 END)       AS syncros_mar_abr,
             SUM(CASE WHEN m.fecha_factura BETWEEN '2026-05-01' AND '2026-06-30'
                           AND m.marca = 'SYNCROS' THEN m.venta_total ELSE 0 END)       AS syncros_may_jun,
-            -- APPAREL (apparel=SI) por periodo
+            -- APPAREL (apparel=SI + BOLD no-bicicleta) por periodo
             SUM(CASE WHEN m.fecha_factura <= '2025-08-31'
-                          AND m.apparel = 'SI' THEN m.venta_total ELSE 0 END)          AS apparel_jul_ago,
+                          AND (m.apparel = 'SI' OR (m.marca = 'BOLD' AND UPPER(TRIM(COALESCE(m.subcategoria,''))) != 'BICICLETA'))
+                     THEN m.venta_total ELSE 0 END)                                     AS apparel_jul_ago,
             SUM(CASE WHEN m.fecha_factura BETWEEN '2025-09-01' AND '2025-10-31'
-                          AND m.apparel = 'SI' THEN m.venta_total ELSE 0 END)          AS apparel_sep_oct,
+                          AND (m.apparel = 'SI' OR (m.marca = 'BOLD' AND UPPER(TRIM(COALESCE(m.subcategoria,''))) != 'BICICLETA'))
+                     THEN m.venta_total ELSE 0 END)                                     AS apparel_sep_oct,
             SUM(CASE WHEN m.fecha_factura BETWEEN '2025-11-01' AND '2025-12-31'
-                          AND m.apparel = 'SI' THEN m.venta_total ELSE 0 END)          AS apparel_nov_dic,
+                          AND (m.apparel = 'SI' OR (m.marca = 'BOLD' AND UPPER(TRIM(COALESCE(m.subcategoria,''))) != 'BICICLETA'))
+                     THEN m.venta_total ELSE 0 END)                                     AS apparel_nov_dic,
             SUM(CASE WHEN m.fecha_factura BETWEEN '2026-01-01' AND '2026-02-28'
-                          AND m.apparel = 'SI' THEN m.venta_total ELSE 0 END)          AS apparel_ene_feb,
+                          AND (m.apparel = 'SI' OR (m.marca = 'BOLD' AND UPPER(TRIM(COALESCE(m.subcategoria,''))) != 'BICICLETA'))
+                     THEN m.venta_total ELSE 0 END)                                     AS apparel_ene_feb,
             SUM(CASE WHEN m.fecha_factura BETWEEN '2026-03-01' AND '2026-04-30'
-                          AND m.apparel = 'SI' THEN m.venta_total ELSE 0 END)          AS apparel_mar_abr,
+                          AND (m.apparel = 'SI' OR (m.marca = 'BOLD' AND UPPER(TRIM(COALESCE(m.subcategoria,''))) != 'BICICLETA'))
+                     THEN m.venta_total ELSE 0 END)                                     AS apparel_mar_abr,
             SUM(CASE WHEN m.fecha_factura BETWEEN '2026-05-01' AND '2026-06-30'
-                          AND m.apparel = 'SI' THEN m.venta_total ELSE 0 END)          AS apparel_may_jun,
+                          AND (m.apparel = 'SI' OR (m.marca = 'BOLD' AND UPPER(TRIM(COALESCE(m.subcategoria,''))) != 'BICICLETA'))
+                     THEN m.venta_total ELSE 0 END)                                     AS apparel_may_jun,
             -- VITTORIA por periodo
             SUM(CASE WHEN m.fecha_factura <= '2025-08-31'
                           AND m.marca = 'VITTORIA' THEN m.venta_total ELSE 0 END)      AS vittoria_jul_ago,
@@ -888,8 +996,9 @@ def _recalcular_acumulados_previo(conexion, cursor):
         WHERE m.contacto_referencia IS NOT NULL
           AND m.contacto_referencia != ''
           AND m.fecha_factura >= COALESCE(c.f_inicio, %s)
+          AND m.fecha_factura <= %s
         GROUP BY m.contacto_referencia
-    """, (DEFAULT_INICIO,))
+    """, (DEFAULT_INICIO, FECHA_CORTE))
     totales = {row['clave']: row for row in cursor.fetchall()}
 
     cursor.execute("SELECT clave, id_grupo FROM clientes WHERE id_grupo IS NOT NULL")
@@ -930,7 +1039,7 @@ def _recalcular_acumulados_previo(conexion, cursor):
             vittoria = sf(claves, 'vittoria')
             bold     = sf(claves, 'bold')
             scott    = sf(claves, 'scott')
-            avance_marcas_validas = sf(claves, 'avance_marcas_validas')
+            total_bruto = sf(claves, 'total_bruto')
             p_syncros  = {p: sf(claves, f'syncros_{p}')  for p in PERIODS}
             p_apparel  = {p: sf(claves, f'apparel_{p}')  for p in PERIODS}
             p_vittoria = {p: sf(claves, f'vittoria_{p}') for p in PERIODS}
@@ -942,7 +1051,7 @@ def _recalcular_acumulados_previo(conexion, cursor):
             vittoria = flt(row.get('vittoria'))
             bold     = flt(row.get('bold'))
             scott    = flt(row.get('scott'))
-            avance_marcas_validas = flt(row.get('avance_marcas_validas'))
+            total_bruto = flt(row.get('total_bruto'))
             p_syncros  = {p: flt(row.get(f'syncros_{p}'))  for p in PERIODS}
             p_apparel  = {p: flt(row.get(f'apparel_{p}'))  for p in PERIODS}
             p_vittoria = {p: flt(row.get(f'vittoria_{p}')) for p in PERIODS}
@@ -950,7 +1059,7 @@ def _recalcular_acumulados_previo(conexion, cursor):
 
 
         app_global = round(syncros + apparel + vittoria, 2)
-        acum_total = round(avance_marcas_validas, 2)
+        acum_total = round(total_bruto, 2)
         p_app = {p: round(p_syncros[p] + p_apparel[p] + p_vittoria[p], 2) for p in PERIODS}
 
         cm_ini = flt(fila.get('compra_minima_inicial'))

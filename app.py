@@ -150,6 +150,20 @@ def create_app():
 
 app = create_app()
 
+# ── Pre-calentamiento automático del caché Redis ──────────────────────────────
+# Se lanza en segundo plano al arrancar para que los clientes estén listos
+# antes de que los usuarios abran el monitor. use_reloader=False garantiza
+# que solo corre una vez (no en el proceso hijo del reloader).
+import threading as _threading
+
+def _autostart_warmup():
+    import time as _t
+    _t.sleep(5)  # espera a que Flask termine de arrancar
+    from routes.caratulas import iniciar_precalentamiento
+    iniciar_precalentamiento()
+
+_threading.Thread(target=_autostart_warmup, daemon=True).start()
+
 if __name__ == '__main__':
     # Usamos socketio.run para mantener compatibilidad con eventlet en el servidor
     socketio.run(

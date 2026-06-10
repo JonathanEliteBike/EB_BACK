@@ -19,10 +19,11 @@ if _ENV == 'test':
     ODOO_USER     = os.getenv('ODOO_TEST_USER',     'sistemas@elitebike-mx.com')
     ODOO_PASSWORD = os.getenv('ODOO_TEST_PASSWORD', '')
 else:
-    ODOO_URL      = os.getenv('ODOO_PROD_URL',      'https://ebik.odoo.com')
-    ODOO_DB       = os.getenv('ODOO_PROD_DB',       'ebik-prod-15375115')
-    ODOO_USER     = os.getenv('ODOO_PROD_USER',     'sistemas@elitebike-mx.com')
-    ODOO_PASSWORD = os.getenv('ODOO_PROD_PASSWORD', 'bb36fdae62c3c113fb91de0143eba06da199672d')
+    # ODOO_PROD_* tiene prioridad; si no existe, usa ODOO_* (nombres del servidor)
+    ODOO_URL      = os.getenv('ODOO_PROD_URL')      or os.getenv('ODOO_URL',      'https://ebik.odoo.com')
+    ODOO_DB       = os.getenv('ODOO_PROD_DB')       or os.getenv('ODOO_DB',       'ebik-prod-15375115')
+    ODOO_USER     = os.getenv('ODOO_PROD_USER')     or os.getenv('ODOO_USER',     'admin')
+    ODOO_PASSWORD = os.getenv('ODOO_PROD_PASSWORD') or os.getenv('ODOO_PASSWORD', '')
 
 logging.info('Odoo ambiente: %s | URL: %s | DB: %s', _ENV.upper(), ODOO_URL, ODOO_DB)
 

@@ -3,7 +3,9 @@ from flask import Blueprint, jsonify, request, Response
 from db_conexion import obtener_conexion
 from decimal import Decimal
 import json
-import time
+import os
+import re
+import redis as _redis_lib
 from utils.email_utils import crear_cuerpo_email
 from utils.odoo_utils import get_odoo_models, ODOO_DB, ODOO_PASSWORD
 import logging
@@ -11,11 +13,79 @@ import traceback
 
 caratulas_bp = Blueprint('caratulas', __name__, url_prefix='')
 
-# ── Caché en memoria para detalle-compras-odoo (TTL = 5 min) ─────────────────
-# Evita repetir las lentas llamadas XML-RPC a Odoo cuando el mismo cliente
-# se consulta varias veces en una sesión de trabajo.
-_odoo_pedidos_cache: dict = {}   # key: (cliente, ref_exacta, grupo) → (ts, data)
-_ODOO_PEDIDOS_TTL = 300          # segundos
+# ── Caché Redis para detalle-compras-odoo (TTL = 30 min) ─────────────────────
+_ODOO_PEDIDOS_TTL = 1800         # segundos (30 min)
+_REDIS_URL = os.getenv('CELERY_BROKER_URL', 'redis://localhost:6379/0')
+try:
+    _redis = _redis_lib.from_url(_REDIS_URL, decode_responses=True, socket_connect_timeout=2)
+    _redis.ping()
+    logging.info('Redis cache activo: %s', _REDIS_URL)
+except Exception as _re:
+    _redis = None
+    logging.warning('Redis no disponible, cache desactivado: %s', _re)
+
+
+_WARM_WORKERS = 4   # peticiones paralelas a Odoo (no subir de 5 para no saturar)
+
+
+def _precalentar_claves(claves: list[str], host: str = 'http://localhost:5000') -> None:
+    """Carga todos los clientes en Redis usando un pool de threads paralelos."""
+    import requests as _req
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    def _cargar_uno(clave: str) -> str:
+        try:
+            _req.get(
+                f'{host}/detalle-compras-odoo',
+                params={'cliente': clave, 'ref_exacta': '1'},
+                timeout=120,
+            )
+            return f'OK:{clave}'
+        except Exception as _e:
+            return f'ERR:{clave}:{_e}'
+
+    logging.info('Precalentamiento: %d clientes, %d workers paralelos', len(claves), _WARM_WORKERS)
+    with ThreadPoolExecutor(max_workers=_WARM_WORKERS) as pool:
+        futuros = {pool.submit(_cargar_uno, c): c for c in claves}
+        ok = err = 0
+        for fut in as_completed(futuros):
+            res = fut.result()
+            if res.startswith('OK'):
+                ok += 1
+            else:
+                err += 1
+                logging.warning('Precalentamiento error: %s', res)
+    logging.info('Precalentamiento terminado: %d OK, %d errores', ok, err)
+
+
+def iniciar_precalentamiento(host: str = 'http://localhost:5000') -> int:
+    """Lanza un thread daemon que precalienta Redis para todos los clientes activos."""
+    import threading
+    try:
+        conn = obtener_conexion()
+        cur = conn.cursor(dictionary=True)
+        cur.execute(
+            "SELECT clave FROM clientes "
+            "WHERE clave IS NOT NULL AND clave != '' AND f_inicio IS NOT NULL"
+        )
+        claves = [r['clave'] for r in cur.fetchall()]
+        cur.close()
+        conn.close()
+    except Exception as _e:
+        logging.warning('iniciar_precalentamiento: no se pudo leer clientes: %s', _e)
+        return 0
+
+    t = threading.Thread(target=_precalentar_claves, args=(claves, host), daemon=True)
+    t.start()
+    logging.info('Precalentamiento iniciado para %d clientes', len(claves))
+    return len(claves)
+
+@caratulas_bp.route('/precalentar-monitor', methods=['POST'])
+def precalentar_monitor():
+    """Dispara el pre-calentamiento del cache Redis para todos los clientes."""
+    total = iniciar_precalentamiento()
+    return jsonify({'status': 'iniciado', 'clientes': total}), 202
+
 
 @caratulas_bp.route('/caratula_evac', methods=['GET'])
 def buscar_caratula_evac():
@@ -479,7 +549,7 @@ def debug_caratula_global_otros():
 
                 COUNT(*) AS registros,
                 ROUND(SUM(COALESCE(venta_total, 0)), 2) AS total
-            FROM monitor_odoo
+            FROM monitor
             WHERE contacto_referencia IN ({placeholders_clientes})
             GROUP BY
                 clasificacion_debug,
@@ -544,7 +614,7 @@ def debug_caratula_global_otros():
 
                 COUNT(*) AS registros,
                 ROUND(SUM(COALESCE(venta_total, 0)), 2) AS total
-            FROM monitor_odoo
+            FROM monitor
             WHERE contacto_referencia IN ({placeholders_clientes})
             GROUP BY clasificacion_debug
             HAVING total <> 0
@@ -728,11 +798,26 @@ def detalle_compras_odoo():
     if not cliente and not grupo_odoo:
         return jsonify({'error': 'Se requiere parámetro cliente o grupo'}), 400
 
-    # ── Caché de respuesta (5 min TTL) ────────────────────────────────────────
-    _cache_key = (cliente or '', bool(ref_exacta), grupo_odoo or '')
-    _cached = _odoo_pedidos_cache.get(_cache_key)
-    if _cached and (time.time() - _cached[0]) < _ODOO_PEDIDOS_TTL:
-        return jsonify(_cached[1]), 200
+    # ── Caché Redis (5 min TTL) ───────────────────────────────────────────────
+    # La clave NO incluye limit/offset/estado: esos parámetros se aplican
+    # en caliente sobre los datos cacheados, evitando entradas duplicadas por página.
+    _cache_key = f"monitor_pedidos:{cliente or ''}:{int(bool(ref_exacta))}:{grupo_odoo or ''}"
+    if _redis:
+        try:
+            _raw = _redis.get(_cache_key)
+            if _raw:
+                _cached = json.loads(_raw)
+                _c_resultado, _c_filas, _c_meta_base = _cached
+                _c_filas_fil = [f for f in _c_filas if f.get('estatus_out') == estado_filtro] if estado_filtro else _c_filas
+                _c_total = len(_c_filas_fil)
+                _c_pag = _c_filas_fil[offset: offset + limit] if limit is not None else _c_filas_fil[offset:]
+                return jsonify({
+                    'data': _c_resultado,
+                    'rows': _c_pag,
+                    'meta': {**_c_meta_base, 'total': _c_total, 'limit': limit, 'offset': offset, 'returned': len(_c_pag)},
+                }), 200
+        except Exception as _ce:
+            logging.warning('Redis cache hit error: %s', _ce)
 
     # ── Fecha de inicio de temporada por cliente / grupo ──────────────────────
     # En lugar del hard-code '2025-07-01' usamos f_inicio de la tabla clientes,
@@ -975,37 +1060,64 @@ def detalle_compras_odoo():
                     sol_want.append('forecast_expected_date')
                 if 'is_mto' in sol_all_keys:
                     sol_want.append('is_mto')
-                all_lines = models.execute_kw(
-                    ODOO_DB, uid, ODOO_PASSWORD,
-                    'sale.order.line', 'search_read',
-                    [[['id', 'in', all_line_ids]]],
-                    {'fields': sol_want, 'limit': 0}
-                )
-                for l in all_lines:
-                    lines_map[l['id']] = l
+                # search_read falla cuando el usuario no tiene acceso a product.product.
+                # read() con IDs explícitos funciona, PERO algunos campos computados
+                # (como is_mto) requieren product.product y también fallan.
+                # Estrategia: intentar con todos los campos; si falla, quitar is_mto y reintentar.
+                _SOL_BATCH = 500
+
+                def _leer_lineas(fields):
+                    result = {}
+                    for _i in range(0, len(all_line_ids), _SOL_BATCH):
+                        _chunk = all_line_ids[_i:_i + _SOL_BATCH]
+                        for l in models.execute_kw(
+                            ODOO_DB, uid, ODOO_PASSWORD,
+                            'sale.order.line', 'read',
+                            [_chunk],
+                            {'fields': fields}
+                        ):
+                            result[l['id']] = l
+                    return result
+
+                try:
+                    lines_map = _leer_lineas(sol_want)
+                except Exception:
+                    # is_mto (u otro campo computado) puede requerir product.product; omitirlo.
+                    sol_want_fallback = [f for f in sol_want if f != 'is_mto']
+                    try:
+                        lines_map = _leer_lineas(sol_want_fallback)
+                    except Exception:
+                        pass
             except Exception:
                 pass
 
-        # ── 4) Leer productos en batch (excluir FLE / Standard delivery) ─────────
-        product_ids = set()
-        for l in lines_map.values():
-            pid = l.get('product_id') and l['product_id'][0]
-            if pid:
-                product_ids.add(pid)
-
+        # ── 4) Construir products_map desde display_name de las líneas ────────────
+        # product.product.search_read requiere permisos que el usuario puede no tener.
+        # El display_name en sale.order.line ya incluye el código "[SKU] Nombre",
+        # así que extraemos la info directamente sin llamada adicional a Odoo.
+        _CODE_RE_SOL = re.compile(r'^\[([^\]]+)\]\s*(.*)')
         products_map = {}
-        if product_ids:
-            try:
-                prods = models.execute_kw(
-                    ODOO_DB, uid, ODOO_PASSWORD,
-                    'product.product', 'search_read',
-                    [[['id', 'in', list(product_ids)]]],
-                    {'fields': ['id', 'default_code', 'name', 'display_name'], 'limit': 0}
-                )
-                for p in prods:
-                    products_map[p['id']] = p
-            except Exception:
-                pass
+        for l in lines_map.values():
+            pid_raw = l.get('product_id')
+            if not pid_raw:
+                continue
+            pid = pid_raw[0]
+            if pid in products_map:
+                continue
+            display_name = pid_raw[1] if isinstance(pid_raw, (list, tuple)) and len(pid_raw) > 1 else ''
+            m_code = _CODE_RE_SOL.match(display_name)
+            if m_code:
+                code = m_code.group(1).strip()
+                pname = m_code.group(2).strip()
+            else:
+                code = ''
+                pname = display_name.strip()
+            products_map[pid] = {
+                'id': pid,
+                'default_code': code,
+                'name': pname,
+                'display_name': display_name,
+            }
 
         # ── 5) Leer facturas en batch ─────────────────────────────────────────────
         order_names = [o['name'] for o in orders if o.get('name')]
@@ -1388,8 +1500,7 @@ def detalle_compras_odoo():
         filas_planas = []
 
         # Pre-cargar SKUs del forecast para marcar líneas con de_proyeccion
-        import re as _re_fc
-        def _norm_fc(s): return _re_fc.sub(r'[\-\s]', '', str(s or '')).upper()
+        def _norm_fc(s): return re.sub(r'[\-\s]', '', str(s or '')).upper()
         _forecast_skus: set = set()
         try:
             _conn_fc = obtener_conexion()
@@ -1606,14 +1717,23 @@ def detalle_compras_odoo():
             logging.warning('detalle_compras_odoo: error al leer acumulado_anticipado: %s', _ex_ap)
             avance_previo = None
 
+        # ── Guardar en caché los datos crudos (sin filtro ni paginación) ─────────
+        _meta_base = {
+            'fecha_inicio_temporada': fecha_inicio_temporada,
+            'avance_previo': avance_previo,
+        }
+        if _redis:
+            try:
+                _redis.setex(_cache_key, _ODOO_PEDIDOS_TTL, json.dumps([resultado, filas_planas, _meta_base]))
+            except Exception as _ce:
+                logging.warning('Redis cache store error: %s', _ce)
+
         # ── Filtro opcional por estado de picking
-        if estado_filtro:
-            filas_planas = [f for f in filas_planas if f.get('estatus_out') == estado_filtro]
+        filas_fil = [f for f in filas_planas if f.get('estatus_out') == estado_filtro] if estado_filtro else filas_planas
+        total = len(filas_fil)
+        filas_pag = filas_fil[offset: offset + limit] if limit is not None else filas_fil[offset:]
 
-        total = len(filas_planas)
-        filas_pag = filas_planas[offset: offset + limit] if limit is not None else filas_planas[offset:]
-
-        _response_data = {
+        return jsonify({
             'data': resultado,
             'rows': filas_pag,
             'meta': {
@@ -1622,11 +1742,9 @@ def detalle_compras_odoo():
                 'offset': offset,
                 'returned': len(filas_pag),
                 'fecha_inicio_temporada': fecha_inicio_temporada,
-                'avance_previo': avance_previo
+                'avance_previo': avance_previo,
             }
-        }
-        _odoo_pedidos_cache[_cache_key] = (time.time(), _response_data)
-        return jsonify(_response_data), 200
+        }), 200
 
     except Exception as e:
         tb = traceback.format_exc()

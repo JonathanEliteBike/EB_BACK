@@ -1,10 +1,13 @@
 import unicodedata
+import os
+import re
 from flask import Blueprint, jsonify, request
 from db_conexion import obtener_conexion
 import decimal
 import traceback
 from datetime import date, datetime
 from utils.odoo_utils import get_odoo_models, ODOO_DB, ODOO_PASSWORD
+import openpyxl
 
 retroactivos_bp = Blueprint('retroactivos', __name__, url_prefix='')
 
@@ -14,6 +17,7 @@ retroactivos_bp = Blueprint('retroactivos', __name__, url_prefix='')
 # ==============================================================================
 FECHA_MINIMA_RETROACTIVOS = '2025-05-01'
 FECHA_MINIMA_PRODUCTOS_OFERTADOS = '2025-06-01'
+FECHA_CORTE = '2026-06-03'
 
 FECHA_INICIO_CASCOS_PROMO = '2025-10-15'
 FECHA_FIN_CASCOS_PROMO = '2025-12-31'
@@ -1792,6 +1796,326 @@ def calcular_productos_ofertados_por_etiqueta_sale_report(
 
 
 # ==============================================================================
+# METODOLOGÍA POR ETIQUETAS — campañas y productos ofertados
+# Cada entrada define el nombre de la etiqueta en Odoo y su ventana de fechas.
+# inicio/fin = None → sin restricción de fecha (aplica todo el periodo del dist.)
+# ==============================================================================
+CAMPANAS_ETIQUETAS = [
+    # id=8  "Producto Ofertado" — sin restricción de fecha
+    {'nombre': 'Producto Ofertado', 'tag_id': 8,  'inicio': None,         'fin': None},
+    # id=23 "DEAL IRRESISTIBLE" (= DEAL NAVIDEÑO en los reportes)
+    {'nombre': 'DEAL NAVIDENO',     'tag_id': 23, 'inicio': '2025-10-15', 'fin': '2025-12-31'},
+    # id=30 "SPRING SALE 26´"
+    {'nombre': 'SPRING SALE 26',    'tag_id': 30, 'inicio': '2026-02-16', 'fin': '2026-04-30'},
+    # id=31 "Season Off!"
+    {'nombre': 'Season Off',        'tag_id': 31, 'inicio': '2026-04-01', 'fin': '2026-05-30'},
+    # id=36 "Scott Sale"
+    {'nombre': 'Scott Sale',        'tag_id': 36, 'inicio': '2026-04-29', 'fin': '2026-06-30'},
+]
+
+# Ruta al Excel de referencia — exportación directa de Odoo con todos los productos
+# etiquetados con campañas (Scott Sale, DEAL NAVIDENO, SPRING SALE 26, Season Off,
+# Producto Ofertado). Una sola hoja, col A=Referencia, col B=Nombre, col C=Etiqueta.
+CAMPANAS_EXCEL_PATH = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    'CAMAPÑAS Y PRODUCTO OFERTADO.xlsx'
+)
+
+
+def cargar_refs_por_etiqueta(models, uid):
+    """
+    Consulta Odoo y retorna un dict {ref: [lista_de_campanas]}.
+
+    Un producto puede tener múltiples tags (ej. DEAL NAVIDENO + SPRING SALE 26).
+    Se guardan TODOS los tags por ref; la función de cálculo usa la fecha de
+    factura para determinar en cuál campaña aplica cada línea.
+    """
+    from utils.odoo_utils import ODOO_DB, ODOO_PASSWORD
+
+    refs_por_etiqueta = {}   # {ref: [{'nombre': ..., 'inicio': ..., 'fin': ...}, ...]}
+
+    for campana in CAMPANAS_ETIQUETAS:
+        tag_id = campana['tag_id']
+        try:
+            tmpl_ids = models.execute_kw(
+                ODOO_DB, uid, ODOO_PASSWORD,
+                'product.template', 'search',
+                [[('product_tag_ids', 'in', [tag_id])]],
+                {'limit': 10000}
+            )
+            if not tmpl_ids:
+                print(f"[AVISO] Tag '{campana['nombre']}' (id={tag_id}): 0 plantillas en Odoo.")
+                continue
+
+            variants = models.execute_kw(
+                ODOO_DB, uid, ODOO_PASSWORD,
+                'product.product', 'search_read',
+                [[('product_tmpl_id', 'in', tmpl_ids),
+                  ('default_code', '!=', False)]],
+                {'fields': ['default_code'], 'limit': 50000}
+            )
+
+            info_camp = {
+                'nombre': campana['nombre'],
+                'inicio': campana['inicio'],
+                'fin':    campana['fin'],
+            }
+            agregadas = 0
+            for v in variants:
+                ref = str(v['default_code']).strip()
+                if not ref:
+                    continue
+                if ref not in refs_por_etiqueta:
+                    refs_por_etiqueta[ref] = []
+                # Evitar duplicar la misma campaña
+                if not any(c['nombre'] == campana['nombre'] for c in refs_por_etiqueta[ref]):
+                    refs_por_etiqueta[ref].append(info_camp)
+                    agregadas += 1
+            print(f"[OK] Tag '{campana['nombre']}': {len(tmpl_ids)} plantillas, {len(variants)} variantes, {agregadas} refs.")
+
+        except Exception as e:
+            print(f"[ERROR] Tag '{campana['nombre']}': {e}")
+
+    print(f"[OK] Total refs con al menos un tag: {len(refs_por_etiqueta)}")
+    return refs_por_etiqueta
+
+
+def _extract_template_num(ref):
+    """Extrae el número de template (5-6 dígitos) de una referencia de variante."""
+    if not ref:
+        return None
+    m = re.match(r'^(\d{5,6})', ref)
+    if m:
+        return m.group(1)
+    m = re.search(r'BI(\d{6})\d+$', ref)
+    if m:
+        return m.group(1)
+    m = re.search(r'(\d{6})', ref)
+    if m:
+        return m.group(1)
+    return None
+
+
+def _norm_nombre(s):
+    """Normaliza nombre para comparación: minúsculas y sin espacios (ej. '22SPORT' == '22 SPORT')."""
+    return re.sub(r'\s+', '', s.lower())
+
+
+def cargar_campanas_desde_excel():
+    """
+    Lee CAMPAÑAS Y PRODUCTO OFERTADO.xlsx — exportación directa de Odoo.
+    Estructura: col A=Referencia interna, col B=Nombre, col C=Etiqueta.
+    Cuando un producto tiene múltiples etiquetas, A y B solo aparecen en la
+    primera fila del grupo; las siguientes filas tienen A y B vacíos.
+
+    Retorna (refs_exactos, tmpl_por_num, nombre_list):
+      - refs_exactos: {ref_variante: [lista_campanas]}
+      - tmpl_por_num: {num_template: [lista_campanas]}
+      - nombre_list:  [{nombre_lower, camps}, ...]  para fallback por nombre
+    """
+    CAMPANA_INFO = {
+        'DEAL NAVIDENO':     {'inicio': '2025-10-15', 'fin': '2025-12-31'},
+        'SPRING SALE 26':    {'inicio': '2026-02-16', 'fin': '2026-04-30'},
+        'Season Off':        {'inicio': '2026-04-01', 'fin': '2026-05-30'},
+        'Scott Sale':        {'inicio': '2026-04-29', 'fin': '2026-06-30'},
+        'Producto Ofertado': {'inicio': None,         'fin': None},
+    }
+    CAMP_TAGS = set(CAMPANA_INFO.keys())
+
+    refs_exactos = {}
+    tmpl_por_num = {}
+    nombre_list  = []
+    seen_nombres = set()
+
+    def _add(d, key, camp_list):
+        if not key:
+            return
+        existing = d.setdefault(key, [])
+        for c in camp_list:
+            if not any(x['nombre'] == c['nombre'] for x in existing):
+                existing.append(c)
+
+    try:
+        wb = openpyxl.load_workbook(CAMPANAS_EXCEL_PATH, read_only=True, data_only=True)
+    except Exception as e:
+        print(f"[ERROR] No se pudo leer Excel de campañas ({CAMPANAS_EXCEL_PATH}): {e}")
+        return {}, {}, []
+
+    ws = wb.active
+    rows = list(ws.iter_rows(values_only=True))[1:]  # saltar encabezado
+
+    # Agrupar filas por producto (forward-fill de ref y nombre)
+    cur_ref, cur_nom, cur_tags = None, None, []
+    groups = []  # [(ref, nombre, [tags])]
+
+    for row in rows:
+        # Estructura actual del export: col0=ID repetido, col1=Referencia, col2=Nombre, col3=Etiqueta
+        ref = str(row[1]).strip() if row[1] else None
+        nom = str(row[2]).strip() if row[2] else None
+        tag = str(row[3]).strip() if row[3] else None
+
+        if ref:
+            # Nueva variante con referencia
+            if cur_nom is not None:
+                groups.append((cur_ref, cur_nom, cur_tags))
+            cur_ref, cur_nom, cur_tags = ref, nom, ([tag] if tag else [])
+        elif nom and not ref:
+            # Plantilla sin código de variante
+            if cur_nom is not None:
+                groups.append((cur_ref, cur_nom, cur_tags))
+            cur_ref, cur_nom, cur_tags = None, nom, ([tag] if tag else [])
+        elif tag:
+            cur_tags.append(tag)
+
+    if cur_nom is not None:
+        groups.append((cur_ref, cur_nom, cur_tags))
+
+    wb.close()
+
+    # Construir los tres índices
+    for ref, nombre, tags in groups:
+        camps = [
+            {'nombre': t, 'inicio': CAMPANA_INFO[t]['inicio'], 'fin': CAMPANA_INFO[t]['fin']}
+            for t in tags if t in CAMP_TAGS
+        ]
+        if not camps:
+            continue
+
+        if ref:
+            _add(refs_exactos, ref, camps)
+
+        m = re.match(r'^(\d{5,6})', nombre or '')
+        if m:
+            _add(tmpl_por_num, m.group(1), camps)
+
+        # nombre_list solo para campañas con fecha (no Producto Ofertado)
+        camps_con_fecha = [c for c in camps if c['nombre'] != 'Producto Ofertado']
+        if camps_con_fecha:
+            nombre_stripped = re.sub(r'^\d+\s*', '', nombre or '').strip()
+            key_n = nombre_stripped.lower()
+            if nombre_stripped and key_n not in seen_nombres:
+                nombre_list.append({'nombre_lower': key_n, 'camps': camps_con_fecha})
+                seen_nombres.add(key_n)
+
+    print(f"[OK] CAMPAÑAS+PO: {len(refs_exactos)} refs exactas, "
+          f"{len(tmpl_por_num)} templates, {len(nombre_list)} nombres.")
+    return refs_exactos, tmpl_por_num, nombre_list
+
+
+def calcular_productos_ofertados_etiquetas(cursor_dict, fechas_por_clave, refs_exactos, tmpl_por_num, nombre_list=None, refs_con_tag_odoo=None):
+    """
+    Calcula productos_ofertados usando las hojas CAMPAÑAS y PO del Excel de referencia.
+
+    Para cada línea de factura del distribuidor en su periodo:
+      1. Busca match exacto de ref en refs_exactos
+      2. Si no encuentra, extrae el número de template de la ref y busca en tmpl_por_num
+      3. Si la fecha de factura está dentro de la ventana de la campaña → suma venta_total
+
+    venta_total es CON IVA (price_total de Odoo), consistente con COMPRAS_TOTALES_CRUDO
+    y con los totales CON IVA que muestra el Excel de referencia.
+
+    Retorna {clave: monto_CON_IVA}.
+    """
+    if not refs_exactos and not tmpl_por_num:
+        print("[AVISO] Sin datos de campañas — productos_ofertados = 0 para todos.")
+        return {}
+
+    PRIORITY = ['Producto Ofertado', 'DEAL NAVIDENO', 'SPRING SALE 26', 'Season Off', 'Scott Sale']
+    _nombre_list = nombre_list or []
+
+    totales = {}
+
+    for clave, rango in fechas_por_clave.items():
+        fecha_inicio_ef = max(str(rango.get('inicio') or ''), FECHA_MINIMA_PRODUCTOS_OFERTADOS)
+        fecha_fin_ef    = str(rango.get('fin') or FECHA_CORTE)
+
+        if fecha_inicio_ef > fecha_fin_ef:
+            continue
+
+        cursor_dict.execute("""
+            SELECT referencia_interna, nombre_producto, fecha_factura, venta_total
+            FROM monitor
+            WHERE contacto_referencia = %s
+              AND fecha_factura >= %s
+              AND fecha_factura <= %s
+              AND referencia_interna IS NOT NULL
+              AND venta_total > 0
+              AND cantidad > 0
+        """, (clave, fecha_inicio_ef, fecha_fin_ef))
+
+        for linea in cursor_dict.fetchall():
+            ref = str(linea['referencia_interna'] or '').strip()
+            if not ref:
+                continue
+
+            # 1. Match exacto por referencia de variante
+            campanas_ref = refs_exactos.get(ref)
+
+            # 2. Match por número de template extraído de la ref
+            # Para refs con formato numérico "NNNNNN-XXXXXXX" (ej. 275894-5547022) se aplica
+            # el mismo gate Odoo que el paso 3: el template "275894" proviene de
+            # SCO20ZA894588xxx (NG/AM, con DEAL NAVIDENO) pero no debe aplicarse a
+            # 275894-5547xxx (NEGRO MATE/GRIS, sin etiqueta de campaña).
+            if not campanas_ref:
+                tmpl = _extract_template_num(ref)
+                if tmpl:
+                    _is_num_ref = bool(re.match(r'^\d{5,6}-', ref))
+                    if not _is_num_ref or refs_con_tag_odoo is None or ref in refs_con_tag_odoo:
+                        campanas_ref = tmpl_por_num.get(tmpl)
+
+            # 3. Fallback por nombre (igual que Excel: LEFT(nombre,20) wildcard en CAMPAÑAS!G)
+            # Para refs con formato numérico "NNNNNN-XXXXXXX" (ej. 281217-1659014) se aplica
+            # el gate Odoo: solo se cuentan si tienen etiqueta de campaña. Esto evita falsos
+            # positivos donde dos productos distintos comparten el mismo prefijo de 20 chars
+            # (ej. "ZAPATOS SCOTT 22 SPO" → CRUS-R y TRAIL EVO BOA ambos coinciden).
+            # Refs con letra (SBI23..., BLD23..., SCO22...) no necesitan gate porque son
+            # coincidencias más específicas y están explícitamente en CAMPAÑAS Excel.
+            if not campanas_ref and _nombre_list:
+                _is_num_ref = bool(re.match(r'^\d{5,6}-', ref))
+                _tiene_tag = not _is_num_ref or refs_con_tag_odoo is None or ref in refs_con_tag_odoo
+                if _tiene_tag:
+                    nombre_prod = str(linea['nombre_producto'] or '').strip()
+                    if nombre_prod:
+                        prefix_norm = _norm_nombre(nombre_prod[:20])
+                        for entry in _nombre_list:
+                            nombre_norm = _norm_nombre(entry['nombre_lower'])
+                            if prefix_norm in nombre_norm or nombre_norm in prefix_norm:
+                                campanas_ref = entry['camps']
+                                break
+
+            if not campanas_ref:
+                continue
+
+            fecha = str(linea['fecha_factura'])[:10]
+
+            # Seleccionar la primera campaña activa según prioridad y ventana de fecha
+            campana_activa = None
+            for pname in PRIORITY:
+                for campana in campanas_ref:
+                    if campana['nombre'] != pname:
+                        continue
+                    if campana['inicio'] and fecha < campana['inicio']:
+                        continue
+                    if campana['fin'] and fecha > campana['fin']:
+                        continue
+                    campana_activa = campana
+                    break
+                if campana_activa:
+                    break
+
+            if not campana_activa:
+                continue
+
+            # venta_total es CON IVA — mismo criterio que COMPRAS_TOTALES_CRUDO
+            venta_total = float(linea['venta_total'] or 0)
+            totales[clave] = totales.get(clave, 0.0) + venta_total
+
+    return totales
+
+
+
+
+# ==============================================================================
 # 1. FUNCIÓN MAESTRA: OBTENER DEDUCCIONES DESDE ODOO
 # ==============================================================================
 def obtener_deducciones_odoo(claves_db, fechas_por_clave):
@@ -1822,7 +2146,6 @@ def obtener_deducciones_odoo(claves_db, fechas_por_clave):
 
     redirecciones = {
         'VICTOR HUGO VILLANUEVA GUZMAN': 'LC657',
-        'BICICLETAS SCJM': 'LC657',
         'MARCO TULIO ANDRADE NAVARRO': 'JC539',
         'NARUCO': 'LC625'
     }
@@ -1948,65 +2271,9 @@ def obtener_deducciones_odoo(claves_db, fechas_por_clave):
         # ==========================================================================
         # B. PRODUCTOS OFERTADOS
         # ==========================================================================
-        # Fuente 1:
-        # account.move.line / Apuntes contables
-        # Cruce por referencia interna + fecha de campaña.
-        # Respeta fechas del distribuidor por fechas_por_clave.
-        productos_ofertados_por_clave, detalle_productos_ofertados = calcular_productos_ofertados_por_campanas(
-            models,
-            uid,
-            lista_ids_validos,
-            min_date,
-            max_date,
-            odoo_id_to_clave,
-            fechas_por_clave
-        )
-
-        # Llaves para evitar duplicar contra sale.report.
-        # Formato:
-        # clave + fecha + referencia + total_con_iva
-        llaves_ya_tomadas = set()
-
-        for item in detalle_productos_ofertados:
-            llaves_ya_tomadas.add((
-                str(item.get('clave') or '').strip().upper(),
-                str(item.get('fecha_factura') or '')[:10],
-                normalizar_referencia_producto(item.get('referencia_interna')),
-                round(float(item.get('total_con_iva') or 0), 2)
-            ))
-
-        # Fuente 2:
-        # Ventas -> Reportes -> Análisis de ventas
-        # Producto / Etiquetas de plantilla = Producto Ofertado
-        # Estado factura = Facturado por completo.
-        # También respeta fechas del distribuidor por fechas_por_clave.
-        productos_ofertados_etiqueta_por_clave, detalle_productos_ofertados_etiqueta = calcular_productos_ofertados_por_etiqueta_sale_report(
-            models,
-            uid,
-            lista_ids_validos,
-            min_date,
-            max_date,
-            odoo_id_to_clave,
-            fechas_por_clave,
-            llaves_ya_tomadas
-        )
-
-        # Sumamos fuente 1: campañas por referencia interna.
-        for clave_encontrada, monto_ofertado in productos_ofertados_por_clave.items():
-            if clave_encontrada in resultados_por_clave:
-                resultados_por_clave[clave_encontrada]['ofertado'] += float(monto_ofertado or 0)
-
-        # Sumamos fuente 2: etiqueta Producto Ofertado desde Análisis de ventas.
-        for clave_encontrada, monto_ofertado in productos_ofertados_etiqueta_por_clave.items():
-            if clave_encontrada in resultados_por_clave:
-                resultados_por_clave[clave_encontrada]['ofertado'] += float(monto_ofertado or 0)
-
-        # Debug opcional para validar Cycling Riding / GD380.
-        for clave_debug in ['GD380', 'LC657']:
-            if clave_debug in resultados_por_clave:
-                print(f"DEBUG OFERTADOS {clave_debug} CAMPANAS:", round(productos_ofertados_por_clave.get(clave_debug, 0), 2))
-                print(f"DEBUG OFERTADOS {clave_debug} ETIQUETA:", round(productos_ofertados_etiqueta_por_clave.get(clave_debug, 0), 2))
-                print(f"DEBUG OFERTADOS {clave_debug} TOTAL:", round(resultados_por_clave[clave_debug]['ofertado'], 2))
+        # La metodología de campañas y etiqueta fue reemplazada.
+        # Los productos ofertados se calculan en el paso siguiente desde monitor
+        # (lista de precios), por lo que aquí el valor se inicializa en 0.
 
         # ==========================================================================
         # B2. BICICLETAS DEMO
@@ -2064,15 +2331,9 @@ def obtener_deducciones_odoo(claves_db, fechas_por_clave):
             ('move_id.invoice_date', '<=', max_date),
             ('quantity', '!=', 0),
             ('partner_id', 'in', lista_ids_validos),
-            ('display_type', '=', False),
-
-            '|',
-                ('product_id.product_tmpl_id.name', 'ilike', 'BOLD'),
-                ('name', 'ilike', 'BOLD'),
-
-            '|',
-                ('product_id.product_tmpl_id.categ_id.complete_name', 'ilike', 'BICICLETA'),
-                ('name', 'ilike', 'BICICLETA')
+            ('display_type', '=', 'product'),
+            ('name', 'ilike', 'BOLD'),
+            ('name', 'ilike', 'BICICLETA'),
         ]
 
         lineas_bold = fetch_all_odoo(
@@ -2082,7 +2343,7 @@ def obtener_deducciones_odoo(claves_db, fechas_por_clave):
             domain_bold,
             [
                 'partner_id',
-                'price_subtotal',
+                'price_total',
                 'date',
                 'name',
                 'move_id'
@@ -2098,7 +2359,7 @@ def obtener_deducciones_odoo(claves_db, fechas_por_clave):
             agregar_valor(
                 partner[0],
                 'bold',
-                linea.get('price_subtotal', 0),
+                linea.get('price_total', 0),
                 linea.get('date')
             )
 
@@ -2138,7 +2399,7 @@ def obtener_deducciones_odoo(claves_db, fechas_por_clave):
 
         return resultados_por_clave
     except Exception as e:
-        print(f"❌ Error Odoo: {e}")
+        print(f"[ERROR Odoo] {e}")
         traceback.print_exc()
         return {}
 
@@ -2152,17 +2413,67 @@ def ejecutar_sincronizacion_y_calculos():
     cursor = conexion.cursor()
 
     try:
-        print("🔵 Auto-sincronizando Odoo y calculando matemáticas...")
+        print("[INFO] Auto-sincronizando Odoo y calculando matematicas...")
+
+        # ══════════════════════════════════════════════════════════════════════
+        # PASO 0: Sync previo → tabla_retroactivos
+        # previo ya tiene los acumulados correctos (calculados desde monitor,
+        # que a su vez viene de Odoo con price_total real).
+        # Aquí los copiamos a tabla_retroactivos para que el resto del cálculo
+        # use montos correctos en COMPRAS_TOTALES_CRUDO, COMPRA_GLOBAL_SCOTT,
+        # COMPRA_GLOBAL_APPAREL y COMPRA_GLOBAL_BOLD.
+        # ══════════════════════════════════════════════════════════════════════
+        cursor.execute("""
+            UPDATE tabla_retroactivos tr
+            JOIN previo p ON UPPER(TRIM(tr.CLAVE)) = UPPER(TRIM(p.clave))
+            SET
+                tr.COMPRAS_TOTALES_CRUDO = COALESCE(p.acumulado_anticipado, 0),
+                tr.COMPRA_GLOBAL_SCOTT   = COALESCE(p.avance_global_scott, 0),
+                tr.COMPRA_GLOBAL_APPAREL = COALESCE(p.avance_global_apparel_syncros_vittoria, 0),
+                tr.COMPRA_GLOBAL_BOLD    = COALESCE(p.acumulado_bold, 0)
+            WHERE tr.CLAVE NOT LIKE 'Integral%%'
+              AND COALESCE(p.es_integral, 0) = 0
+        """)
+
+        # Integrales: suma de sus claves hijas (ya actualizadas arriba)
+        _integrales_sync = {
+            'Integral 1': ['EC216', 'JC539'],
+            'Integral 2': ['GC411', 'MC679', 'MC677', 'LC657'],
+            'Integral 3': ['LC625', 'LC627', 'LC626'],
+        }
+        for clave_int, hijas in _integrales_sync.items():
+            fmt = ','.join(['%s'] * len(hijas))
+            cursor.execute(f"""
+                UPDATE tabla_retroactivos tr_i
+                JOIN (
+                    SELECT
+                        COALESCE(SUM(COMPRAS_TOTALES_CRUDO), 0) AS s_crudo,
+                        COALESCE(SUM(COMPRA_GLOBAL_SCOTT),   0) AS s_scott,
+                        COALESCE(SUM(COMPRA_GLOBAL_APPAREL), 0) AS s_apparel,
+                        COALESCE(SUM(COMPRA_GLOBAL_BOLD),    0) AS s_bold
+                    FROM tabla_retroactivos
+                    WHERE CLAVE IN ({fmt})
+                ) sub
+                SET
+                    tr_i.COMPRAS_TOTALES_CRUDO = sub.s_crudo,
+                    tr_i.COMPRA_GLOBAL_SCOTT   = sub.s_scott,
+                    tr_i.COMPRA_GLOBAL_APPAREL = sub.s_apparel,
+                    tr_i.COMPRA_GLOBAL_BOLD    = sub.s_bold
+                WHERE tr_i.CLAVE = %s
+            """, tuple(hijas) + (clave_int,))
+
+        print("[OK] Acumulados previo -> tabla_retroactivos sincronizados.")
 
         cursor_dict.execute("""
-            SELECT 
-                tr.CLAVE, 
-                c.f_inicio, 
-                c.f_fin 
+            SELECT
+                tr.CLAVE,
+                tr.CATEGORIA,
+                c.f_inicio,
+                c.f_fin
             FROM tabla_retroactivos tr
-            LEFT JOIN clientes c 
+            LEFT JOIN clientes c
                 ON UPPER(TRIM(tr.CLAVE)) = UPPER(TRIM(c.clave))
-            WHERE tr.CLAVE NOT LIKE 'Integral%' 
+            WHERE tr.CLAVE NOT LIKE 'Integral%'
               AND tr.CLAVE IS NOT NULL
         """)
 
@@ -2170,6 +2481,7 @@ def ejecutar_sincronizacion_y_calculos():
 
         claves_db = []
         fechas_por_clave = {}
+        nivel_por_clave = {}
 
         for row in resultados_db:
             clave = str(row['CLAVE']).strip().upper()
@@ -2189,8 +2501,9 @@ def ejecutar_sincronizacion_y_calculos():
 
             fechas_por_clave[clave] = {
                 'inicio': ini,
-                'fin': fin
+                'fin': min(fin, FECHA_CORTE)
             }
+            nivel_por_clave[clave] = str(row.get('CATEGORIA') or '')
 
         datos_por_clave = obtener_deducciones_odoo(claves_db, fechas_por_clave)
 
@@ -2234,6 +2547,46 @@ def ejecutar_sincronizacion_y_calculos():
             if clave == 'LC657':
                 print("DEBUG UPDATE LC657 rowcount:", cursor.rowcount)
                 print("DEBUG UPDATE LC657 productos_ofertados:", float(valores.get('ofertado') or 0))
+
+        # ==========================================================================
+        # PRODUCTOS OFERTADOS: METODOLOGÍA POR EXCEL (hojas CAMPAÑAS y PO)
+        # Fuente de verdad: snapshot de etiquetas del Excel de referencia.
+        # Monto almacenado: venta_total CON IVA (consistente con COMPRAS_TOTALES_CRUDO).
+        # ==========================================================================
+        try:
+            _refs_exactos, _tmpl_por_num, _nombre_list = cargar_campanas_desde_excel()
+        except Exception as _e:
+            print(f"[ERROR] No se pudo cargar campañas desde Excel: {_e}")
+            _refs_exactos, _tmpl_por_num, _nombre_list = {}, {}, []
+
+        # Gate de etiquetas Odoo: solo el paso 3 (name-match) requiere confirmación.
+        # Si el producto no tiene etiqueta de campaña en Odoo, no se contabiliza
+        # aunque su nombre coincida con CAMPAÑAS (evita falsos positivos).
+        _refs_con_tag_odoo = None
+        try:
+            _r_odoo = get_odoo_models()
+            if _r_odoo and _r_odoo[0]:
+                _refs_por_etiqueta_odoo = cargar_refs_por_etiqueta(_r_odoo[1], _r_odoo[0])
+                _refs_con_tag_odoo = set(_refs_por_etiqueta_odoo.keys())
+                print(f"[OK] Gate Odoo name-match: {len(_refs_con_tag_odoo)} refs con etiqueta.")
+        except Exception as _e_odoo:
+            print(f"[AVISO] Gate Odoo no disponible, name-match sin restricción: {_e_odoo}")
+
+        totales_etiquetas = calcular_productos_ofertados_etiquetas(
+            cursor_dict,
+            fechas_por_clave,
+            _refs_exactos,
+            _tmpl_por_num,
+            _nombre_list,
+            _refs_con_tag_odoo,
+        )
+        for clave_et, monto_et in totales_etiquetas.items():
+            cursor.execute("""
+                UPDATE tabla_retroactivos
+                SET productos_ofertados = %s
+                WHERE UPPER(TRIM(CLAVE)) = UPPER(TRIM(%s))
+            """, (float(monto_et), clave_et))
+        print(f"[OK] Productos ofertados (Excel): {len(totales_etiquetas)} clientes actualizados.")
 
         # ==========================================================================
         # BOLD
@@ -2293,11 +2646,16 @@ def ejecutar_sincronizacion_y_calculos():
                 ))
 
         # ==========================================================================
+        # importe_final es columna GENERADA en MySQL:
+        # CRUDO − notas_credito − garantias − productos_ofertados − bicicleta_demo − bicicletas_bold
+        # Se recalcula automáticamente; no se puede ni se necesita hacer UPDATE.
+
+        # ==========================================================================
         # CÁLCULOS BASE
         # ==========================================================================
         cursor.execute("""
             UPDATE tabla_retroactivos
-            SET 
+            SET
                 TOTAL_ACUMULADO = COALESCE(COMPRAS_TOTALES_CRUDO, 0),
 
                 compra_anual_crudo = (
@@ -2401,7 +2759,7 @@ def ejecutar_sincronizacion_y_calculos():
         """)
 
         conexion.commit()
-        print("✅ Sincronización y cálculos terminados correctamente.")
+        print("[OK] Sincronizacion y calculos terminados correctamente.")
 
         cursor_dict.execute("""
             SELECT 
@@ -2422,7 +2780,7 @@ def ejecutar_sincronizacion_y_calculos():
         if conexion:
             conexion.rollback()
 
-        print(f"❌ Error en auto-sync: {e}")
+        print(f"[ERROR auto-sync] {e}")
         traceback.print_exc()
 
         raise
@@ -2439,7 +2797,27 @@ def ejecutar_sincronizacion_y_calculos():
 
 
 # ==============================================================================
-# 3. ENDPOINT GET GLOBAL
+# 3. ENDPOINT CLAVES (autocomplete sin filtro de categoría)
+# ==============================================================================
+@retroactivos_bp.route('/retroactivos/claves', methods=['GET'])
+def obtener_claves_retroactivos():
+    conexion = obtener_conexion()
+    cursor = conexion.cursor(dictionary=True)
+    try:
+        cursor.execute("""
+            SELECT CLAVE, CLIENTE FROM tabla_retroactivos
+            WHERE CLAVE IS NOT NULL
+            ORDER BY CLIENTE
+        """)
+        return jsonify(cursor.fetchall()), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    finally:
+        cursor.close()
+        conexion.close()
+
+
+# 3B. ENDPOINT GET GLOBAL
 # ==============================================================================
 @retroactivos_bp.route('/retroactivos', methods=['GET'])
 def obtener_retroactivos():
@@ -2510,7 +2888,7 @@ def obtener_retroactivos():
         return jsonify(resultados), 200
 
     except Exception as e:
-        print("❌ Error al obtener retroactivos:", str(e))
+        print("[ERROR] Error al obtener retroactivos:", str(e))
         traceback.print_exc()
         return jsonify({"error": str(e)}), 500
 
@@ -2574,7 +2952,7 @@ def obtener_retroactivo_individual(identificador):
 
     try:
         query = """
-            SELECT 
+            SELECT
                 CLAVE, ZONA, CLIENTE, CATEGORIA,
                 COMPRA_MINIMA_ANUAL, COMPRA_GLOBAL_SCOTT,
                 COMPRA_MINIMA_APPAREL, COMPRA_GLOBAL_APPAREL,
@@ -2583,11 +2961,11 @@ def obtener_retroactivo_individual(identificador):
                 importe_final, porcentaje_retroactivo, porcentaje_retroactivo_apparel,
                 compra_adicional, retroactivo_total, importe, estatus, NC, FACT
             FROM tabla_retroactivos
-            WHERE CLAVE = %s OR CLIENTE = %s
+            WHERE CLAVE = %s OR CLIENTE LIKE %s
             LIMIT 1
         """
 
-        cursor.execute(query, (identificador, identificador))
+        cursor.execute(query, (identificador, f'%{identificador}%'))
         cliente_data = cursor.fetchone()
 
         if not cliente_data:
@@ -2635,7 +3013,7 @@ def obtener_retroactivo_individual(identificador):
         return jsonify(cliente_data), 200
 
     except Exception as e:
-        print("❌ Error al obtener cliente:", str(e))
+        print("[ERROR] Error al obtener cliente:", str(e))
         traceback.print_exc()
         return jsonify({"error": str(e)}), 500
 
@@ -2921,7 +3299,7 @@ def debug_productos_ofertados_detalle(clave_param=None):
             fechas_por_clave[clave_db] = {
                 "nombre_cliente": c.get('nombre_cliente'),
                 "inicio": f_inicio or fecha_inicio,
-                "fin": f_fin or fecha_fin
+                "fin": min(f_fin or fecha_fin, FECHA_CORTE)
             }
 
         partner_ids = list({
@@ -3428,7 +3806,7 @@ def debug_nc_garantias():
 
             fechas_por_clave[clave] = {
                 'inicio': f_inicio or fecha_inicio,
-                'fin': f_fin or fecha_fin
+                'fin': min(f_fin or fecha_fin, FECHA_CORTE)
             }
 
             cliente_por_clave[clave] = c.get('nombre_cliente') or ''
@@ -4080,238 +4458,3 @@ def debug_productos_ofertados_campanas():
         if conexion:
             conexion.close()
 
-@retroactivos_bp.route('/debug_facturas_producto_ofertado/<clave>', methods=['GET'])
-def debug_facturas_producto_ofertado(clave):
-    """
-    Devuelve el detalle de facturas/órdenes que entran como producto ofertado
-    para un cliente específico.
-
-    Incluye:
-    - Campañas por referencia interna desde account.move.line
-    - Etiqueta Producto Ofertado desde sale.report
-    - Respeta f_inicio / f_fin del distribuidor
-    - Evita duplicados entre ambas fuentes
-
-    Ejemplo:
-    /debug_facturas_producto_ofertado/LC657
-    """
-
-    clave = str(clave or '').strip().upper()
-
-    if not clave:
-        return jsonify({
-            "success": False,
-            "error": "Debes mandar una clave válida"
-        }), 400
-
-    resultado_odoo = get_odoo_models()
-    uid = resultado_odoo[0]
-    models = resultado_odoo[1]
-
-    if not uid:
-        return jsonify({
-            "success": False,
-            "error": "No se pudo conectar a Odoo"
-        }), 500
-
-    conexion = obtener_conexion()
-    cursor = conexion.cursor(dictionary=True)
-
-    try:
-        cursor.execute("""
-            SELECT 
-                tr.CLAVE,
-                tr.CLIENTE,
-                c.f_inicio,
-                c.f_fin
-            FROM tabla_retroactivos tr
-            LEFT JOIN clientes c 
-                ON UPPER(TRIM(tr.CLAVE)) = UPPER(TRIM(c.clave))
-            WHERE UPPER(TRIM(tr.CLAVE)) = %s
-            LIMIT 1
-        """, (clave,))
-
-        cliente = cursor.fetchone()
-
-        if not cliente:
-            return jsonify({
-                "success": False,
-                "error": f"No encontré el cliente {clave} en tabla_retroactivos"
-            }), 404
-
-        fecha_inicio = (
-            cliente['f_inicio'].strftime('%Y-%m-%d')
-            if isinstance(cliente.get('f_inicio'), (date, datetime))
-            else (cliente.get('f_inicio') or '2025-06-01')
-        )
-
-        fecha_fin = (
-            cliente['f_fin'].strftime('%Y-%m-%d')
-            if isinstance(cliente.get('f_fin'), (date, datetime))
-            else (cliente.get('f_fin') or '2026-06-30')
-        )
-
-        fechas_por_clave = {
-            clave: {
-                'inicio': fecha_inicio,
-                'fin': fecha_fin
-            }
-        }
-
-        # ==========================================================
-        # MAPEO DE PARTNERS ODOO A CLAVE
-        # ==========================================================
-        partners_odoo = models.execute_kw(
-            ODOO_DB,
-            uid,
-            ODOO_PASSWORD,
-            'res.partner',
-            'search_read',
-            [[]],
-            {
-                'fields': ['id', 'name', 'ref', 'parent_id'],
-                'limit': 100000
-            }
-        )
-
-        odoo_id_to_clave = {}
-
-        for p in partners_odoo:
-            ref_odoo = str(p.get('ref') or '').strip().upper()
-            name_odoo = str(p.get('name') or '').strip().upper()
-            clave_limpia = clave.strip().upper()
-
-            if (
-                ref_odoo == clave_limpia or
-                ref_odoo == f"{clave_limpia}-CA" or
-                clave_limpia in name_odoo
-            ):
-                odoo_id_to_clave[p['id']] = clave_limpia
-
-        # Redirecciones especiales
-        redirecciones = {
-            'VICTOR HUGO VILLANUEVA GUZMAN': 'LC657',
-            'BICICLETAS SCJM': 'LC657',
-            'MARCO TULIO ANDRADE NAVARRO': 'JC539',
-            'NARUCO': 'LC625'
-        }
-
-        for p in partners_odoo:
-            name_odoo = str(p.get('name') or '').strip().upper()
-
-            if name_odoo in redirecciones:
-                clave_redirect = redirecciones[name_odoo]
-
-                if clave_redirect == clave:
-                    odoo_id_to_clave[p['id']] = clave
-                    print(
-                        f"DEBUG REDIRECCION DEBUG ENDPOINT: partner_id={p['id']} "
-                        f"name={name_odoo} -> clave={clave}"
-                    )
-
-        # Mapear contactos hijos al cliente padre
-        for p in partners_odoo:
-            if p['id'] not in odoo_id_to_clave and p.get('parent_id'):
-                parent_id = p['parent_id'][0] if isinstance(p['parent_id'], (list, tuple)) else p['parent_id']
-
-                if parent_id and parent_id in odoo_id_to_clave:
-                    odoo_id_to_clave[p['id']] = odoo_id_to_clave[parent_id]
-
-        lista_ids_validos = list(odoo_id_to_clave.keys())
-
-        if not lista_ids_validos:
-            return jsonify({
-                "success": False,
-                "error": f"No encontré partners de Odoo relacionados con {clave}",
-                "cliente": cliente
-            }), 404
-
-        min_date = max(fecha_inicio, FECHA_MINIMA_RETROACTIVOS)
-        max_date = fecha_fin
-
-        # ==========================================================
-        # FUENTE 1: CAMPAÑAS POR REFERENCIA
-        # ==========================================================
-        productos_ofertados_por_clave, detalle_campanas = calcular_productos_ofertados_por_campanas(
-            models,
-            uid,
-            lista_ids_validos,
-            min_date,
-            max_date,
-            odoo_id_to_clave,
-            fechas_por_clave
-        )
-
-        llaves_ya_tomadas = set()
-
-        for item in detalle_campanas:
-            llaves_ya_tomadas.add((
-                str(item.get('clave') or '').strip().upper(),
-                str(item.get('fecha_factura') or '')[:10],
-                normalizar_referencia_producto(item.get('referencia_interna')),
-                round(float(item.get('total_con_iva') or 0), 2)
-            ))
-
-        # ==========================================================
-        # FUENTE 2: ETIQUETA PRODUCTO OFERTADO EN SALE.REPORT
-        # ==========================================================
-        productos_ofertados_etiqueta_por_clave, detalle_etiqueta = calcular_productos_ofertados_por_etiqueta_sale_report(
-            models,
-            uid,
-            lista_ids_validos,
-            min_date,
-            max_date,
-            odoo_id_to_clave,
-            fechas_por_clave,
-            llaves_ya_tomadas
-        )
-
-        total_campanas = round(float(productos_ofertados_por_clave.get(clave, 0) or 0), 2)
-        total_etiqueta = round(float(productos_ofertados_etiqueta_por_clave.get(clave, 0) or 0), 2)
-        total_general = round(total_campanas + total_etiqueta, 2)
-
-        detalle_campanas_filtrado = [
-            item for item in detalle_campanas
-            if str(item.get('clave') or '').strip().upper() == clave
-        ]
-
-        detalle_etiqueta_filtrado = [
-            item for item in detalle_etiqueta
-            if str(item.get('clave') or '').strip().upper() == clave
-        ]
-
-        return jsonify({
-            "success": True,
-            "clave": clave,
-            "cliente": cliente.get('CLIENTE'),
-            "periodo": {
-                "inicio_cliente": fecha_inicio,
-                "fin_cliente": fecha_fin,
-                "inicio_efectivo_productos_ofertados": max(fecha_inicio, FECHA_MINIMA_PRODUCTOS_OFERTADOS),
-                "fin": fecha_fin
-            },
-            "partners_odoo_encontrados": len(lista_ids_validos),
-            "totales": {
-                "campanas_por_referencia": total_campanas,
-                "etiqueta_producto_ofertado": total_etiqueta,
-                "total_productos_ofertados": total_general
-            },
-            "registros": {
-                "campanas": len(detalle_campanas_filtrado),
-                "etiqueta_producto_ofertado": len(detalle_etiqueta_filtrado),
-                "total": len(detalle_campanas_filtrado) + len(detalle_etiqueta_filtrado)
-            },
-            "detalle_campanas": detalle_campanas_filtrado,
-            "detalle_etiqueta_producto_ofertado": detalle_etiqueta_filtrado
-        }), 200
-
-    except Exception as e:
-        traceback.print_exc()
-        return jsonify({
-            "success": False,
-            "error": str(e)
-        }), 500
-
-    finally:
-        cursor.close()
-        conexion.close()

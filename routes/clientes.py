@@ -119,10 +119,10 @@ def buscar_cliente():
         query = """
             SELECT id, clave, evac, nombre_cliente, nivel, f_inicio, f_fin
             FROM clientes
-            WHERE clave = %s OR nombre_cliente = %s
+            WHERE clave = %s OR nombre_cliente LIKE %s
             LIMIT 1
         """
-        cursor.execute(query, (valor, valor))
+        cursor.execute(query, (valor, f'%{valor}%'))
         cliente = cursor.fetchone()
 
         if cliente:
