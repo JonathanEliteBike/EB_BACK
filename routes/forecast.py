@@ -3087,6 +3087,46 @@ def sync_catalogo_status():
     }), 200
 
 
+@forecast_bp.route('/forecast/debug-megamo-grupos', methods=['GET'])
+def debug_megamo_grupos():
+    """GET /forecast/debug-megamo-grupos — lista todos los grupos MEGAMO visibles en búsqueda."""
+    conn = _safe_obtener_conexion()
+    if conn is None:
+        return jsonify({'error': 'DB unavailable'}), 503
+    cur = conn.cursor()
+    try:
+        cur.execute("""
+            SELECT DISTINCT oc.nombre_producto AS nombre
+            FROM odoo_catalogo oc
+            INNER JOIN forecast_sku_whitelist wl ON wl.sku = oc.referencia_interna
+            WHERE oc.nombre_producto LIKE '%megamo%' OR oc.marca LIKE '%megamo%'
+            ORDER BY oc.nombre_producto
+        """)
+        grupos = [r[0] for r in cur.fetchall()]
+
+        cur.execute("""
+            SELECT wl.sku
+            FROM forecast_sku_whitelist wl
+            WHERE wl.sku LIKE 'MH%'
+              AND wl.sku NOT IN (SELECT referencia_interna FROM odoo_catalogo)
+            ORDER BY wl.sku
+        """)
+        missing = [r[0] for r in cur.fetchall()]
+
+        cur.execute("SELECT COUNT(*) FROM odoo_catalogo WHERE nombre_producto LIKE '%megamo%' OR marca LIKE '%megamo%'")
+        total_megamo = cur.fetchone()[0]
+
+        return jsonify({
+            'grupos_visibles': len(grupos),
+            'grupos': grupos,
+            'skus_whitelist_sin_catalogo': missing,
+            'total_megamo_en_catalogo': total_megamo,
+        }), 200
+    finally:
+        cur.close()
+        conn.close()
+
+
 @forecast_bp.route('/forecast/<int:fid>', methods=['PUT'])
 def actualizar_forecast(fid):
     """
