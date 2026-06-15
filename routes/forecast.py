@@ -3140,7 +3140,7 @@ def actualizar_forecast(fid):
 
 
 _SEARCH_PAGE       = 50    # fallback general
-_SEARCH_PAGE_WL    = 200   # whitelist: caben todos los SKUs Megamo+Scott (≤200)
+_SEARCH_PAGE_WL    = 2000  # whitelist: todos los SKUs Megamo+Scott en una sola página
 
 # Alias map for Spanish plural/variant forms that don't match DB names
 _SEARCH_ALIAS = {
