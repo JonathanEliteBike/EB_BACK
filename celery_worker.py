@@ -35,6 +35,15 @@ celery_app.conf.update(
     timezone='America/Mexico_City',
     enable_utc=True,
     worker_hijack_root_logger=False,
+    beat_schedule={
+        # Recalienta el caché de detalle-compras-odoo cada 25 min
+        # (TTL del caché es 30 min → siempre llega antes de que expire)
+        'precalentar-monitor-periodico': {
+            'task': 'tasks.precalentar_monitor_async',
+            'schedule': 1500,  # 25 minutos en segundos
+            'args': ('http://localhost:5000',),
+        },
+    },
 )
 
 # ----------------- POOL DE CONEXIONES SMTP -----------------
@@ -168,3 +177,55 @@ def recalcular_previo_async():
             "status": "error",
             "mensaje": str(e)
         }
+
+
+@celery_app.task(name='tasks.precalentar_monitor_async')
+def precalentar_monitor_async(host='http://localhost:5000'):
+    """
+    Pre-calienta el caché Redis de detalle-compras-odoo para todos los clientes activos.
+    Se ejecuta periódicamente vía Celery Beat (cada 25 min) para que el TTL de 30 min
+    nunca expire antes de ser renovado — el modal carga al instante desde caché.
+    """
+    import requests as _req
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    import sys as _sys
+    _sys.path.insert(0, BASE_DIR)
+    from db_conexion import obtener_conexion
+
+    try:
+        conn = obtener_conexion()
+        cur = conn.cursor(dictionary=True)
+        cur.execute(
+            "SELECT clave FROM clientes "
+            "WHERE clave IS NOT NULL AND clave != '' AND f_inicio IS NOT NULL"
+        )
+        claves = [r['clave'] for r in cur.fetchall()]
+        cur.close()
+        conn.close()
+    except Exception as e:
+        logging.error('precalentar_monitor_async: no se pudo leer clientes: %s', e)
+        return {'status': 'error', 'mensaje': str(e)}
+
+    def _cargar(clave):
+        try:
+            _req.get(
+                f'{host}/detalle-compras-odoo',
+                params={'cliente': clave, 'ref_exacta': '1'},
+                timeout=120,
+            )
+            return 'ok'
+        except Exception as _e:
+            logging.warning('precalentar_monitor_async: error clave %s: %s', clave, _e)
+            return 'err'
+
+    ok = err = 0
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        futuros = [pool.submit(_cargar, c) for c in claves]
+        for fut in as_completed(futuros):
+            if fut.result() == 'ok':
+                ok += 1
+            else:
+                err += 1
+
+    logging.info('precalentar_monitor_async: %d OK, %d errores de %d clientes', ok, err, len(claves))
+    return {'status': 'ok', 'clientes': len(claves), 'ok': ok, 'errores': err}

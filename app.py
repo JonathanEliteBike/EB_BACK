@@ -1,3 +1,4 @@
+import os
 from flask import Flask, request, make_response
 from flask_cors import CORS
 from socket_instance import socketio
@@ -174,7 +175,22 @@ def create_app():
 
 app = create_app()
 
-# Pre-calentamiento disponible vía POST /precalentar-monitor (no automático en producción)
+# ── Disparo de pre-calentamiento en startup ──────────────────────────────────
+# Usa un lock Redis de 60 s para que solo UN worker de gunicorn lance la tarea.
+try:
+    import redis as _redis_startup
+    _r_startup = _redis_startup.from_url(
+        os.getenv('CELERY_BROKER_URL', 'redis://localhost:6379/0'),
+        decode_responses=True, socket_connect_timeout=2
+    )
+    if _r_startup.set('startup_warm_lock', '1', nx=True, ex=60):
+        from celery_worker import celery_app as _celery
+        _celery.send_task('tasks.precalentar_monitor_async', args=('http://localhost:5000',))
+        import logging as _log_s
+        _log_s.info('Startup: tarea precalentar_monitor_async enviada a Celery')
+except Exception as _e_warm:
+    import logging as _log_s
+    _log_s.warning('Startup warm skipped: %s', _e_warm)
 
 if __name__ == '__main__':
     socketio.run(
