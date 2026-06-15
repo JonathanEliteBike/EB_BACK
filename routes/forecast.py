@@ -3340,9 +3340,9 @@ def buscar_producto():
             tok_conds  = []
             tok_params = []
             for tok in tokens:
-                lk = f'%{tok}%'
+                lk = f'%{tok.upper()}%'
                 tok_conds.append(
-                    "(nombre_src LIKE %s OR sku LIKE %s OR marca LIKE %s OR odoo_color LIKE %s OR odoo_talla LIKE %s)"
+                    "(UPPER(nombre_src) LIKE %s OR UPPER(sku) LIKE %s OR UPPER(marca) LIKE %s OR UPPER(odoo_color) LIKE %s OR UPPER(odoo_talla) LIKE %s)"
                 )
                 tok_params.extend([lk, lk, lk, lk, lk])
 
@@ -3400,10 +3400,10 @@ def buscar_producto():
 
         if use_excel:
             # Fallback Excel: también multi-token AND
-            fb_conds  = ' AND '.join(["(sku LIKE %s OR nombre LIKE %s)"] * len(tokens))
+            fb_conds  = ' AND '.join(["(UPPER(sku) LIKE %s OR UPPER(nombre) LIKE %s)"] * len(tokens))
             fb_params = []
             for tok in tokens:
-                lk = f'%{tok}%'
+                lk = f'%{tok.upper()}%'
                 fb_params.extend([lk, lk])
             cur.execute(f"""
                 SELECT sku, nombre AS nombre_src, color AS odoo_color, talla AS odoo_talla
@@ -3443,22 +3443,22 @@ def buscar_producto():
         cat_conds  = []
         cat_params = []
         for tok in tokens:
-            lk = f'%{tok}%'
+            lk = f'%{tok.upper()}%'
             cat_conds.append(
-                "(oc.nombre_producto LIKE %s OR oc.referencia_interna LIKE %s "
-                "OR oc.marca LIKE %s OR oc.categoria LIKE %s "
-                "OR pv.descripcion LIKE %s OR pv.modelo LIKE %s OR pv.clave_factura LIKE %s)"
+                "(UPPER(oc.nombre_producto) LIKE %s OR UPPER(oc.referencia_interna) LIKE %s "
+                "OR UPPER(oc.marca) LIKE %s OR UPPER(oc.categoria) LIKE %s "
+                "OR UPPER(pv.descripcion) LIKE %s OR UPPER(pv.modelo) LIKE %s OR UPPER(pv.clave_factura) LIKE %s)"
             )
             cat_params.extend([lk, lk, lk, lk, lk, lk, lk])
 
         mon_conds  = []
         mon_params = []
         for tok in tokens:
-            lk = f'%{tok}%'
+            lk = f'%{tok.upper()}%'
             mon_conds.append(
-                "(m.nombre_producto LIKE %s OR m.referencia_interna LIKE %s "
-                "OR m.marca LIKE %s OR pv.descripcion LIKE %s "
-                "OR pv.modelo LIKE %s OR pv.clave_factura LIKE %s)"
+                "(UPPER(m.nombre_producto) LIKE %s OR UPPER(m.referencia_interna) LIKE %s "
+                "OR UPPER(m.marca) LIKE %s OR UPPER(pv.descripcion) LIKE %s "
+                "OR UPPER(pv.modelo) LIKE %s OR UPPER(pv.clave_factura) LIKE %s)"
             )
             mon_params.extend([lk, lk, lk, lk, lk, lk])
 
