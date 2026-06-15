@@ -3097,7 +3097,12 @@ def cerrar_temporada():
         return jsonify({"error": "No autorizado"}), 401
 
     payload = verificar_token(raw_token)
-    if not payload or payload.get('rol') != 1:
+    rol = payload.get('rol') if payload else None
+    try:
+        es_admin = int(rol) == 1
+    except (TypeError, ValueError):
+        es_admin = False
+    if not es_admin:
         return jsonify({"error": "Solo administradores pueden cerrar la temporada"}), 403
 
     data = request.get_json() or {}
