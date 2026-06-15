@@ -35,8 +35,10 @@ forecast_bp = Blueprint('forecast', __name__, url_prefix='')
 # Evita repetir las llamadas XML-RPC lentas cuando el usuario recarga la vista
 # o cambia de pestaña dentro del mismo periodo.
 import time as _time
-_avance_cache: dict = {}   # key: (clave, periodo) → (timestamp, result_list)
-_AVANCE_TTL = 180          # segundos
+_avance_cache: dict   = {}   # key: (clave, periodo) → (timestamp, result_list)
+_forecast_cache: dict = {}   # key: (clave, periodo) → (timestamp, result_list)
+_AVANCE_TTL   = 180          # segundos
+_FORECAST_TTL = 180          # segundos
 
 # Orden de meses en el periodo comercial Mayo–Abril
 MESES = ['mayo', 'junio', 'julio', 'agosto', 'septiembre', 'octubre',
@@ -47,8 +49,17 @@ TIER_NAMES  = ['Partner Elite Plus!', 'Partner Elite', 'Partner', 'Distribuidor'
 CAMPOS_INFO = ['SKU', 'Producto', 'Marca', 'Modelo', 'Color', 'Talla']
 IVA_FACTOR  = 1.16   # precios en SKU_CATALOG y Odoo son sin IVA
 
+# Mapeo tier (MySQL) → nombre exacto de lista de precios en Odoo
+_TIER_TO_ODOO_PL: dict[str, str] = {
+    'Partner Elite Plus!': 'PARTNER ELITE',
+    'Partner Elite':       'PARTNER ELITE',
+    'Partner':             'PARTNER',
+    'Distribuidor':        'DISTRIBUIDOR',
+}
+
 # SKU whitelist para proyecciones (solo estos productos se muestran)
 FORECAST_SKU_WHITELIST = [
+    # ── Scott MY27 ──────────────────────────────────────────────────────────
     '427981-5814004', '427981-5814006', '427981-5814008', '427981-5814010', '427981-5814012',
     '427982-8561004', '427982-8561006', '427982-8561008', '427982-8561010', '427982-8561012',
     '427982-0002004', '427982-0002006', '427982-0002008', '427982-0002010', '427982-0002012',
@@ -66,7 +77,296 @@ FORECAST_SKU_WHITELIST = [
     '427102-0002004', '427102-0002006', '427102-0002008', '427102-0002010', '427102-0002012', '427102-0002014',
     '427102-2878004', '427102-2878006', '427102-2878008', '427102-2878010',
     '427102-1087004', '427102-1087006', '427102-1087008', '427102-1087010',
-    '427985-3831006', '427985-3831008', '427985-3831010', '427985-3831012'
+    '427985-3831006', '427985-3831008', '427985-3831010', '427985-3831012',
+    # ── Megamo MY27 ─────────────────────────────────────────────────────────
+    # MH440085
+    'MH44008505A', 'MH44008405A', 'MH44008305A', 'MH44008205A',
+    'MH44008503B', 'MH44008403B', 'MH44008303B', 'MH44008203B',
+    'MH44008503A', 'MH44008403A', 'MH44008303A', 'MH44008203A',
+    # MH440101
+    'MH44010505A', 'MH44010405A', 'MH44010305A', 'MH44010205A',
+    'MH44010503B', 'MH44010403B', 'MH44010303B', 'MH44010203B',
+    'MH44010503A', 'MH44010403A', 'MH44010303A', 'MH44010203A',
+    # MH390005
+    'MH39000500M', 'MH39000400M', 'MH39000300M', 'MH39000200M',
+    'MH39000507K', 'MH39000407K', 'MH39000307K', 'MH39000207K',
+    'MH39000507A', 'MH39000407A', 'MH39000307A', 'MH39000207A',
+    # MH390013
+    'MH39013500M', 'MH39013400M', 'MH39013300M', 'MH39013200M',
+    'MH39013507K', 'MH39013407K', 'MH39013307K', 'MH39013207K',
+    'MH39013507A', 'MH39013407A', 'MH39013307A', 'MH39013207A',
+    # MH370025
+    'MH37002504J', 'MH37002404J', 'MH37002304J', 'MH37002204J',
+    # MH370005
+    'MH37000503M', 'MH37000403M', 'MH37000303M', 'MH37000203M',
+    # MH380075
+    'MH38007502M', 'MH38007402M', 'MH38007302M', 'MH38007202M',
+    'MH38007501M', 'MH38007505A',
+    # MH380055
+    'MH38005502M', 'MH38005402M', 'MH38005302M', 'MH38005202M',
+    'MH38005505A',
+    # MH380135
+    'MH38013502M', 'MH38013402M', 'MH38013302M', 'MH38013202M',
+    'MH38013501M', 'MH38013401M', 'MH38013301M', 'MH38013201M',
+    # MH400075
+    'MH40007502M', 'MH40007402M', 'MH40007302M', 'MH40007202M',
+    'MH40007505A', 'MH40007405A', 'MH40007305A', 'MH40007205A',
+    # MH460015
+    'MH46001504M', 'MH46001404M', 'MH46001304M', 'MH46001204M',
+    'MH46001505C', 'MH46001405C', 'MH46001305C', 'MH46001205C',
+    # MH460365
+    'MH46036505C', 'MH46036405C', 'MH46036305C', 'MH46036205C',
+    # ── Megamo MY28 ─────────────────────────────────────────────────────────
+    # MH370015
+    'MH37001500M', 'MH37001400M', 'MH37001300M', 'MH37001200M',
+    'MH37001507K', 'MH37001207K',
+    'MH37001507A', 'MH37001207A',
+    # MH370135
+    'MH37013500M', 'MH37013507K', 'MH37013507A',
+    # MH370035
+    'MH37003500M', 'MH37003400M', 'MH37003300M', 'MH37003200M',
+    'MH37003507K', 'MH37003407K', 'MH37003307K', 'MH37003207K',
+    'MH37003507A', 'MH37003407A', 'MH37003307A', 'MH37003207A',
+    # MH370055
+    'MH37005500M', 'MH37005507K', 'MH37005507A',
+    # MH370075
+    'MH37007500M', 'MH37007400M', 'MH37007300M', 'MH37007200M',
+    'MH37007507K', 'MH37007407K', 'MH37007307K', 'MH37007207K',
+    'MH37007507A', 'MH37007407A', 'MH37007307A', 'MH37007207A',
+    # MH390055
+    'MH39005500M', 'MH39005400M', 'MH39005300M', 'MH39005200M',
+    'MH39005507K', 'MH39005407K', 'MH39005307K', 'MH39005207K',
+    'MH39005507A', 'MH39005407A', 'MH39005307A', 'MH39005207A',
+    # MH390075
+    'MH39007500M', 'MH39007400M', 'MH39007300M', 'MH39007200M',
+    'MH39007507K', 'MH39007407K', 'MH39007307K', 'MH39007207K',
+    'MH39007507A', 'MH39007407A', 'MH39007307A', 'MH39007207A',
+    # MH380135
+    'MH38013505A', 'MH38013405A',
+    # MH380035
+    'MH38003505A', 'MH38003205A',
+    'MH38003501M', 'MH38003401M', 'MH38003301M', 'MH38003201M',
+    'MH38003502M', 'MH38003402M', 'MH38003302M', 'MH38003202M',
+    # MH380055
+    'MH38005501M',
+    # MH400055
+    'MH40005505A', 'MH40005405A', 'MH40005305A', 'MH40005205A',
+    'MH40005501M', 'MH40005401M', 'MH40005301M', 'MH40005201M',
+    'MH40005502M', 'MH40005402M', 'MH40005302M', 'MH40005202M',
+    # MH400075
+    'MH40007501M', 'MH40007401M', 'MH40007301M', 'MH40007201M',
+    # MH440135
+    'MH44013505A', 'MH44013405A', 'MH44013305A', 'MH44013205A',
+    'MH44013503B', 'MH44013403B', 'MH44013303B', 'MH44013203B',
+    'MH44013503A', 'MH44013403A', 'MH44013303A', 'MH44013203A',
+    # MH440055
+    'MH44005505A', 'MH44005405A', 'MH44005305A', 'MH44005205A',
+    'MH44005503B', 'MH44005403B', 'MH44005303B', 'MH44005203B',
+    'MH44005503A', 'MH44005403A', 'MH44005303A', 'MH44005203A',
+    # MH450055
+    'MH45005505A', 'MH45005405A', 'MH45005305A', 'MH45005205A',
+    'MH45005503A', 'MH45005403A', 'MH45005303A', 'MH45005203A',
+    # MH450975
+    'MH45097505A', 'MH45097405A', 'MH45097305A', 'MH45097205A',
+    'MH45097503A', 'MH45097403A', 'MH45097303A', 'MH45097203A',
+    # MH450205
+    'MH45020505A', 'MH45020405A', 'MH45020305A', 'MH45020205A',
+    'MH45020503A', 'MH45020403A', 'MH45020303A', 'MH45020203A',
+    # MH460365 (MY28)
+    'MH46036504M', 'MH46036404M', 'MH46036304M', 'MH46036204M',
+    # MH460035
+    'MH46003504M', 'MH46003404M', 'MH46003304M', 'MH46003204M',
+    'MH46003505C', 'MH46003405C', 'MH46003305C', 'MH46003205C',
+    # MH460105
+    'MH46010504M', 'MH46010404M', 'MH46010304M', 'MH46010204M',
+    'MH46010505C', 'MH46010405C', 'MH46010305C', 'MH46010205C',
+    # MH461095
+    'MH46109504M', 'MH46109404M', 'MH46109304M', 'MH46109204M',
+    'MH46109505C', 'MH46109405C', 'MH46109305C', 'MH46109205C',
+    # ── Scott MY28 ──────────────────────────────────────────────────────────
+    # MH091265
+    'MH09126505N', 'MH09126405N', 'MH09126305N', 'MH09126205N',
+    # MH090015
+    'MH09001505N', 'MH09001405N', 'MH09001305N', 'MH09001205N',
+    # MH091275
+    'MH09127506M', 'MH09127406M', 'MH09127306M', 'MH09127206M',
+    'MH09127503A', 'MH09127403A', 'MH09127303A', 'MH09127203A',
+    # MH091285
+    'MH09128506M', 'MH09128406M', 'MH09128306M', 'MH09128206M',
+    'MH09128503A', 'MH09128403A', 'MH09128303A', 'MH09128203A',
+    # MH090065
+    'MH09006506M', 'MH09006406M', 'MH09006306M', 'MH09006206M',
+    'MH09006503A', 'MH09006403A', 'MH09006303A', 'MH09006203A',
+    # MH090085
+    'MH09008506M', 'MH09008406M', 'MH09008306M', 'MH09008206M',
+    'MH09008503A', 'MH09008403A', 'MH09008303A', 'MH09008203A',
+    # MH100375
+    'MH10037500O', 'MH10037400O', 'MH10037300O', 'MH10037200O',
+    # MH100155
+    'MH10015500O', 'MH10015400O', 'MH10015300O', 'MH10015200O',
+    # MH100305
+    'MH10030500O', 'MH10030400O', 'MH10030300O', 'MH10030200O',
+    # MH250155
+    'MH25015505A', 'MH25015405A', 'MH25015305A', 'MH25015205A',
+    'MH25015507A', 'MH25015407A', 'MH25015307A', 'MH25015207A',
+    # MH110305
+    'MH11030505A', 'MH11030405A', 'MH11030305A', 'MH11030205A',
+    'MH11030507A', 'MH11030407A', 'MH11030307A', 'MH11030207A',
+    # MH110405
+    'MH11040505A', 'MH11040405A', 'MH11040305A', 'MH11040205A',
+    'MH11040507A', 'MH11040407A', 'MH11040307A', 'MH11040207A',
+    # MH110435/440
+    'MH11043505A', 'MH11043405A', 'MH11043305A', 'MH11044205A', 'MH11043205A', 'MH11044105A',
+    'MH11043507A', 'MH11043407A', 'MH11043307A', 'MH11044207A', 'MH11043207A', 'MH11044107A',
+    # MH170905/089
+    'MH17090506A', 'MH17090406A', 'MH17090306A', 'MH17090206A',
+    'MH17089206A', 'MH17089106A',
+    'MH17090503B', 'MH17090403B', 'MH17090303B', 'MH17090203B',
+    'MH17089203B', 'MH17089103B',
+    # MH190990 / MH180990
+    'MH19099004A', 'MH19099003A',
+    'MH18099002H', 'MH18099002B', 'MH18099003B',
+    # ── Scott MY28 (MH12xxx / MH13xxx) ──────────────────────────────────────
+    # MH120005
+    'MH12000508M', 'MH12000408M', 'MH12000308M', 'MH12000208M', 'MH12000108M',
+    'MH12000509M', 'MH12000409M', 'MH12000309M', 'MH12000209M', 'MH12000109M',
+    'MH12000500N', 'MH12000400N', 'MH12000300N', 'MH12000200N', 'MH12000100N',
+    # MH120015
+    'MH12001508M', 'MH12001408M', 'MH12001308M', 'MH12001208M', 'MH12001108M',
+    'MH12001509M', 'MH12001409M', 'MH12001309M', 'MH12001209M', 'MH12001109M',
+    'MH12001500N', 'MH12001400N', 'MH12001300N', 'MH12001200N', 'MH12001100N',
+    # MH120025
+    'MH12002508M', 'MH12002408M', 'MH12002308M', 'MH12002208M', 'MH12002108M',
+    'MH12002509M', 'MH12002409M', 'MH12002309M', 'MH12002209M', 'MH12002109M',
+    'MH12002500N', 'MH12002400N', 'MH12002300N', 'MH12002200N', 'MH12002100N',
+    # MH121235
+    'MH12123503N', 'MH12123403N', 'MH12123303N', 'MH12123203N', 'MH12123103N',
+    'MH12123502N', 'MH12123402N', 'MH12123302N', 'MH12123202N', 'MH12123102N',
+    'MH12123504N', 'MH12123404N', 'MH12123304N', 'MH12123204N', 'MH12123104N',
+    # MH121175
+    'MH12117508M', 'MH12117408M', 'MH12117308M', 'MH12117208M', 'MH12117108M',
+    'MH12117509M', 'MH12117409M', 'MH12117309M', 'MH12117209M', 'MH12117109M',
+    'MH12117500N', 'MH12117400N', 'MH12117300N', 'MH12117200N', 'MH12117100N',
+    # MH120955
+    'MH12095503N', 'MH12095403N', 'MH12095303N', 'MH12095203N', 'MH12095103N',
+    'MH12095502N', 'MH12095402N', 'MH12095302N', 'MH12095202N', 'MH12095102N',
+    'MH12095504N', 'MH12095404N', 'MH12095304N', 'MH12095204N', 'MH12095104N',
+    # MH121185
+    'MH12118508M', 'MH12118408M', 'MH12118308M', 'MH12118208M', 'MH12118108M',
+    'MH12118509M', 'MH12118409M', 'MH12118309M', 'MH12118209M', 'MH12118109M',
+    'MH12118500N', 'MH12118400N', 'MH12118300N', 'MH12118200N', 'MH12118100N',
+    # MH120975
+    'MH12097503N', 'MH12097403N', 'MH12097303N', 'MH12097203N', 'MH12097103N',
+    'MH12097502N', 'MH12097402N', 'MH12097302N', 'MH12097202N', 'MH12097102N',
+    'MH12097504N', 'MH12097404N', 'MH12097304N', 'MH12097204N', 'MH12097104N',
+    # MH120155
+    'MH12015503N', 'MH12015403N', 'MH12015303N', 'MH12015203N', 'MH12015103N',
+    'MH12015502N', 'MH12015402N', 'MH12015302N', 'MH12015202N', 'MH12015102N',
+    'MH12015504N', 'MH12015404N', 'MH12015304N', 'MH12015204N', 'MH12015104N',
+    # MH130005
+    'MH13000506N', 'MH13000406N', 'MH13000306N', 'MH13000206N', 'MH13000106N',
+    'MH13000504J', 'MH13000404J', 'MH13000304J', 'MH13000204J', 'MH13000104J',
+    # MH130015
+    'MH13001506N', 'MH13001406N', 'MH13001306N', 'MH13001206N', 'MH13001106N',
+    'MH13001504J', 'MH13001404J', 'MH13001304J', 'MH13001204J', 'MH13001104J',
+    # MH130025
+    'MH13002506N', 'MH13002406N', 'MH13002306N', 'MH13002206N', 'MH13002106N',
+    'MH13002504J', 'MH13002404J', 'MH13002304J', 'MH13002204J', 'MH13002104J',
+    # MH131235
+    'MH13123507N', 'MH13123407N', 'MH13123307N', 'MH13123207N', 'MH13123107N',
+    'MH13123504A', 'MH13123404A', 'MH13123304A', 'MH13123204A', 'MH13123104A',
+    'MH13123503A', 'MH13123403A', 'MH13123303A', 'MH13123203A', 'MH13123103A',
+    # MH131175
+    'MH13117506N', 'MH13117406N', 'MH13117306N', 'MH13117206N', 'MH13117106N',
+    'MH13117504J', 'MH13117404J', 'MH13117304J', 'MH13117204J', 'MH13117104J',
+    # MH130955
+    'MH13095507N', 'MH13095407N', 'MH13095307N', 'MH13095207N', 'MH13095107N',
+    'MH13095504A', 'MH13095404A', 'MH13095304A', 'MH13095204A', 'MH13095104A',
+    'MH13095503A', 'MH13095403A', 'MH13095303A', 'MH13095203A', 'MH13095103A',
+    # MH131295
+    'MH13129507N', 'MH13129407N', 'MH13129307N', 'MH13129207N', 'MH13129107N',
+    'MH13129504A', 'MH13129404A', 'MH13129304A', 'MH13129204A', 'MH13129104A',
+    'MH13129503A', 'MH13129403A', 'MH13129303A', 'MH13129203A', 'MH13129103A',
+    # MH130975
+    'MH13097507N', 'MH13097407N', 'MH13097307N', 'MH13097207N', 'MH13097107N',
+    'MH13097504A', 'MH13097404A', 'MH13097304A', 'MH13097204A', 'MH13097104A',
+    'MH13097503A', 'MH13097403A', 'MH13097303A', 'MH13097203A', 'MH13097103A',
+    # MH130155
+    'MH13015507N', 'MH13015407N', 'MH13015307N', 'MH13015207N', 'MH13015107N',
+    'MH13015504A', 'MH13015404A', 'MH13015304A', 'MH13015204A', 'MH13015104A',
+    'MH13015503A', 'MH13015403A', 'MH13015303A', 'MH13015203A', 'MH13015103A',
+    # MH130205
+    'MH13020507N', 'MH13020407N', 'MH13020307N', 'MH13020207N', 'MH13020107N',
+    'MH13020504A', 'MH13020404A', 'MH13020304A', 'MH13020204A', 'MH13020104A',
+    'MH13020503A', 'MH13020403A', 'MH13020303A', 'MH13020203A', 'MH13020103A',
+    # ── Bold / Look / Otros MY28 ─────────────────────────────────────────────
+    # MH470005
+    'MH47000505A', 'MH47000405A', 'MH47000305A', 'MH47000205A', 'MH47000105A',
+    'MH47000504L', 'MH47000404L', 'MH47000304L', 'MH47000204L', 'MH47000104L',
+    'MH47000508N', 'MH47000408N', 'MH47000308N', 'MH47000208N', 'MH47000108N',
+    # MH470015
+    'MH47001505A', 'MH47001405A', 'MH47001305A', 'MH47001205A', 'MH47001105A',
+    'MH47001504L', 'MH47001404L', 'MH47001304L', 'MH47001204L', 'MH47001104L',
+    'MH47001508N', 'MH47001408N', 'MH47001308N', 'MH47001208N', 'MH47001108N',
+    # MH470035
+    'MH47003505A', 'MH47003405A', 'MH47003305A', 'MH47003205A', 'MH47003105A',
+    'MH47003504L', 'MH47003404L', 'MH47003304L', 'MH47003204L', 'MH47003104L',
+    'MH47003508N', 'MH47003408N', 'MH47003308N', 'MH47003208N', 'MH47003108N',
+    # MH471175
+    'MH47117505A', 'MH47117405A', 'MH47117305A', 'MH47117205A', 'MH47117105A',
+    'MH47117504L', 'MH47117404L', 'MH47117304L', 'MH47117204L', 'MH47117104L',
+    'MH47117508N', 'MH47117408N', 'MH47117308N', 'MH47117208N', 'MH47117108N',
+    # MH470055
+    'MH47005505A', 'MH47005405A', 'MH47005305A', 'MH47005205A', 'MH47005105A',
+    'MH47005504L', 'MH47005404L', 'MH47005304L', 'MH47005204L', 'MH47005104L',
+    'MH47005508N', 'MH47005408N', 'MH47005308N', 'MH47005208N', 'MH47005108N',
+    # MH470065
+    'MH47006509N', 'MH47006409N', 'MH47006309N', 'MH47006209N', 'MH47006109N',
+    'MH47006505C', 'MH47006405C', 'MH47006305C', 'MH47006205C', 'MH47006105C',
+    # MH470075
+    'MH47007509N', 'MH47007409N', 'MH47007309N', 'MH47007209N', 'MH47007109N',
+    'MH47007505C', 'MH47007405C', 'MH47007305C', 'MH47007205C', 'MH47007105C',
+    # MH150015
+    'MH15001507L', 'MH15001407L', 'MH15001307L', 'MH15001207L', 'MH15001107L',
+    'MH15001500O', 'MH15001400O', 'MH15001300O', 'MH15001200O', 'MH15001100O',
+    'MH15001505C', 'MH15001405C', 'MH15001305C', 'MH15001205C', 'MH15001105C',
+    # MH150035
+    'MH15003507L', 'MH15003407L', 'MH15003307L', 'MH15003207L', 'MH15003107L',
+    'MH15003500O', 'MH15003400O', 'MH15003300O', 'MH15003200O', 'MH15003100O',
+    'MH15003505C', 'MH15003405C', 'MH15003305C', 'MH15003205C', 'MH15003105C',
+    # MH150055
+    'MH15005507L', 'MH15005407L', 'MH15005307L', 'MH15005207L', 'MH15005107L',
+    'MH15005500O', 'MH15005400O', 'MH15005300O', 'MH15005200O', 'MH15005100O',
+    'MH15005505C', 'MH15005405C', 'MH15005305C', 'MH15005205C', 'MH15005105C',
+    # MH150105
+    'MH15010507L', 'MH15010407L', 'MH15010307L', 'MH15010207L', 'MH15010107L',
+    'MH15010500O', 'MH15010400O', 'MH15010300O', 'MH15010200O', 'MH15010100O',
+    'MH15010505C', 'MH15010405C', 'MH15010305C', 'MH15010205C', 'MH15010105C',
+    # MH150155
+    'MH15015507L', 'MH15015407L', 'MH15015307L', 'MH15015207L', 'MH15015107L',
+    'MH15015500O', 'MH15015400O', 'MH15015300O', 'MH15015200O', 'MH15015100O',
+    'MH15015505C', 'MH15015405C', 'MH15015305C', 'MH15015205C', 'MH15015105C',
+    # MH160205
+    'MH16020505M', 'MH16020405M', 'MH16020305M', 'MH16020205M', 'MH16020105M',
+    'MH16020507M', 'MH16020407M', 'MH16020307M', 'MH16020207M', 'MH16020107M',
+    'MH16020503J', 'MH16020403J', 'MH16020303J', 'MH16020203J', 'MH16020103J',
+    # MH160305
+    'MH16030505M', 'MH16030405M', 'MH16030305M', 'MH16030205M', 'MH16030105M',
+    'MH16030507M', 'MH16030407M', 'MH16030307M', 'MH16030207M', 'MH16030107M',
+    'MH16030503J', 'MH16030403J', 'MH16030303J', 'MH16030203J', 'MH16030103J',
+    # MH160325
+    'MH16032505M', 'MH16032405M', 'MH16032305M', 'MH16032205M', 'MH16032105M',
+    'MH16032507M', 'MH16032407M', 'MH16032307M', 'MH16032207M', 'MH16032107M',
+    'MH16032503J', 'MH16032403J', 'MH16032303J', 'MH16032203J', 'MH16032103J',
+    # MH280991 / MH410990
+    'MH28099106B', 'MH28099106L',
+    'MH41099005C', 'MH41099004B',
+    # MH20xxx / MH21xxx / MH22xxx / MH23xxx / MH24xxx
+    'MH20078000A', 'MH20078003A', 'MH20099000A', 'MH20099003A',
+    'MH21099006A', 'MH21099002H',
+    'MH22099004A', 'MH22099007A',
+    'MH23099003A', 'MH23099009A',
+    'MH24099004A', 'MH24099003A',
 ]
 
 # Catálogo oficial MY27 — precios reales + disponibilidad mensual (May-Ago).
@@ -446,12 +746,19 @@ def _get_odoo_prices_for_skus(refs: list) -> dict:
 
         pricelists = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD,
             'product.pricelist', 'search_read',
-            [[['name', 'in', TIER_NAMES]]],
+            [[['name', 'in', list({_TIER_TO_ODOO_PL.get(t, t.upper()) for t in TIER_NAMES})]]],
             {'fields': ['id', 'name']}
         )
         if not pricelists:
-            logging.warning('[prices] No pricelists found matching TIER_NAMES')
+            logging.warning('[prices] No pricelists found in Odoo for %s', list(_TIER_TO_ODOO_PL.values()))
             return result
+        # Expand: each Odoo pricelist may map to multiple TIER_NAMES
+        pl_tier_list = []
+        for pl in pricelists:
+            for t in TIER_NAMES:
+                if _TIER_TO_ODOO_PL.get(t, t.upper()) == pl['name']:
+                    pl_tier_list.append({'id': pl['id'], 'name': t})
+        pricelists = pl_tier_list
 
         all_prod_ids = list(prod_id_by_ref.values())
         all_tmpl_ids = list(set(tmpl_id_by_ref.values()))
@@ -511,7 +818,97 @@ def _get_odoo_prices_for_skus(refs: list) -> dict:
         return result
 
 
-def _get_product_from_sources(sku: str) -> dict or None:
+def _get_single_pricelist_prices(pricelist_id: int, refs: list) -> dict:
+    """
+    Retorna {sku: precio_sin_iva} para los refs usando la lista de precios indicada por ID.
+    Misma lógica de resolución de ítems que _get_odoo_prices_for_skus().
+    """
+    result = {r: 0.0 for r in refs}
+    if not refs or not pricelist_id:
+        return result
+    try:
+        from utils.odoo_utils import get_odoo_models, ODOO_DB, ODOO_PASSWORD
+        uid, models, err = get_odoo_models()
+        if not uid:
+            logging.warning('[prices] No Odoo connection for pricelist %s: %s', pricelist_id, err)
+            return result
+
+        prods = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD,
+            'product.product', 'search_read',
+            [[['default_code', 'in', refs]]],
+            {'fields': ['id', 'default_code', 'lst_price', 'product_tmpl_id']}
+        )
+        prod_id_by_ref    = {}
+        tmpl_id_by_ref    = {}
+        list_price_by_ref = {}
+        for p in prods:
+            ref = (p.get('default_code') or '').strip()
+            if ref in result:
+                prod_id_by_ref[ref]    = p['id']
+                list_price_by_ref[ref] = float(p.get('lst_price') or 0.0)
+                if p.get('product_tmpl_id'):
+                    tmpl_id_by_ref[ref] = p['product_tmpl_id'][0]
+
+        if not prod_id_by_ref:
+            return result
+
+        all_prod_ids = list(prod_id_by_ref.values())
+        all_tmpl_ids = list(set(tmpl_id_by_ref.values()))
+        PRIORITY = {'0_product_variant': 0, '1_product': 1,
+                    '2_product_category': 2, '3_global': 3}
+
+        items = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD,
+            'product.pricelist.item', 'search_read',
+            [[
+                ['pricelist_id', '=', pricelist_id],
+                '|', '|', '|',
+                ['product_id',       'in', all_prod_ids],
+                ['product_tmpl_id',  'in', all_tmpl_ids],
+                ['applied_on', '=', '2_product_category'],
+                ['applied_on', '=', '3_global'],
+            ]],
+            {'fields': ['applied_on', 'product_id', 'product_tmpl_id',
+                        'compute_price', 'fixed_price', 'percent_price',
+                        'price_discount', 'price_surcharge']}
+        )
+
+        for ref in refs:
+            prod_id    = prod_id_by_ref.get(ref)
+            tmpl_id    = tmpl_id_by_ref.get(ref)
+            list_price = list_price_by_ref.get(ref, 0.0)
+            if not prod_id:
+                continue
+            best_item, best_prio = None, 999
+            for item in items:
+                prio = PRIORITY.get(item.get('applied_on', '3_global'), 999)
+                if prio >= best_prio:
+                    continue
+                ao = item.get('applied_on')
+                if ao == '0_product_variant':
+                    if not item.get('product_id') or item['product_id'][0] != prod_id:
+                        continue
+                elif ao == '1_product':
+                    if not item.get('product_tmpl_id') or item['product_tmpl_id'][0] != tmpl_id:
+                        continue
+                best_item, best_prio = item, prio
+            if best_item:
+                compute = best_item.get('compute_price', 'fixed')
+                if compute == 'fixed':
+                    result[ref] = float(best_item.get('fixed_price') or 0.0)
+                elif compute == 'percentage':
+                    pct = float(best_item.get('percent_price') or 0.0)
+                    result[ref] = round(list_price * (1 - pct / 100), 2)
+                else:
+                    disc      = float(best_item.get('price_discount') or 0.0)
+                    surcharge = float(best_item.get('price_surcharge') or 0.0)
+                    result[ref] = round(list_price * (1 - disc / 100) + surcharge, 2)
+        return result
+    except Exception as e:
+        logging.exception('[prices] _get_single_pricelist_prices(%s) error: %s', pricelist_id, e)
+        return result
+
+
+def _get_product_from_sources(sku: str) -> dict | None:
     """
     Busca un producto por SKU en ambas fuentes (Excel primero, luego Odoo).
     Retorna dict con keys: sku, nombre, color, talla, origen
@@ -606,8 +1003,11 @@ def _sync_catalogo_odoo_task():
                 nombre   = (p.get('name') or '').upper().strip()
                 categ    = p.get('categ_id', [None, ''])
                 categoria = (categ[1] if categ and len(categ) > 1 else '').strip()
-                # First segment of the category path is the brand
-                marca = categoria.split(' / ')[0].strip() if categoria else ''
+                # Odoo paths: 'All / MEGAMO / ...' or '25161506 / MEGAMO / ...'
+                # Skip root "All" and numeric codes to get the real brand
+                _parts = [s.strip() for s in categoria.split(' / ')] if categoria else []
+                _meaningful = [s for s in _parts if s and not s.isdigit() and s.upper() != 'ALL']
+                marca = _meaningful[0] if _meaningful else (_parts[0] if _parts else '')
                 # Extract color and talla from Odoo variant attributes
                 color = ''
                 talla = ''
@@ -855,14 +1255,15 @@ def descargar_template():
     if id_cliente is None:
         return jsonify({'error': f'Cliente "{clave}" no encontrado'}), 404
 
-    # Fuente de productos: solo whitelist Odoo
-    products = _get_whitelist_products()
+    # Fuente de productos: solo Megamo del whitelist (la plantilla Scott se gestiona aparte)
+    products = [p for p in _get_whitelist_products()
+                if (p.get('marca') or '').upper() == 'MEGAMO']
 
-    # Precios de Odoo para todos los productos
+    # Precios de Odoo para los productos Megamo
     skus   = [p['sku'] for p in products]
     prices = _get_odoo_prices_for_skus(skus) if skus else {}
 
-    # Fusionar con SKU_CATALOG: si Odoo devuelve 0 para un nivel, usar precio del catálogo
+    # Fusionar con SKU_CATALOG como fallback (por si algún SKU no tiene precio en Odoo)
     for sku in skus:
         cat_entry  = SKU_CATALOG.get(sku, {})
         cat_prices = cat_entry.get('prices', {})
@@ -1525,6 +1926,259 @@ def descargar_template_global():
 
 
 
+@forecast_bp.route('/forecast/template-blank', methods=['GET'])
+def descargar_template_blank():
+    """
+    GET /forecast/template-blank
+    Plantilla de forecast vacía — solo encabezados y meses, sin productos precargados.
+    El distribuidor llena manualmente SKU, Producto, Marca, Modelo, Color, Talla y cantidades.
+    """
+    if not OPENPYXL_OK:
+        return jsonify({'error': 'openpyxl no instalado en el servidor'}), 500
+
+    from datetime import datetime
+    current_year = datetime.now().year
+    periodo = f"{current_year}-{current_year + 1}"
+
+    PRICE_PUB_COL   = 7
+    PRICE_DIST_COL  = 8
+    MONTH_START     = 9
+    TOTAL_COL       = 21
+    TOTAL_PRICE_COL = 22
+    VISIBLE_COLS    = TOTAL_PRICE_COL
+    NUM_BLANK_ROWS  = 25
+
+    ORANGE      = 'FFEB5E28'
+    DARK_BG     = 'FF252422'
+    HEADER_BG   = 'FF1A1918'
+    SELECTOR_BG = 'FF2C2A28'
+    PRICE_BG    = 'FF1B3A2B'
+
+    info_font       = Font(bold=True, color='FFFFFFFF', size=10)
+    price_hdr_font  = Font(bold=True, color='FF66FFB2', size=10)
+    month_hdr_font  = Font(bold=True, color='FFFFFFFF', size=10)
+    editable_font   = Font(color='FF111111', size=10)
+
+    center = Alignment(horizontal='center', vertical='center', wrap_text=True)
+    left   = Alignment(horizontal='left',   vertical='center', wrap_text=True)
+    right  = Alignment(horizontal='right',  vertical='center')
+    thin   = Side(style='thin', color='FF666666')
+    border = Border(left=thin, right=thin, top=thin, bottom=thin)
+
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = 'Forecast'
+
+    # Fila 1: Campo clave distribuidor
+    ws.row_dimensions[1].height = 28
+    ws.merge_cells('A1:C1')
+    lbl = ws['A1']
+    lbl.value     = 'CLAVE / NOMBRE DISTRIBUIDOR'
+    lbl.font      = Font(bold=True, color='FFFFFFFF', size=10)
+    lbl.fill      = PatternFill('solid', fgColor=SELECTOR_BG)
+    lbl.alignment = right
+
+    ws.merge_cells('D1:F1')
+    inp = ws['D1']
+    inp.value      = ''
+    inp.font       = Font(bold=True, color='FFEB5E28', size=11)
+    inp.fill       = PatternFill('solid', fgColor=SELECTOR_BG)
+    inp.alignment  = center
+    inp.protection = Protection(locked=False)
+
+    ws.merge_cells('G1:H1')
+    sel = ws['G1']
+    sel.value      = 'Distribuidor'
+    sel.font       = Font(bold=True, color='FFEB5E28', size=12)
+    sel.fill       = PatternFill('solid', fgColor=SELECTOR_BG)
+    sel.alignment  = center
+    sel.protection = Protection(locked=False)
+
+    dv = DataValidation(
+        type='list',
+        formula1='"Partner Elite Plus!,Partner Elite,Partner,Distribuidor"',
+        allow_blank=False,
+        showDropDown=False,
+    )
+    ws.add_data_validation(dv)
+    dv.add(ws['G1'])
+
+    for ci in range(MONTH_START, VISIBLE_COLS + 1):
+        ws.cell(row=1, column=ci).fill = PatternFill('solid', fgColor=SELECTOR_BG)
+
+    # Fila 2: Título
+    ws.row_dimensions[2].height = 28
+    ws.merge_cells(f'A2:{get_column_letter(VISIBLE_COLS)}2')
+    tc = ws['A2']
+    tc.value     = f'Plantilla de Forecast — Periodo Comercial {periodo}'
+    tc.font      = Font(bold=True, color='FFEB5E28', size=12)
+    tc.fill      = PatternFill('solid', fgColor=HEADER_BG)
+    tc.alignment = center
+
+    # Fila 3: Encabezados
+    ws.row_dimensions[3].height = 22
+    ALL_HEADERS = CAMPOS_INFO + ['Precio Público', 'Precio'] + MESES_LABELS + ['TOTAL', 'Total $']
+    for ci, h in enumerate(ALL_HEADERS, start=1):
+        cell = ws.cell(row=3, column=ci, value=h)
+        cell.alignment = center
+        cell.border    = border
+        if h in CAMPOS_INFO:
+            cell.fill = PatternFill('solid', fgColor=DARK_BG)
+            cell.font = info_font
+        elif h in ('Precio Público', 'Precio'):
+            cell.fill = PatternFill('solid', fgColor=PRICE_BG)
+            cell.font = price_hdr_font
+        elif h in ('TOTAL', 'Total $'):
+            cell.fill = PatternFill('solid', fgColor=ORANGE)
+            cell.font = Font(bold=True, color='FF000000', size=10)
+        else:
+            cell.fill = PatternFill('solid', fgColor=ORANGE)
+            cell.font = month_hdr_font
+
+    # Fila 4: Leyenda
+    ws.row_dimensions[4].height = 22
+    ws.merge_cells(f'A4:{get_column_letter(VISIBLE_COLS)}4')
+    note = ws['A4']
+    note.value     = f'Proyecciones de compra — Periodo Comercial {periodo}   |   Distribuidor: ______________________________   Nivel: ______________________________'
+    note.font      = Font(italic=True, color='FF444444', size=9)
+    note.fill      = PatternFill('solid', fgColor='FFFFF8F0')
+    note.alignment = Alignment(horizontal='left', vertical='center', wrap_text=False)
+
+    # Filas vacías editables (5 en adelante)
+    first_data_row = 5
+    last_data_row  = first_data_row + NUM_BLANK_ROWS - 1
+    h_col          = get_column_letter(PRICE_DIST_COL)
+    u_col          = get_column_letter(TOTAL_COL)
+    first_m        = get_column_letter(MONTH_START)
+    last_m         = get_column_letter(MONTH_START + len(MESES) - 1)
+
+    for row_idx in range(first_data_row, last_data_row + 1):
+        ws.row_dimensions[row_idx].height = 22
+        # Columnas info (A-F)
+        for ci in range(1, 7):
+            c = ws.cell(row=row_idx, column=ci)
+            c.font      = editable_font
+            c.fill      = PatternFill('solid', fgColor='FFFAFAFA')
+            c.alignment = left if ci == 2 else center
+            c.border    = border
+            c.protection = Protection(locked=False)
+
+        # Precio Público (G) — editable
+        g = ws.cell(row=row_idx, column=PRICE_PUB_COL)
+        g.font          = Font(color='FF333333', size=9)
+        g.fill          = PatternFill('solid', fgColor='FFE8F5E9')
+        g.alignment     = center
+        g.border        = border
+        g.number_format = '"$"#,##0.00'
+        g.protection    = Protection(locked=False)
+
+        # Precio distribuidor (H) — editable
+        h = ws.cell(row=row_idx, column=PRICE_DIST_COL)
+        h.font          = Font(color='FF333333', size=9)
+        h.fill          = PatternFill('solid', fgColor='FFF3E5F5')
+        h.alignment     = center
+        h.border        = border
+        h.number_format = '"$"#,##0.00'
+        h.protection    = Protection(locked=False)
+
+        # Meses (I-T) — editables con 0
+        for mi in range(len(MESES)):
+            c = ws.cell(row=row_idx, column=MONTH_START + mi)
+            c.value         = None
+            c.font          = editable_font
+            c.fill          = PatternFill('solid', fgColor='FFFEFEFE')
+            c.alignment     = center
+            c.border        = border
+            c.number_format = '0'
+            c.protection    = Protection(locked=False)
+
+        # TOTAL unidades (U)
+        tc2 = ws.cell(row=row_idx, column=TOTAL_COL)
+        tc2.value         = f'=SUM({first_m}{row_idx}:{last_m}{row_idx})'
+        tc2.font          = Font(bold=True, color='FF000000', size=10)
+        tc2.fill          = PatternFill('solid', fgColor='FFFFF0D0')
+        tc2.alignment     = center
+        tc2.border        = border
+        tc2.number_format = '0'
+
+        # Total $ (V)
+        tp = ws.cell(row=row_idx, column=TOTAL_PRICE_COL)
+        tp.value         = f'={h_col}{row_idx}*{u_col}{row_idx}'
+        tp.font          = Font(bold=True, color='FF000000', size=10)
+        tp.fill          = PatternFill('solid', fgColor='FFE8F0FF')
+        tp.alignment     = center
+        tp.border        = border
+        tp.number_format = '"$"#,##0.00'
+
+    # Fila de TOTALES
+    total_row = last_data_row + 1
+    ws.row_dimensions[total_row].height = 24
+    ws.merge_cells(f'A{total_row}:H{total_row}')
+    label = ws[f'A{total_row}']
+    label.value     = 'TOTALES'
+    label.font      = Font(bold=True, color='FFFFFFFF', size=11)
+    label.fill      = PatternFill('solid', fgColor=ORANGE)
+    label.alignment = center
+    label.border    = border
+
+    for mi in range(len(MESES)):
+        col_letter = get_column_letter(MONTH_START + mi)
+        c = ws.cell(row=total_row, column=MONTH_START + mi)
+        c.value         = f'=SUM({col_letter}{first_data_row}:{col_letter}{last_data_row})'
+        c.font          = Font(bold=True, color='FF000000', size=10)
+        c.fill          = PatternFill('solid', fgColor=ORANGE)
+        c.alignment     = center
+        c.border        = border
+        c.number_format = '0'
+
+    tu = ws.cell(row=total_row, column=TOTAL_COL)
+    tu.value         = f'=SUM({u_col}{first_data_row}:{u_col}{last_data_row})'
+    tu.font          = Font(bold=True, color='FFFFFFFF', size=11)
+    tu.fill          = PatternFill('solid', fgColor=ORANGE)
+    tu.alignment     = center
+    tu.border        = border
+    tu.number_format = '0'
+
+    v_col_letter = get_column_letter(TOTAL_PRICE_COL)
+    tp_total = ws.cell(row=total_row, column=TOTAL_PRICE_COL)
+    tp_total.value         = f'=SUM({v_col_letter}{first_data_row}:{v_col_letter}{last_data_row})'
+    tp_total.font          = Font(bold=True, color='FFFFFFFF', size=11)
+    tp_total.fill          = PatternFill('solid', fgColor=ORANGE)
+    tp_total.alignment     = center
+    tp_total.border        = border
+    tp_total.number_format = '"$"#,##0.00'
+
+    # Anchos de columna
+    col_widths = [18, 42, 16, 22, 14, 8, 14, 14] + [13] * 12 + [9, 18]
+    for ci, w in enumerate(col_widths, start=1):
+        ws.column_dimensions[get_column_letter(ci)].width = w
+
+    ws.freeze_panes = 'A5'
+
+    # Configuración de impresión — una sola hoja horizontal
+    last_col_letter = get_column_letter(VISIBLE_COLS)
+    ws.print_area   = f'A1:{last_col_letter}{total_row}'
+    ws.page_setup.orientation   = ws.ORIENTATION_LANDSCAPE
+    ws.page_setup.paperSize     = ws.PAPERSIZE_LETTER
+    ws.page_setup.fitToPage     = True
+    ws.page_setup.fitToWidth    = 1
+    ws.page_setup.fitToHeight   = 1
+    ws.print_options.horizontalCentered = True
+    ws.print_title_rows = '1:4'   # Repetir encabezados si llega a más de una hoja
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+
+    filename = f'Forecast_Plantilla_Vacia_{periodo}.xlsx'
+    return send_file(
+        buf,
+        as_attachment=True,
+        download_name=filename,
+        mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+    )
+
+
 @forecast_bp.route('/forecast/importar', methods=['POST'])
 def importar_forecast():
     """
@@ -1715,6 +2369,8 @@ def importar_forecast():
         cur.close()
         conn.close()
 
+    _forecast_cache.pop((clave, periodo), None)
+
     result = {'guardados': saved, 'clave_cliente': clave, 'periodo': periodo}
     if errors:
         result['advertencias'] = errors
@@ -1736,6 +2392,12 @@ def listar_forecast():
 
     _update_whitelist_skus()
 
+    # ── Caché rápida ──────────────────────────────────────────────────────────
+    _fc_key = (clave, periodo)
+    _fc_hit  = _forecast_cache.get(_fc_key)
+    if _fc_hit and (_time.time() - _fc_hit[0]) < _FORECAST_TTL:
+        return jsonify(_fc_hit[1]), 200
+
     # MySQL nivel → TIER_NAMES key
     NIVEL_TO_TIER = {
         'Partner Elite Plus!': 'Partner Elite Plus!',
@@ -1756,6 +2418,7 @@ def listar_forecast():
 
         cur.execute("""
             SELECT
+                f.id,
                 p.referencia_interna AS sku, p.nombre_producto AS producto, p.marca, p.categoria AS modelo, p.color, p.talla,
                 COALESCE(f.mayo, 0) AS mayo,
                 COALESCE(f.junio, 0) AS junio,
@@ -1774,32 +2437,80 @@ def listar_forecast():
                  COALESCE(f.noviembre, 0) + COALESCE(f.diciembre, 0) + COALESCE(f.enero, 0) +
                  COALESCE(f.febrero, 0) + COALESCE(f.marzo, 0) + COALESCE(f.abril, 0)) AS total,
                 f.actualizado_en
-            FROM odoo_catalogo p
-            LEFT JOIN forecast_proyecciones f ON f.sku = p.referencia_interna AND f.clave_cliente = %s AND f.periodo = %s
-            WHERE p.referencia_interna IN (SELECT sku FROM forecast_sku_whitelist)
+            FROM forecast_proyecciones f
+            INNER JOIN odoo_catalogo p ON p.referencia_interna = f.sku
+            WHERE f.clave_cliente = %s AND f.periodo = %s
             ORDER BY p.marca, p.categoria, p.referencia_interna
         """, (clave, periodo))
         rows = cur.fetchall()
 
-        # Precios por SKU: Odoo con fallback a SKU_CATALOG
         all_skus = [r['sku'] for r in rows if r.get('sku')]
-        prices = _get_odoo_prices_for_skus(all_skus) if all_skus else {}
-        for sku in all_skus:
-            cat_entry  = SKU_CATALOG.get(sku, {})
-            cat_prices = cat_entry.get('prices', {})
-            odoo_entry = prices.get(sku, {})
-            for key in ['list_price'] + TIER_NAMES:
-                if not odoo_entry.get(key):
-                    odoo_entry[key] = cat_prices.get(key, 0.0)
-            prices[sku] = odoo_entry
 
-        for r in rows:
-            p = prices.get(r.get('sku') or '', {})
-            r['precio']       = round(p.get(tier, p.get('Distribuidor', 0.0)) * IVA_FACTOR, 2)
-            r['nivel_precio'] = tier
-            if r.get('actualizado_en'):
-                r['actualizado_en'] = r['actualizado_en'].isoformat()
+        # ── Resolver lista de precios del distribuidor en Odoo ───────────────────
+        # Prioridad: (1) lista asignada individualmente en res.partner,
+        #            (2) lista genérica del tier (para distribuidores sin registro en Odoo)
+        partner_pricelist_id   = None
+        partner_pricelist_name = ''
+        try:
+            from utils.odoo_utils import get_odoo_models, ODOO_DB, ODOO_PASSWORD, ODOO_COMPANY_ID
+            uid_pl, models_pl, _ = get_odoo_models()
+            if uid_pl:
+                # 1) Lista asignada individualmente al socio
+                partners_pl = models_pl.execute_kw(
+                    ODOO_DB, uid_pl, ODOO_PASSWORD,
+                    'res.partner', 'search_read',
+                    [[('ref', '=', clave), ('company_id', '=', ODOO_COMPANY_ID)]],
+                    {'fields': ['property_product_pricelist'], 'limit': 1}
+                )
+                if partners_pl:
+                    pl = partners_pl[0].get('property_product_pricelist')
+                    if pl and isinstance(pl, (list, tuple)) and len(pl) >= 2:
+                        partner_pricelist_id   = pl[0]
+                        partner_pricelist_name = str(pl[1])
 
+                # 2) Si no tiene lista individual, usar la lista genérica del tier
+                if not partner_pricelist_id:
+                    odoo_pl_name = _TIER_TO_ODOO_PL.get(tier, tier.upper())
+                    pl_fallback = models_pl.execute_kw(
+                        ODOO_DB, uid_pl, ODOO_PASSWORD,
+                        'product.pricelist', 'search_read',
+                        [[['name', '=', odoo_pl_name]]],
+                        {'fields': ['id', 'name'], 'order': 'id desc', 'limit': 1}
+                    )
+                    if pl_fallback:
+                        partner_pricelist_id   = pl_fallback[0]['id']
+                        partner_pricelist_name = pl_fallback[0]['name']
+                        logging.info('[forecast] %s no en Odoo; usando lista generica "%s" (id=%s)',
+                                     clave, partner_pricelist_name, partner_pricelist_id)
+        except Exception as _e:
+            logging.warning('[forecast] No se pudo obtener lista de precios de Odoo para %s: %s', clave, _e)
+
+        if partner_pricelist_id and all_skus:
+            # Precios desde la lista de precios del distribuidor en Odoo
+            raw_prices = _get_single_pricelist_prices(partner_pricelist_id, all_skus)
+            for r in rows:
+                sku = r.get('sku') or ''
+                raw = raw_prices.get(sku, 0.0)
+                if not raw:
+                    # Fallback a SKU_CATALOG (Scott MY27)
+                    cat_p = SKU_CATALOG.get(sku, {}).get('prices', {})
+                    raw = cat_p.get(tier, cat_p.get('Distribuidor', 0.0))
+                r['precio']       = round(raw * IVA_FACTOR, 2)
+                r['nivel_precio'] = partner_pricelist_name or tier
+                if r.get('actualizado_en'):
+                    r['actualizado_en'] = r['actualizado_en'].isoformat()
+        else:
+            # Sin conexión Odoo: usar SKU_CATALOG con el tier del distribuidor
+            for r in rows:
+                sku = r.get('sku') or ''
+                cat_p = SKU_CATALOG.get(sku, {}).get('prices', {})
+                raw   = cat_p.get(tier, cat_p.get('Distribuidor', 0.0))
+                r['precio']       = round(raw * IVA_FACTOR, 2)
+                r['nivel_precio'] = tier
+                if r.get('actualizado_en'):
+                    r['actualizado_en'] = r['actualizado_en'].isoformat()
+
+        _forecast_cache[_fc_key] = (_time.time(), rows)
         return jsonify(rows), 200
     except Exception as e:
         logging.exception('[forecast] listar_forecast error: %s', e)
@@ -2078,6 +2789,276 @@ def avance_forecast():
         conn.close()
 
 
+@forecast_bp.route('/forecast/periodos/integral', methods=['GET'])
+def listar_periodos_integral():
+    """
+    GET /forecast/periodos/integral?grupo_id=<id>
+    Periodos con datos guardados para cualquier cliente del grupo.
+    """
+    grupo_id = request.args.get('grupo_id', '').strip()
+    if not grupo_id:
+        return jsonify({'error': 'Falta parámetro grupo_id'}), 400
+
+    conn = obtener_conexion()
+    cur = conn.cursor(dictionary=True)
+    try:
+        cur.execute("""
+            SELECT DISTINCT fp.periodo
+            FROM forecast_proyecciones fp
+            INNER JOIN clientes c ON c.clave = fp.clave_cliente
+            WHERE c.id_grupo = %s
+            ORDER BY fp.periodo DESC
+        """, (grupo_id,))
+        periodos = [r['periodo'] for r in cur.fetchall()]
+        return jsonify(periodos), 200
+    except Exception as e:
+        logging.exception('[forecast/periodos/integral] error: %s', e)
+        return jsonify({'error': str(e)}), 500
+    finally:
+        cur.close()
+        conn.close()
+
+
+@forecast_bp.route('/forecast/integral', methods=['GET'])
+def listar_forecast_integral():
+    """
+    GET /forecast/integral?grupo_id=<id>&periodo=<periodo>
+    Proyecciones agregadas (suma) de todos los clientes del grupo, por SKU.
+    """
+    grupo_id = request.args.get('grupo_id', '').strip()
+    periodo  = request.args.get('periodo', '').strip()
+    if not grupo_id or not periodo:
+        return jsonify({'error': 'Faltan parámetros: grupo_id, periodo'}), 400
+
+    _update_whitelist_skus()
+
+    conn = obtener_conexion()
+    cur = conn.cursor(dictionary=True)
+    try:
+        cur.execute("SELECT clave FROM clientes WHERE id_grupo = %s", (grupo_id,))
+        claves = [r['clave'] for r in cur.fetchall()]
+        if not claves:
+            return jsonify([]), 200
+
+        ph = ','.join(['%s'] * len(claves))
+        cur.execute(f"""
+            SELECT
+                p.referencia_interna AS sku,
+                p.nombre_producto    AS producto,
+                p.marca,
+                p.categoria          AS modelo,
+                p.color,
+                p.talla,
+                COALESCE(SUM(f.mayo),       0) AS mayo,
+                COALESCE(SUM(f.junio),      0) AS junio,
+                COALESCE(SUM(f.julio),      0) AS julio,
+                COALESCE(SUM(f.agosto),     0) AS agosto,
+                COALESCE(SUM(f.septiembre), 0) AS septiembre,
+                COALESCE(SUM(f.octubre),    0) AS octubre,
+                COALESCE(SUM(f.noviembre),  0) AS noviembre,
+                COALESCE(SUM(f.diciembre),  0) AS diciembre,
+                COALESCE(SUM(f.enero),      0) AS enero,
+                COALESCE(SUM(f.febrero),    0) AS febrero,
+                COALESCE(SUM(f.marzo),      0) AS marzo,
+                COALESCE(SUM(f.abril),      0) AS abril,
+                (COALESCE(SUM(f.mayo),0)+COALESCE(SUM(f.junio),0)+COALESCE(SUM(f.julio),0)+
+                 COALESCE(SUM(f.agosto),0)+COALESCE(SUM(f.septiembre),0)+COALESCE(SUM(f.octubre),0)+
+                 COALESCE(SUM(f.noviembre),0)+COALESCE(SUM(f.diciembre),0)+COALESCE(SUM(f.enero),0)+
+                 COALESCE(SUM(f.febrero),0)+COALESCE(SUM(f.marzo),0)+COALESCE(SUM(f.abril),0)) AS total
+            FROM odoo_catalogo p
+            LEFT JOIN forecast_proyecciones f
+                ON  f.sku = p.referencia_interna
+                AND f.clave_cliente IN ({ph})
+                AND f.periodo = %s
+            WHERE p.referencia_interna IN (SELECT sku FROM forecast_sku_whitelist)
+            GROUP BY p.referencia_interna, p.nombre_producto, p.marca, p.categoria, p.color, p.talla
+            ORDER BY p.marca, p.categoria, p.referencia_interna
+        """, (*claves, periodo))
+        rows = cur.fetchall()
+
+        all_skus = [r['sku'] for r in rows if r.get('sku')]
+        prices = _get_odoo_prices_for_skus(all_skus) if all_skus else {}
+        for sku in all_skus:
+            cat_entry  = SKU_CATALOG.get(sku, {})
+            odoo_entry = prices.get(sku, {})
+            for key in ['list_price'] + TIER_NAMES:
+                if not odoo_entry.get(key):
+                    odoo_entry[key] = cat_entry.get('prices', {}).get(key, 0.0)
+            prices[sku] = odoo_entry
+
+        for r in rows:
+            p = prices.get(r.get('sku') or '', {})
+            r['precio']       = round(p.get('Distribuidor', 0.0) * IVA_FACTOR, 2)
+            r['nivel_precio'] = 'Grupo'
+
+        return jsonify(rows), 200
+    except Exception as e:
+        logging.exception('[forecast/integral] error: %s', e)
+        return jsonify({'error': str(e)}), 500
+    finally:
+        cur.close()
+        conn.close()
+
+
+@forecast_bp.route('/forecast/avance/integral', methods=['GET'])
+def avance_forecast_integral():
+    """
+    GET /forecast/avance/integral?grupo_id=<id>&periodo=<periodo>
+    Avance (forecast vs pedidos Odoo) agregado para todos los clientes del grupo.
+    """
+    grupo_id = request.args.get('grupo_id', '').strip()
+    periodo  = request.args.get('periodo', '').strip()
+    if not grupo_id or not periodo:
+        return jsonify({'error': 'Faltan parámetros: grupo_id, periodo'}), 400
+    if not _validate_periodo(periodo):
+        return jsonify({'error': 'Formato de periodo inválido'}), 400
+
+    m = re.match(r'^(\d{4})-(\d{4})$', periodo)
+    year1, year2 = int(m.group(1)), int(m.group(2))
+    fecha_inicio = f'{year1 - 1}-07-01'
+    fecha_fin    = f'{year2}-04-30'
+
+    def _norm(s: str) -> str:
+        return re.sub(r'[\-\s]', '', str(s or '')).upper()
+
+    conn = obtener_conexion()
+    cur = conn.cursor(dictionary=True)
+    try:
+        cur.execute("SELECT clave FROM clientes WHERE id_grupo = %s", (grupo_id,))
+        claves = [r['clave'] for r in cur.fetchall()]
+        if not claves:
+            return jsonify([]), 200
+
+        ph = ','.join(['%s'] * len(claves))
+        cur.execute(f"""
+            SELECT id, sku, producto, marca, modelo, color, talla,
+                   (mayo+junio+julio+agosto+septiembre+octubre+
+                    noviembre+diciembre+enero+febrero+marzo+abril) AS forecast_total
+            FROM forecast_proyecciones
+            WHERE clave_cliente IN ({ph}) AND periodo = %s
+            ORDER BY marca, modelo, sku
+        """, (*claves, periodo))
+        rows_raw = cur.fetchall()
+
+        if not rows_raw:
+            return jsonify([]), 200
+
+        # Agregamos el forecast total por SKU (un cliente puede tener el mismo SKU que otro)
+        agg: dict = {}
+        for fr in rows_raw:
+            sku = fr['sku']
+            if sku not in agg:
+                agg[sku] = {**fr, 'forecast_total': 0}
+            agg[sku]['forecast_total'] += int(fr['forecast_total'] or 0)
+        forecast_rows = list(agg.values())
+
+        norm_to_sku: dict = {}
+        for fr in forecast_rows:
+            n = _norm(fr['sku'])
+            if n:
+                norm_to_sku[n] = fr['sku']
+
+        # Consulta Odoo para TODOS los partners del grupo en una sola pasada
+        orders_by_sku: dict = {}
+        _cache_key = ('integral', grupo_id, periodo)
+        _cached = _avance_cache.get(_cache_key)
+        if _cached and (_time.time() - _cached[0]) < _AVANCE_TTL:
+            orders_by_sku = _cached[1]
+        else:
+            try:
+                from utils.odoo_utils import get_odoo_models, ODOO_DB, ODOO_PASSWORD
+                uid_oo, models_oo, err_oo = get_odoo_models()
+                if uid_oo and models_oo:
+                    # Buscar todos los partners del grupo por su ref
+                    partner_ids = []
+                    for clave in claves:
+                        pids = models_oo.execute_kw(
+                            ODOO_DB, uid_oo, ODOO_PASSWORD,
+                            'res.partner', 'search',
+                            [[['ref', '=', clave]]]
+                        )
+                        partner_ids.extend(pids)
+
+                    if partner_ids:
+                        order_ids = models_oo.execute_kw(
+                            ODOO_DB, uid_oo, ODOO_PASSWORD,
+                            'sale.order', 'search',
+                            [[['partner_id', 'in', partner_ids],
+                              ['state', 'in', ['sale', 'done']],
+                              ['date_order', '>=', fecha_inicio],
+                              ['date_order', '<=', fecha_fin + ' 23:59:59']]]
+                        )
+                        if order_ids:
+                            sol = models_oo.execute_kw(
+                                ODOO_DB, uid_oo, ODOO_PASSWORD,
+                                'sale.order.line', 'search_read',
+                                [[['order_id', 'in', order_ids],
+                                  ['state', 'not in', ['cancel']]]],
+                                {'fields': ['product_id', 'product_uom_qty'], 'limit': 0}
+                            )
+                            prod_ids = list({l['product_id'][0] for l in sol if l.get('product_id')})
+                            prods = models_oo.execute_kw(
+                                ODOO_DB, uid_oo, ODOO_PASSWORD,
+                                'product.product', 'search_read',
+                                [[['id', 'in', prod_ids]]],
+                                {'fields': ['id', 'default_code'], 'limit': 0}
+                            )
+                            prod_code_map = {
+                                p['id']: (p.get('default_code') or '').strip() or f'ODOO:{p["id"]}'
+                                for p in prods
+                            }
+                            for l in sol:
+                                pid     = l['product_id'][0] if l.get('product_id') else None
+                                dc      = prod_code_map.get(pid, '')
+                                matched = norm_to_sku.get(_norm(dc))
+                                if matched is None:
+                                    continue
+                                qty = int(l.get('product_uom_qty') or 0)
+                                if matched not in orders_by_sku:
+                                    orders_by_sku[matched] = {'pedido_total': 0, 'estados': {}}
+                                orders_by_sku[matched]['pedido_total'] += qty
+                                orders_by_sku[matched]['estados']['Orden Confirmada'] = (
+                                    orders_by_sku[matched]['estados'].get('Orden Confirmada', 0) + qty
+                                )
+                else:
+                    logging.warning('avance_forecast_integral: no se pudo conectar a Odoo – %s', err_oo)
+                _avance_cache[_cache_key] = (_time.time(), orders_by_sku)
+            except Exception as _ex:
+                logging.exception('avance_forecast_integral: error Odoo: %s', _ex)
+
+        result = []
+        for fr in forecast_rows:
+            sku            = fr['sku']
+            ord_data       = orders_by_sku.get(sku, {'pedido_total': 0, 'estados': {}})
+            forecast_total = int(fr['forecast_total'] or 0)
+            pedido_total   = ord_data['pedido_total']
+            restante       = max(0, forecast_total - pedido_total)
+            pct            = (round(pedido_total / forecast_total * 1000) / 10
+                               if forecast_total > 0 else 0)
+            result.append({
+                'id':             fr['id'],
+                'sku':            sku,
+                'producto':       fr['producto'],
+                'marca':          fr['marca'],
+                'modelo':         fr['modelo'],
+                'color':          fr['color'],
+                'talla':          fr['talla'],
+                'forecast_total': forecast_total,
+                'pedido_total':   pedido_total,
+                'restante':       restante,
+                'pct_cubierto':   pct,
+                'estados':        ord_data['estados'],
+            })
+
+        return jsonify(result), 200
+    except Exception as e:
+        logging.exception('[forecast/avance/integral] error: %s', e)
+        return jsonify({'error': str(e)}), 500
+    finally:
+        cur.close()
+        conn.close()
+
+
 @forecast_bp.route('/forecast/sync-catalogo', methods=['POST'])
 def sync_catalogo():
     """
@@ -2158,7 +3139,8 @@ def actualizar_forecast(fid):
         conn.close()
 
 
-_SEARCH_PAGE = 50
+_SEARCH_PAGE       = 50    # fallback general
+_SEARCH_PAGE_WL    = 200   # whitelist: caben todos los SKUs Megamo+Scott (≤200)
 
 # Alias map for Spanish plural/variant forms that don't match DB names
 _SEARCH_ALIAS = {
@@ -2304,31 +3286,38 @@ def buscar_producto():
         use_whitelist = cur.fetchone()['cnt'] > 0
 
         if use_whitelist:
+            # Subquery GROUP BY elimina duplicados en odoo_catalogo para el mismo (sku, color, talla)
             cur.execute("""
-                SELECT
-                    oc.referencia_interna AS sku,
-                    oc.nombre_producto    AS nombre_src,
-                    oc.categoria          AS categoria,
-                    oc.marca              AS marca,
-                    oc.color              AS odoo_color,
-                    oc.talla              AS odoo_talla
-                FROM odoo_catalogo oc
-                INNER JOIN forecast_sku_whitelist wl ON wl.sku = oc.referencia_interna
+                SELECT sku, nombre_src, categoria, marca, odoo_color, odoo_talla
+                FROM (
+                    SELECT
+                        oc.referencia_interna                                    AS sku,
+                        MIN(oc.nombre_producto)                                  AS nombre_src,
+                        MIN(oc.categoria)                                        AS categoria,
+                        MIN(oc.marca)                                            AS marca,
+                        COALESCE(NULLIF(TRIM(oc.color), ''), 'N/A')             AS odoo_color,
+                        COALESCE(NULLIF(TRIM(oc.talla), ''), 'N/A')             AS odoo_talla
+                    FROM odoo_catalogo oc
+                    INNER JOIN forecast_sku_whitelist wl ON wl.sku = oc.referencia_interna
+                    GROUP BY oc.referencia_interna,
+                             COALESCE(NULLIF(TRIM(oc.color), ''), 'N/A'),
+                             COALESCE(NULLIF(TRIM(oc.talla), ''), 'N/A')
+                ) AS deduped
                 WHERE (
-                    oc.nombre_producto    LIKE %s
-                    OR oc.referencia_interna LIKE %s
-                    OR oc.marca           LIKE %s
-                    OR oc.color           LIKE %s
-                    OR oc.talla           LIKE %s
+                    nombre_src LIKE %s
+                    OR sku     LIKE %s
+                    OR marca   LIKE %s
+                    OR odoo_color LIKE %s
+                    OR odoo_talla LIKE %s
                 )
                 ORDER BY
-                    CASE WHEN oc.referencia_interna = %s THEN 0 ELSE 1 END,
-                    oc.nombre_producto
+                    CASE WHEN sku = %s THEN 0 ELSE 1 END,
+                    nombre_src
                 LIMIT %s OFFSET %s
-            """, (like, like, like, like, like, q_search, _SEARCH_PAGE + 1, offset))
+            """, (like, like, like, like, like, q_search, _SEARCH_PAGE_WL + 1, offset))
             rows     = cur.fetchall()
-            has_more = len(rows) > _SEARCH_PAGE
-            rows     = rows[:_SEARCH_PAGE]
+            has_more = len(rows) > _SEARCH_PAGE_WL
+            rows     = rows[:_SEARCH_PAGE_WL]
 
             results = []
             for r in rows:
@@ -2336,7 +3325,8 @@ def buscar_producto():
                 modelo = cat.split(' / ')[-1].strip().upper() if ' / ' in cat else ''
                 color  = (r.get('odoo_color') or '').strip().upper() or 'N/A'
                 talla  = (r.get('odoo_talla') or '').strip().upper() or 'N/A'
-                nombre = (r.get('nombre_src') or '').strip().upper()
+                # Normalizar whitespace interno para evitar duplicados por espacios extra
+                nombre = ' '.join((r.get('nombre_src') or '').split()).upper()
                 results.append({
                     'sku':      r['sku'] or '',
                     'producto': nombre,
@@ -2518,12 +3508,16 @@ def buscar_producto():
 def eliminar_forecast(fid):
     """DELETE /forecast/<id>"""
     conn = obtener_conexion()
-    cur = conn.cursor()
+    cur = conn.cursor(dictionary=True)
     try:
+        cur.execute("SELECT clave_cliente, periodo FROM forecast_proyecciones WHERE id = %s", (fid,))
+        reg = cur.fetchone()
         cur.execute("DELETE FROM forecast_proyecciones WHERE id = %s", (fid,))
         conn.commit()
         if cur.rowcount == 0:
             return jsonify({'error': 'Registro no encontrado'}), 404
+        if reg:
+            _forecast_cache.pop((reg['clave_cliente'], reg['periodo']), None)
         return jsonify({'ok': True}), 200
     except Exception as e:
         conn.rollback()
@@ -2656,6 +3650,9 @@ def guardar_forecast():
         cur.close()
         conn.close()
 
+    # Invalidar caché para que la próxima carga refleje los cambios
+    _forecast_cache.pop((clave, periodo), None)
+
     result = {'guardados': saved}
     if errors:
         result['advertencias'] = errors
@@ -2669,7 +3666,16 @@ def guardar_forecast():
 @forecast_bp.route('/forecast/sku-whitelist', methods=['GET'])
 def listar_sku_whitelist():
     """GET /forecast/sku-whitelist — lista SKUs y productos del catálogo de proyecciones."""
-    skus     = _get_whitelist_skus()
+    conn = _safe_obtener_conexion()
+    skus = []
+    if conn:
+        cur = conn.cursor(dictionary=True)
+        try:
+            cur.execute("SELECT sku FROM forecast_sku_whitelist ORDER BY sku")
+            skus = [r['sku'] for r in cur.fetchall()]
+        finally:
+            cur.close()
+            conn.close()
     products = _get_whitelist_products() if skus else []
     return jsonify({'total': len(skus), 'skus': skus, 'productos': products}), 200
 

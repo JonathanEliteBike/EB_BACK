@@ -997,6 +997,7 @@ def _recalcular_acumulados_previo(conexion, cursor):
           AND m.contacto_referencia != ''
           AND m.fecha_factura >= COALESCE(c.f_inicio, %s)
           AND m.fecha_factura <= %s
+          AND (c.temporada_cerrada IS NULL OR c.temporada_cerrada = 0)
         GROUP BY m.contacto_referencia
     """, (DEFAULT_INICIO, FECHA_CORTE))
     totales = {row['clave']: row for row in cursor.fetchall()}

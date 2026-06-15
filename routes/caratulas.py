@@ -782,7 +782,8 @@ def detalle_compras_odoo():
     grupo_odoo = request.args.get('grupo')
     # Cuando ref_exacta=1 la búsqueda es solo por ref exact en res.partner
     # (usado en "Mis Pedidos" de usuarios integrales para evitar matches parciales)
-    ref_exacta = request.args.get('ref_exacta') in ('1', 'true', 'True')
+    ref_exacta    = request.args.get('ref_exacta') in ('1', 'true', 'True')
+    force_refresh = request.args.get('force_refresh') in ('1', 'true', 'True')
     try:
         _limit_raw = request.args.get('limit')
         limit = int(_limit_raw) if _limit_raw is not None else None
@@ -802,7 +803,13 @@ def detalle_compras_odoo():
     # La clave NO incluye limit/offset/estado: esos parámetros se aplican
     # en caliente sobre los datos cacheados, evitando entradas duplicadas por página.
     _cache_key = f"monitor_pedidos:{cliente or ''}:{int(bool(ref_exacta))}:{grupo_odoo or ''}"
-    if _redis:
+    if _redis and force_refresh:
+        try:
+            _redis.delete(_cache_key)
+            logging.info('Cache invalidado por force_refresh: %s', _cache_key)
+        except Exception as _de:
+            logging.warning('Redis delete error: %s', _de)
+    if _redis and not force_refresh:
         try:
             _raw = _redis.get(_cache_key)
             if _raw:
@@ -1005,10 +1012,9 @@ def detalle_compras_odoo():
         if not partners:
             return jsonify({'data': [], 'rows': [], 'meta': {'total': 0}}), 200
 
-        # Siempre expandimos child_ids: los contactos hijo de un partner son
-        # sub-cuentas del mismo cliente (portales B2B, tiendas, etc.) y sus órdenes
-        # pertenecen al mismo distribuidor.  El filtro de COMPANY_ID y la búsqueda
-        # por ref garantizan que no mezclamos datos de otros clientes.
+        # Expandimos child_ids: los contactos hijo de un partner son sub-cuentas
+        # del mismo cliente (portales B2B, direcciones de entrega, personas de
+        # contacto) y sus órdenes pertenecen al mismo distribuidor.
         all_partner_ids = set()
         for p in partners:
             all_partner_ids.add(p['id'])

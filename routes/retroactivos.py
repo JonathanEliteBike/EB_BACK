@@ -11,6 +11,8 @@ import openpyxl
 
 retroactivos_bp = Blueprint('retroactivos', __name__, url_prefix='')
 
+from utils.jwt_utils import verificar_token
+
 
 # ==============================================================================
 # CONFIGURACIÓN GENERAL
@@ -2407,6 +2409,149 @@ def obtener_deducciones_odoo(claves_db, fechas_por_clave):
 # ==============================================================================
 # 2. FUNCIÓN DE SINCRONIZACIÓN AUTOMÁTICA
 # ==============================================================================
+
+def _recalcular_previo_clave_cierre(conexion, cursor_dict, cursor, clave, f_inicio, fecha_cierre):
+    """
+    Recalcula las columnas de avance en previo para un distribuidor individual,
+    usando fecha_cierre como tope de fecha. Se llama al cerrar la temporada
+    para asegurar que el previo no incluya compras posteriores al cierre.
+    """
+    SCOTT_COND = """(
+        (
+            UPPER(TRIM(m.marca)) IN ('SCOTT', 'MEGAMO')
+            AND (UPPER(TRIM(m.subcategoria)) = 'BICICLETA' OR UPPER(m.nombre_producto) LIKE '%%BICICLETA%%')
+            AND (UPPER(TRIM(m.apparel)) = 'NO' OR UPPER(m.nombre_producto) LIKE '%%BICICLETA%%')
+        )
+        OR (UPPER(TRIM(m.marca)) = 'BOLD' AND UPPER(TRIM(m.subcategoria)) = 'BICICLETA')
+    )"""
+
+    APP_COND = "(m.apparel = 'SI' OR (m.marca = 'BOLD' AND UPPER(TRIM(COALESCE(m.subcategoria,''))) != 'BICICLETA'))"
+
+    cursor_dict.execute(f"""
+        SELECT
+            COALESCE(SUM(m.venta_total), 0) AS total_bruto,
+            COALESCE(SUM(CASE WHEN m.marca = 'SYNCROS' THEN m.venta_total ELSE 0 END), 0) AS syncros,
+            COALESCE(SUM(CASE WHEN {APP_COND} THEN m.venta_total ELSE 0 END), 0) AS apparel,
+            COALESCE(SUM(CASE WHEN m.marca = 'VITTORIA' THEN m.venta_total ELSE 0 END), 0) AS vittoria,
+            COALESCE(SUM(CASE WHEN UPPER(TRIM(m.marca)) = 'BOLD' AND UPPER(TRIM(m.subcategoria)) = 'BICICLETA' THEN m.venta_total ELSE 0 END), 0) AS bold,
+            COALESCE(SUM(CASE WHEN {SCOTT_COND} THEN m.venta_total ELSE 0 END), 0) AS scott,
+            COALESCE(SUM(CASE WHEN m.fecha_factura <= '2025-08-31' AND {SCOTT_COND} THEN m.venta_total ELSE 0 END), 0) AS scott_jul_ago,
+            COALESCE(SUM(CASE WHEN m.fecha_factura BETWEEN '2025-09-01' AND '2025-10-31' AND {SCOTT_COND} THEN m.venta_total ELSE 0 END), 0) AS scott_sep_oct,
+            COALESCE(SUM(CASE WHEN m.fecha_factura BETWEEN '2025-11-01' AND '2025-12-31' AND {SCOTT_COND} THEN m.venta_total ELSE 0 END), 0) AS scott_nov_dic,
+            COALESCE(SUM(CASE WHEN m.fecha_factura BETWEEN '2026-01-01' AND '2026-02-28' AND {SCOTT_COND} THEN m.venta_total ELSE 0 END), 0) AS scott_ene_feb,
+            COALESCE(SUM(CASE WHEN m.fecha_factura BETWEEN '2026-03-01' AND '2026-04-30' AND {SCOTT_COND} THEN m.venta_total ELSE 0 END), 0) AS scott_mar_abr,
+            COALESCE(SUM(CASE WHEN m.fecha_factura BETWEEN '2026-05-01' AND '2026-06-30' AND {SCOTT_COND} THEN m.venta_total ELSE 0 END), 0) AS scott_may_jun,
+            COALESCE(SUM(CASE WHEN m.fecha_factura <= '2025-08-31' AND m.marca = 'SYNCROS' THEN m.venta_total ELSE 0 END), 0) AS syncros_jul_ago,
+            COALESCE(SUM(CASE WHEN m.fecha_factura BETWEEN '2025-09-01' AND '2025-10-31' AND m.marca = 'SYNCROS' THEN m.venta_total ELSE 0 END), 0) AS syncros_sep_oct,
+            COALESCE(SUM(CASE WHEN m.fecha_factura BETWEEN '2025-11-01' AND '2025-12-31' AND m.marca = 'SYNCROS' THEN m.venta_total ELSE 0 END), 0) AS syncros_nov_dic,
+            COALESCE(SUM(CASE WHEN m.fecha_factura BETWEEN '2026-01-01' AND '2026-02-28' AND m.marca = 'SYNCROS' THEN m.venta_total ELSE 0 END), 0) AS syncros_ene_feb,
+            COALESCE(SUM(CASE WHEN m.fecha_factura BETWEEN '2026-03-01' AND '2026-04-30' AND m.marca = 'SYNCROS' THEN m.venta_total ELSE 0 END), 0) AS syncros_mar_abr,
+            COALESCE(SUM(CASE WHEN m.fecha_factura BETWEEN '2026-05-01' AND '2026-06-30' AND m.marca = 'SYNCROS' THEN m.venta_total ELSE 0 END), 0) AS syncros_may_jun,
+            COALESCE(SUM(CASE WHEN m.fecha_factura <= '2025-08-31' AND {APP_COND} THEN m.venta_total ELSE 0 END), 0) AS apparel_jul_ago,
+            COALESCE(SUM(CASE WHEN m.fecha_factura BETWEEN '2025-09-01' AND '2025-10-31' AND {APP_COND} THEN m.venta_total ELSE 0 END), 0) AS apparel_sep_oct,
+            COALESCE(SUM(CASE WHEN m.fecha_factura BETWEEN '2025-11-01' AND '2025-12-31' AND {APP_COND} THEN m.venta_total ELSE 0 END), 0) AS apparel_nov_dic,
+            COALESCE(SUM(CASE WHEN m.fecha_factura BETWEEN '2026-01-01' AND '2026-02-28' AND {APP_COND} THEN m.venta_total ELSE 0 END), 0) AS apparel_ene_feb,
+            COALESCE(SUM(CASE WHEN m.fecha_factura BETWEEN '2026-03-01' AND '2026-04-30' AND {APP_COND} THEN m.venta_total ELSE 0 END), 0) AS apparel_mar_abr,
+            COALESCE(SUM(CASE WHEN m.fecha_factura BETWEEN '2026-05-01' AND '2026-06-30' AND {APP_COND} THEN m.venta_total ELSE 0 END), 0) AS apparel_may_jun,
+            COALESCE(SUM(CASE WHEN m.fecha_factura <= '2025-08-31' AND m.marca = 'VITTORIA' THEN m.venta_total ELSE 0 END), 0) AS vittoria_jul_ago,
+            COALESCE(SUM(CASE WHEN m.fecha_factura BETWEEN '2025-09-01' AND '2025-10-31' AND m.marca = 'VITTORIA' THEN m.venta_total ELSE 0 END), 0) AS vittoria_sep_oct,
+            COALESCE(SUM(CASE WHEN m.fecha_factura BETWEEN '2025-11-01' AND '2025-12-31' AND m.marca = 'VITTORIA' THEN m.venta_total ELSE 0 END), 0) AS vittoria_nov_dic,
+            COALESCE(SUM(CASE WHEN m.fecha_factura BETWEEN '2026-01-01' AND '2026-02-28' AND m.marca = 'VITTORIA' THEN m.venta_total ELSE 0 END), 0) AS vittoria_ene_feb,
+            COALESCE(SUM(CASE WHEN m.fecha_factura BETWEEN '2026-03-01' AND '2026-04-30' AND m.marca = 'VITTORIA' THEN m.venta_total ELSE 0 END), 0) AS vittoria_mar_abr,
+            COALESCE(SUM(CASE WHEN m.fecha_factura BETWEEN '2026-05-01' AND '2026-06-30' AND m.marca = 'VITTORIA' THEN m.venta_total ELSE 0 END), 0) AS vittoria_may_jun
+        FROM monitor m
+        WHERE m.contacto_referencia = %s
+          AND m.fecha_factura >= %s
+          AND m.fecha_factura <= %s
+    """, (clave, f_inicio, fecha_cierre))
+
+    row = cursor_dict.fetchone() or {}
+
+    cursor_dict.execute("""
+        SELECT id, compromiso_scott, compromiso_apparel_syncros_vittoria,
+               compromiso_jul_ago, compromiso_sep_oct, compromiso_nov_dic,
+               compromiso_ene_feb, compromiso_mar_abr, compromiso_may_jun,
+               compromiso_jul_ago_app, compromiso_sep_oct_app, compromiso_nov_dic_app,
+               compromiso_ene_feb_app, compromiso_mar_abr_app, compromiso_may_jun_app,
+               compra_minima_inicial, compra_minima_anual
+        FROM previo
+        WHERE UPPER(TRIM(clave)) = %s AND (es_integral IS NULL OR es_integral = 0)
+        LIMIT 1
+    """, (clave,))
+    previo_row = cursor_dict.fetchone()
+    if not previo_row:
+        return
+
+    def flt(v): return float(v or 0)
+    def pct(avance, compromiso): return int(round(avance / compromiso * 100)) if compromiso > 0 else 0
+
+    PERIODS = ['jul_ago', 'sep_oct', 'nov_dic', 'ene_feb', 'mar_abr', 'may_jun']
+    syncros  = flt(row.get('syncros'))
+    apparel  = flt(row.get('apparel'))
+    vittoria = flt(row.get('vittoria'))
+    bold     = flt(row.get('bold'))
+    scott    = flt(row.get('scott'))
+    acum_total = round(flt(row.get('total_bruto')), 2)
+
+    p_syncros  = {p: flt(row.get(f'syncros_{p}'))  for p in PERIODS}
+    p_apparel  = {p: flt(row.get(f'apparel_{p}'))  for p in PERIODS}
+    p_vittoria = {p: flt(row.get(f'vittoria_{p}')) for p in PERIODS}
+    p_scott    = {p: flt(row.get(f'scott_{p}'))    for p in PERIODS}
+    app_global = round(syncros + apparel + vittoria, 2)
+    p_app = {p: round(p_syncros[p] + p_apparel[p] + p_vittoria[p], 2) for p in PERIODS}
+
+    cm_ini = flt(previo_row.get('compra_minima_inicial'))
+    cm_anu = flt(previo_row.get('compra_minima_anual'))
+
+    cursor.execute("""
+        UPDATE previo SET
+            acumulado_anticipado                   = %s,
+            acumulado_syncros                      = %s,
+            acumulado_apparel                      = %s,
+            acumulado_vittoria                     = %s,
+            acumulado_bold                         = %s,
+            avance_global                          = %s,
+            avance_global_scott                    = %s,
+            avance_global_apparel_syncros_vittoria = %s,
+            porcentaje_global                      = %s,
+            porcentaje_anual                       = %s,
+            porcentaje_scott                       = %s,
+            porcentaje_apparel_syncros_vittoria    = %s,
+            avance_jul_ago     = %s, porcentaje_jul_ago     = %s,
+            avance_sep_oct     = %s, porcentaje_sep_oct     = %s,
+            avance_nov_dic     = %s, porcentaje_nov_dic     = %s,
+            avance_ene_feb     = %s, porcentaje_ene_feb     = %s,
+            avance_mar_abr     = %s, porcentaje_mar_abr     = %s,
+            avance_may_jun     = %s, porcentaje_may_jun     = %s,
+            avance_jul_ago_app = %s, porcentaje_jul_ago_app = %s,
+            avance_sep_oct_app = %s, porcentaje_sep_oct_app = %s,
+            avance_nov_dic_app = %s, porcentaje_nov_dic_app = %s,
+            avance_ene_feb_app = %s, porcentaje_ene_feb_app = %s,
+            avance_mar_abr_app = %s, porcentaje_mar_abr_app = %s,
+            avance_may_jun_app = %s, porcentaje_may_jun_app = %s
+        WHERE id = %s
+    """, (
+        acum_total, syncros, apparel, vittoria, bold,
+        acum_total, scott, app_global,
+        pct(acum_total, cm_ini), pct(acum_total, cm_anu),
+        pct(scott,      flt(previo_row.get('compromiso_scott'))),
+        pct(app_global, flt(previo_row.get('compromiso_apparel_syncros_vittoria'))),
+        p_scott['jul_ago'], pct(p_scott['jul_ago'], flt(previo_row.get('compromiso_jul_ago'))),
+        p_scott['sep_oct'], pct(p_scott['sep_oct'], flt(previo_row.get('compromiso_sep_oct'))),
+        p_scott['nov_dic'], pct(p_scott['nov_dic'], flt(previo_row.get('compromiso_nov_dic'))),
+        p_scott['ene_feb'], pct(p_scott['ene_feb'], flt(previo_row.get('compromiso_ene_feb'))),
+        p_scott['mar_abr'], pct(p_scott['mar_abr'], flt(previo_row.get('compromiso_mar_abr'))),
+        p_scott['may_jun'], pct(p_scott['may_jun'], flt(previo_row.get('compromiso_may_jun'))),
+        p_app['jul_ago'],   pct(p_app['jul_ago'],   flt(previo_row.get('compromiso_jul_ago_app'))),
+        p_app['sep_oct'],   pct(p_app['sep_oct'],   flt(previo_row.get('compromiso_sep_oct_app'))),
+        p_app['nov_dic'],   pct(p_app['nov_dic'],   flt(previo_row.get('compromiso_nov_dic_app'))),
+        p_app['ene_feb'],   pct(p_app['ene_feb'],   flt(previo_row.get('compromiso_ene_feb_app'))),
+        p_app['mar_abr'],   pct(p_app['mar_abr'],   flt(previo_row.get('compromiso_mar_abr_app'))),
+        p_app['may_jun'],   pct(p_app['may_jun'],   flt(previo_row.get('compromiso_may_jun_app'))),
+        previo_row['id']
+    ))
+
+
 def ejecutar_sincronizacion_y_calculos():
     conexion = obtener_conexion()
     cursor_dict = conexion.cursor(dictionary=True)
@@ -2942,7 +3087,101 @@ def sincronizar_notas_odoo():
         }), 500
 
 # ==============================================================================
-# 5. ENDPOINT GET INDIVIDUAL
+# 5. ENDPOINT CERRAR TEMPORADA (admin only, irreversible)
+# ==============================================================================
+@retroactivos_bp.route('/cerrar-temporada', methods=['POST'])
+def cerrar_temporada():
+    auth_header = request.headers.get('Authorization', '')
+    raw_token = auth_header.split(' ')[1] if ' ' in auth_header else None
+    if not raw_token:
+        return jsonify({"error": "No autorizado"}), 401
+
+    payload = verificar_token(raw_token)
+    if not payload or payload.get('rol') != 1:
+        return jsonify({"error": "Solo administradores pueden cerrar la temporada"}), 403
+
+    data = request.get_json() or {}
+    clave = (data.get('clave') or '').strip().upper()
+    fecha_cierre = (data.get('fecha_cierre') or '').strip()
+
+    if not clave:
+        return jsonify({"error": "Se requiere la clave del distribuidor"}), 400
+    if not fecha_cierre:
+        return jsonify({"error": "Se requiere la fecha de cierre"}), 400
+
+    try:
+        datetime.strptime(fecha_cierre, '%Y-%m-%d')
+    except ValueError:
+        return jsonify({"error": "Formato de fecha inválido. Use YYYY-MM-DD"}), 400
+
+    conexion = obtener_conexion()
+    cursor     = conexion.cursor()
+    cursor_dict = conexion.cursor(dictionary=True)
+
+    try:
+        cursor_dict.execute("""
+            SELECT clave, f_inicio, temporada_cerrada
+            FROM clientes
+            WHERE UPPER(TRIM(clave)) = %s
+            LIMIT 1
+        """, (clave,))
+        cliente = cursor_dict.fetchone()
+
+        if not cliente:
+            return jsonify({"error": f"No se encontró el distribuidor {clave}"}), 404
+
+        if cliente.get('temporada_cerrada'):
+            return jsonify({"error": f"La temporada de {clave} ya fue cerrada previamente"}), 409
+
+        f_inicio = cliente.get('f_inicio')
+        if hasattr(f_inicio, 'strftime'):
+            f_inicio = f_inicio.strftime('%Y-%m-%d')
+        f_inicio = f_inicio or '2025-07-01'
+
+        # Recalcular previo con tope en fecha_cierre ANTES de marcar como cerrado
+        _recalcular_previo_clave_cierre(conexion, cursor_dict, cursor, clave, f_inicio, fecha_cierre)
+
+        # Actualizar f_fin y marcar como cerrado
+        cursor.execute("""
+            UPDATE clientes
+            SET temporada_cerrada      = 1,
+                fecha_cierre_temporada = %s,
+                f_fin                  = %s
+            WHERE UPPER(TRIM(clave)) = %s
+        """, (fecha_cierre, fecha_cierre, clave))
+
+        conexion.commit()
+        print(f"[CIERRE] Temporada cerrada para {clave} al {fecha_cierre}")
+
+    except Exception as e:
+        conexion.rollback()
+        traceback.print_exc()
+        return jsonify({"error": str(e)}), 500
+    finally:
+        cursor_dict.close()
+        cursor.close()
+        conexion.close()
+
+    # Recalcular tabla_retroactivos con los nuevos topes ya aplicados
+    try:
+        ejecutar_sincronizacion_y_calculos()
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({
+            "success": False,
+            "error": f"Cierre marcado pero falló el recálculo: {str(e)}"
+        }), 500
+
+    return jsonify({
+        "success": True,
+        "mensaje": f"Temporada cerrada para {clave} al {fecha_cierre}",
+        "clave": clave,
+        "fecha_cierre": fecha_cierre
+    }), 200
+
+
+# ==============================================================================
+# 6. ENDPOINT GET INDIVIDUAL
 # ==============================================================================
 @retroactivos_bp.route('/retroactivo_cliente/<string:identificador>', methods=['GET'])
 def obtener_retroactivo_individual(identificador):
@@ -2953,15 +3192,18 @@ def obtener_retroactivo_individual(identificador):
     try:
         query = """
             SELECT
-                CLAVE, ZONA, CLIENTE, CATEGORIA,
-                COMPRA_MINIMA_ANUAL, COMPRA_GLOBAL_SCOTT,
-                COMPRA_MINIMA_APPAREL, COMPRA_GLOBAL_APPAREL,
-                COMPRAS_TOTALES_CRUDO, notas_credito, garantias,
-                productos_ofertados, bicicleta_demo, bicicletas_bold,
-                importe_final, porcentaje_retroactivo, porcentaje_retroactivo_apparel,
-                compra_adicional, retroactivo_total, importe, estatus, NC, FACT
-            FROM tabla_retroactivos
-            WHERE CLAVE = %s OR CLIENTE LIKE %s
+                tr.CLAVE, tr.ZONA, tr.CLIENTE, tr.CATEGORIA,
+                tr.COMPRA_MINIMA_ANUAL, tr.COMPRA_GLOBAL_SCOTT,
+                tr.COMPRA_MINIMA_APPAREL, tr.COMPRA_GLOBAL_APPAREL,
+                tr.COMPRAS_TOTALES_CRUDO, tr.notas_credito, tr.garantias,
+                tr.productos_ofertados, tr.bicicleta_demo, tr.bicicletas_bold,
+                tr.importe_final, tr.porcentaje_retroactivo, tr.porcentaje_retroactivo_apparel,
+                tr.compra_adicional, tr.retroactivo_total, tr.importe, tr.estatus, tr.NC, tr.FACT,
+                COALESCE(c.temporada_cerrada, 0)   AS temporada_cerrada,
+                c.fecha_cierre_temporada
+            FROM tabla_retroactivos tr
+            LEFT JOIN clientes c ON UPPER(TRIM(tr.CLAVE)) = UPPER(TRIM(c.clave))
+            WHERE tr.CLAVE = %s OR tr.CLIENTE LIKE %s
             LIMIT 1
         """
 
@@ -2971,14 +3213,28 @@ def obtener_retroactivo_individual(identificador):
         if not cliente_data:
             return jsonify({"mensaje": "Cliente no encontrado"}), 404
 
+        # Guardar campos de cierre antes de la serialización genérica
+        _tc  = cliente_data.get('temporada_cerrada')
+        _fct = cliente_data.get('fecha_cierre_temporada')
+
         for clave, valor in cliente_data.items():
             cliente_data[clave] = convertir_decimal_y_fecha(valor)
 
             if cliente_data[clave] is None:
-                if clave in ['CLAVE', 'ZONA', 'CLIENTE', 'CATEGORIA', 'estatus', 'NC', 'FACT']:
+                if clave in ['CLAVE', 'ZONA', 'CLIENTE', 'CATEGORIA', 'estatus', 'NC', 'FACT',
+                             'fecha_cierre_temporada']:
                     cliente_data[clave] = ''
                 else:
                     cliente_data[clave] = 0.0
+
+        # Restaurar campos de cierre con tipos correctos
+        cliente_data['temporada_cerrada'] = bool(_tc)
+        if _fct:
+            cliente_data['fecha_cierre_temporada'] = (
+                _fct.strftime('%Y-%m-%d') if hasattr(_fct, 'strftime') else str(_fct)
+            )
+        else:
+            cliente_data['fecha_cierre_temporada'] = None
 
         minima_anual = cliente_data.get('COMPRA_MINIMA_ANUAL', 0) or 0
         minima_apparel = cliente_data.get('COMPRA_MINIMA_APPAREL', 0) or 0

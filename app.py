@@ -33,6 +33,9 @@ from routes.proyecciones_my27 import proyecciones_my27_bp
 # Importamos la instancia de Celery desde celery_worker
 from celery_worker import celery_app as celery
 
+# Scheduler para sync automático diario
+from services.sync_scheduler import init_scheduler
+
 
 def create_app():
     app = Flask(__name__)
@@ -162,6 +165,9 @@ def create_app():
     app.register_blueprint(garantias_bp)
     app.register_blueprint(importaciones_bp)
     app.register_blueprint(proyecciones_my27_bp)
+
+    # Iniciar scheduler de sync automático (L-V 08:30 CDMX)
+    init_scheduler()
 
     return app
 
