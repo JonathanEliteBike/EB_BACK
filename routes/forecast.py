@@ -3220,6 +3220,14 @@ def _normalizar_query(q: str) -> str:
     return q
 
 
+def _tokens_busqueda(q: str) -> list:
+    """Divide la query en tokens individuales y normaliza cada uno.
+    Permite búsquedas como 'MEGAMO PULSE' → ['MEGAMO', 'PULS'] (AND entre tokens).
+    """
+    tokens = [t.strip() for t in q.split() if len(t.strip()) >= 2]
+    return [_normalizar_query(t) for t in tokens] or [_normalizar_query(q)]
+
+
 @forecast_bp.route('/forecast/catalogo-excel', methods=['POST'])
 def cargar_catalogo_excel():
     """
@@ -3316,18 +3324,32 @@ def buscar_producto():
     except (ValueError, TypeError):
         offset = 0
 
-    q_search = _normalizar_query(q)
-    like = f'%{q_search}%'
+    tokens = _tokens_busqueda(q)
+    # Para ORDER BY: el primer token como referencia de coincidencia exacta de SKU
+    q_first = tokens[0]
+
     conn = obtener_conexion()
     cur = conn.cursor(dictionary=True)
     try:
-        # ── Whitelist activa: buscar SOLO entre los 92 SKUs configurados ──────
+        # ── Whitelist activa: buscar SOLO entre los SKUs configurados ──────────
         cur.execute("SELECT COUNT(*) as cnt FROM forecast_sku_whitelist")
         use_whitelist = cur.fetchone()['cnt'] > 0
 
         if use_whitelist:
+            # Condición AND por cada token: todos deben aparecer en algún campo
+            tok_conds  = []
+            tok_params = []
+            for tok in tokens:
+                lk = f'%{tok}%'
+                tok_conds.append(
+                    "(nombre_src LIKE %s OR sku LIKE %s OR marca LIKE %s OR odoo_color LIKE %s OR odoo_talla LIKE %s)"
+                )
+                tok_params.extend([lk, lk, lk, lk, lk])
+
+            where_sql = ' AND '.join(tok_conds)
+
             # Subquery GROUP BY elimina duplicados en odoo_catalogo para el mismo (sku, color, talla)
-            cur.execute("""
+            cur.execute(f"""
                 SELECT sku, nombre_src, categoria, marca, odoo_color, odoo_talla
                 FROM (
                     SELECT
@@ -3343,18 +3365,12 @@ def buscar_producto():
                              COALESCE(NULLIF(TRIM(oc.color), ''), 'N/A'),
                              COALESCE(NULLIF(TRIM(oc.talla), ''), 'N/A')
                 ) AS deduped
-                WHERE (
-                    nombre_src LIKE %s
-                    OR sku     LIKE %s
-                    OR marca   LIKE %s
-                    OR odoo_color LIKE %s
-                    OR odoo_talla LIKE %s
-                )
+                WHERE {where_sql}
                 ORDER BY
                     CASE WHEN sku = %s THEN 0 ELSE 1 END,
                     nombre_src
                 LIMIT %s OFFSET %s
-            """, (like, like, like, like, like, q_search, _SEARCH_PAGE_WL + 1, offset))
+            """, (*tok_params, q_first, _SEARCH_PAGE_WL + 1, offset))
             rows     = cur.fetchall()
             has_more = len(rows) > _SEARCH_PAGE_WL
             rows     = rows[:_SEARCH_PAGE_WL]
@@ -3383,16 +3399,22 @@ def buscar_producto():
         use_excel = cur.fetchone()['cnt'] > 0
 
         if use_excel:
-            cur.execute("""
+            # Fallback Excel: también multi-token AND
+            fb_conds  = ' AND '.join(["(sku LIKE %s OR nombre LIKE %s)"] * len(tokens))
+            fb_params = []
+            for tok in tokens:
+                lk = f'%{tok}%'
+                fb_params.extend([lk, lk])
+            cur.execute(f"""
                 SELECT sku, nombre AS nombre_src, color AS odoo_color, talla AS odoo_talla
                 FROM forecast_excel_productos
                 WHERE origen = 'excel'
-                  AND (sku LIKE %s OR nombre LIKE %s)
+                  AND {fb_conds}
                 ORDER BY
                     CASE WHEN sku = %s THEN 0 ELSE 1 END,
                     nombre
                 LIMIT %s OFFSET %s
-            """, (like, like, q_search, _SEARCH_PAGE + 1, offset))
+            """, (*fb_params, q_first, _SEARCH_PAGE + 1, offset))
             rows     = cur.fetchall()
             has_more = len(rows) > _SEARCH_PAGE
             rows     = rows[:_SEARCH_PAGE]
@@ -3417,8 +3439,31 @@ def buscar_producto():
         cur.execute('SELECT COUNT(*) as cnt FROM odoo_catalogo')
         use_catalogo = cur.fetchone()['cnt'] > 0
 
+        # Fallback catalogo/monitor: multi-token AND
+        cat_conds  = []
+        cat_params = []
+        for tok in tokens:
+            lk = f'%{tok}%'
+            cat_conds.append(
+                "(oc.nombre_producto LIKE %s OR oc.referencia_interna LIKE %s "
+                "OR oc.marca LIKE %s OR oc.categoria LIKE %s "
+                "OR pv.descripcion LIKE %s OR pv.modelo LIKE %s OR pv.clave_factura LIKE %s)"
+            )
+            cat_params.extend([lk, lk, lk, lk, lk, lk, lk])
+
+        mon_conds  = []
+        mon_params = []
+        for tok in tokens:
+            lk = f'%{tok}%'
+            mon_conds.append(
+                "(m.nombre_producto LIKE %s OR m.referencia_interna LIKE %s "
+                "OR m.marca LIKE %s OR pv.descripcion LIKE %s "
+                "OR pv.modelo LIKE %s OR pv.clave_factura LIKE %s)"
+            )
+            mon_params.extend([lk, lk, lk, lk, lk, lk])
+
         if use_catalogo:
-            cur.execute("""
+            cur.execute(f"""
                 SELECT
                     oc.referencia_interna                                       AS sku,
                     oc.nombre_producto                                          AS nombre_src,
@@ -3430,23 +3475,15 @@ def buscar_producto():
                     pv.modelo                                                   AS modelo_pv
                 FROM odoo_catalogo oc
                 LEFT JOIN proyecciones_ventas pv ON pv.clave_odoo = oc.referencia_interna
-                WHERE (
-                    oc.nombre_producto    LIKE %s
-                    OR oc.referencia_interna LIKE %s
-                    OR oc.marca           LIKE %s
-                    OR oc.categoria       LIKE %s
-                    OR pv.descripcion     LIKE %s
-                    OR pv.modelo          LIKE %s
-                    OR pv.clave_factura   LIKE %s
-                )
+                WHERE {' AND '.join(cat_conds)}
                 ORDER BY
                     CASE WHEN oc.referencia_interna = %s THEN 0 ELSE 1 END,
                     oc.nombre_producto
                 LIMIT %s OFFSET %s
-            """, (like, like, like, like, like, like, like, q_search, _SEARCH_PAGE + 1, offset))
+            """, (*cat_params, q_first, _SEARCH_PAGE + 1, offset))
         else:
             # Last fallback: monitor table (only invoiced products)
-            cur.execute("""
+            cur.execute(f"""
                 SELECT
                     m.referencia_interna                                            AS sku,
                     ANY_VALUE(m.nombre_producto)                                    AS nombre_src,
@@ -3458,20 +3495,13 @@ def buscar_producto():
                 LEFT JOIN proyecciones_ventas pv ON pv.clave_odoo = m.referencia_interna
                 WHERE m.referencia_interna IS NOT NULL
                   AND m.referencia_interna != ''
-                  AND (
-                      m.nombre_producto    LIKE %s
-                      OR m.referencia_interna LIKE %s
-                      OR m.marca           LIKE %s
-                      OR pv.descripcion    LIKE %s
-                      OR pv.modelo         LIKE %s
-                      OR pv.clave_factura  LIKE %s
-                  )
+                  AND {' AND '.join(mon_conds)}
                 GROUP BY m.referencia_interna
                 ORDER BY
                     CASE WHEN m.referencia_interna = %s THEN 0 ELSE 1 END,
                     ANY_VALUE(m.nombre_producto)
                 LIMIT %s OFFSET %s
-            """, (like, like, like, like, like, like, q_search, _SEARCH_PAGE + 1, offset))
+            """, (*mon_params, q_first, _SEARCH_PAGE + 1, offset))
 
         rows = cur.fetchall()
         has_more = len(rows) > _SEARCH_PAGE
