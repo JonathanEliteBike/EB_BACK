@@ -103,6 +103,28 @@ def inicializar_tablas():
                 INDEX idx_formulario (formulario_id)
             ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci
         """)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS garantia_piezas (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                nombre VARCHAR(200) NOT NULL UNIQUE,
+                activo TINYINT(1) DEFAULT 1,
+                fecha_creacion DATETIME DEFAULT NOW()
+            ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci
+        """)
+        conn.commit()
+        # Sembrar piezas por defecto si la tabla está vacía
+        cursor.execute("SELECT COUNT(*) as cnt FROM garantia_piezas")
+        if cursor.fetchone()['cnt'] == 0:
+            piezas_default = [
+                'N/A', 'ASIENTO', 'BATERIA', 'CUADRO', 'DROPPER', 'DROPPER POST',
+                'FRENOS', 'GOOGLES', 'GUANTES', 'HANGER', 'LLANTA', 'MANDO E-BIKE',
+                'MAUBRIO', 'POTENCIA', 'RINES', 'SUSPENSION', 'TRANSMISION',
+                'TWINLOCK', 'UNIDAD MOTRIZ', 'ZAPATOS',
+            ]
+            for p in piezas_default:
+                cursor.execute("INSERT IGNORE INTO garantia_piezas (nombre) VALUES (%s)", (p,))
+            conn.commit()
+
         # Columnas de seguimiento ampliado — se agregan si no existen
         for col_sql in [
             "ALTER TABLE garantia_formularios ADD COLUMN estatus_pieza VARCHAR(50) DEFAULT 'Sin pieza'",
@@ -871,6 +893,70 @@ def get_latencias():
         return jsonify(rows)
     except Exception as e:
         logging.exception("Error en /garantias/latencias: %s", e)
+        return jsonify({"error": str(e)}), 500
+    finally:
+        conn.close()
+
+
+# ── Catálogo de piezas de reemplazo ──────────────────────────────────────────
+
+@garantias_bp.route("/piezas", methods=["GET"])
+def listar_piezas():
+    conn = obtener_conexion()
+    if not conn:
+        return jsonify({"error": "Sin conexion a BD"}), 500
+    try:
+        cursor = conn.cursor(dictionary=True)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS garantia_piezas (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                nombre VARCHAR(200) NOT NULL UNIQUE,
+                activo TINYINT(1) DEFAULT 1,
+                fecha_creacion DATETIME DEFAULT NOW()
+            ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci
+        """)
+        cursor.execute("SELECT COUNT(*) as cnt FROM garantia_piezas")
+        if cursor.fetchone()['cnt'] == 0:
+            piezas_default = [
+                'N/A', 'ASIENTO', 'BATERIA', 'CUADRO', 'DROPPER', 'DROPPER POST',
+                'FRENOS', 'GOOGLES', 'GUANTES', 'HANGER', 'LLANTA', 'MANDO E-BIKE',
+                'MAUBRIO', 'POTENCIA', 'RINES', 'SUSPENSION', 'TRANSMISION',
+                'TWINLOCK', 'UNIDAD MOTRIZ', 'ZAPATOS',
+            ]
+            for p in piezas_default:
+                cursor.execute("INSERT IGNORE INTO garantia_piezas (nombre) VALUES (%s)", (p,))
+        conn.commit()
+        cursor.execute("""
+            SELECT nombre FROM garantia_piezas
+            WHERE activo = 1
+            ORDER BY nombre = 'N/A' DESC, nombre ASC
+        """)
+        return jsonify([r['nombre'] for r in cursor.fetchall()])
+    except Exception as e:
+        logging.exception("Error al listar piezas: %s", e)
+        return jsonify({"error": str(e)}), 500
+    finally:
+        conn.close()
+
+
+@garantias_bp.route("/piezas", methods=["POST"])
+def agregar_pieza():
+    conn = obtener_conexion()
+    if not conn:
+        return jsonify({"error": "Sin conexion a BD"}), 500
+    try:
+        datos = request.get_json(force=True) or {}
+        nombre = (datos.get('nombre') or '').strip().upper()
+        if not nombre:
+            return jsonify({"error": "El nombre de la pieza es requerido"}), 400
+        cursor = conn.cursor()
+        cursor.execute("INSERT IGNORE INTO garantia_piezas (nombre) VALUES (%s)", (nombre,))
+        conn.commit()
+        if cursor.rowcount == 0:
+            return jsonify({"ok": True, "mensaje": "La pieza ya existía", "nombre": nombre})
+        return jsonify({"ok": True, "nombre": nombre})
+    except Exception as e:
+        logging.exception("Error al agregar pieza: %s", e)
         return jsonify({"error": str(e)}), 500
     finally:
         conn.close()
