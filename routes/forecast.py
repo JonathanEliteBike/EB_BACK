@@ -3611,6 +3611,10 @@ def guardar_forecast():
     periodo    = str(data.get('periodo', '')).strip()
     rows       = data.get('rows', [])
 
+    # Si el frontend no envió id_cliente (vista usuario), derivarlo de la clave
+    if not id_cliente and clave:
+        id_cliente = _get_client_id(clave)
+
     if not clave or not id_cliente or not periodo:
         return jsonify({'error': 'Faltan campos: clave_cliente, id_cliente, periodo'}), 400
     if not _validate_periodo(periodo):
