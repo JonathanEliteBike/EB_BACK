@@ -3119,11 +3119,14 @@ def cerrar_temporada():
     except ValueError:
         return jsonify({"error": "Formato de fecha inválido. Use YYYY-MM-DD"}), 400
 
+    import re as _re
+
     conexion = obtener_conexion()
     cursor     = conexion.cursor()
     cursor_dict = conexion.cursor(dictionary=True)
 
     try:
+        # ── 1. Buscar distribuidor individual ──────────────────────────────────
         cursor_dict.execute("""
             SELECT clave, f_inicio, temporada_cerrada
             FROM clientes
@@ -3132,31 +3135,67 @@ def cerrar_temporada():
         """, (clave,))
         cliente = cursor_dict.fetchone()
 
-        if not cliente:
-            return jsonify({"error": f"No se encontró el distribuidor {clave}"}), 404
+        es_integral = False
+        id_grupo    = None
+        miembros    = []
 
-        if cliente.get('temporada_cerrada'):
-            return jsonify({"error": f"La temporada de {clave} ya fue cerrada previamente"}), 409
+        if cliente:
+            miembros = [cliente]
+        else:
+            # ── 2. Intentar patrón "INTEGRAL X" ───────────────────────────────
+            m = _re.match(r'INTEGRAL\s+(\d+)$', clave)
+            if not m:
+                return jsonify({"error": f"No se encontró el distribuidor {clave}"}), 404
 
-        f_inicio = cliente.get('f_inicio')
-        if hasattr(f_inicio, 'strftime'):
-            f_inicio = f_inicio.strftime('%Y-%m-%d')
-        f_inicio = f_inicio or '2025-07-01'
+            id_grupo = int(m.group(1))
+            cursor_dict.execute(
+                "SELECT id, nombre_grupo FROM grupo_clientes WHERE id = %s", (id_grupo,)
+            )
+            grupo = cursor_dict.fetchone()
+            if not grupo:
+                return jsonify({"error": f"No se encontró el grupo Integral {id_grupo}"}), 404
 
-        # Recalcular previo con tope en fecha_cierre ANTES de marcar como cerrado
-        _recalcular_previo_clave_cierre(conexion, cursor_dict, cursor, clave, f_inicio, fecha_cierre)
+            cursor_dict.execute("""
+                SELECT clave, f_inicio, temporada_cerrada
+                FROM clientes
+                WHERE id_grupo = %s
+            """, (id_grupo,))
+            miembros = cursor_dict.fetchall()
+            if not miembros:
+                return jsonify({"error": f"El grupo Integral {id_grupo} no tiene miembros"}), 404
+            es_integral = True
 
-        # Actualizar f_fin y marcar como cerrado
-        cursor.execute("""
-            UPDATE clientes
-            SET temporada_cerrada      = 1,
-                fecha_cierre_temporada = %s,
-                f_fin                  = %s
-            WHERE UPPER(TRIM(clave)) = %s
-        """, (fecha_cierre, fecha_cierre, clave))
+        # ── 3. Validar que no estén todos ya cerrados ──────────────────────────
+        pendientes = [mb for mb in miembros if not mb.get('temporada_cerrada')]
+        if not pendientes:
+            etiqueta = f"Integral {id_grupo}" if es_integral else clave
+            return jsonify({"error": f"La temporada de {etiqueta} ya fue cerrada previamente"}), 409
+
+        # ── 4. Cerrar cada miembro pendiente ───────────────────────────────────
+        claves_cerradas = []
+        for mb in pendientes:
+            clave_mb = mb['clave'].strip().upper()
+            f_inicio  = mb.get('f_inicio')
+            if hasattr(f_inicio, 'strftime'):
+                f_inicio = f_inicio.strftime('%Y-%m-%d')
+            f_inicio = f_inicio or '2025-07-01'
+
+            _recalcular_previo_clave_cierre(
+                conexion, cursor_dict, cursor, clave_mb, f_inicio, fecha_cierre
+            )
+
+            cursor.execute("""
+                UPDATE clientes
+                SET temporada_cerrada      = 1,
+                    fecha_cierre_temporada = %s,
+                    f_fin                  = %s
+                WHERE UPPER(TRIM(clave)) = %s
+            """, (fecha_cierre, fecha_cierre, clave_mb))
+
+            claves_cerradas.append(clave_mb)
+            print(f"[CIERRE] {clave_mb} -> {fecha_cierre}")
 
         conexion.commit()
-        print(f"[CIERRE] Temporada cerrada para {clave} al {fecha_cierre}")
 
     except Exception as e:
         conexion.rollback()
@@ -3167,7 +3206,7 @@ def cerrar_temporada():
         cursor.close()
         conexion.close()
 
-    # Recalcular tabla_retroactivos con los nuevos topes ya aplicados
+    # ── 5. Recalcular tabla_retroactivos ──────────────────────────────────────
     try:
         ejecutar_sincronizacion_y_calculos()
     except Exception as e:
@@ -3177,10 +3216,20 @@ def cerrar_temporada():
             "error": f"Cierre marcado pero falló el recálculo: {str(e)}"
         }), 500
 
+    if es_integral:
+        return jsonify({
+            "success":   True,
+            "integral":  True,
+            "id_grupo":  id_grupo,
+            "mensaje":   f"Integral {id_grupo} cerrada al {fecha_cierre}. Miembros: {', '.join(claves_cerradas)}",
+            "claves":    claves_cerradas,
+            "fecha_cierre": fecha_cierre
+        }), 200
+
     return jsonify({
         "success": True,
-        "mensaje": f"Temporada cerrada para {clave} al {fecha_cierre}",
-        "clave": clave,
+        "mensaje": f"Temporada cerrada para {claves_cerradas[0]} al {fecha_cierre}",
+        "clave":   claves_cerradas[0],
         "fecha_cierre": fecha_cierre
     }), 200
 
@@ -3233,6 +3282,24 @@ def obtener_retroactivo_individual(identificador):
                     cliente_data[clave] = 0.0
 
         # Restaurar campos de cierre con tipos correctos
+        # Para integrales ("Integral X"), el LEFT JOIN no une con clientes →
+        # consultamos si TODOS los miembros del grupo están cerrados
+        import re as _re2
+        clave_tr = cliente_data.get('CLAVE', '')
+        m_int = _re2.match(r'[Ii]ntegral\s+(\d+)$', str(clave_tr).strip())
+        if m_int and not _tc:
+            id_g = int(m_int.group(1))
+            cursor.execute("""
+                SELECT COUNT(*) AS total,
+                       SUM(CASE WHEN temporada_cerrada=1 THEN 1 ELSE 0 END) AS cerrados,
+                       MAX(fecha_cierre_temporada) AS fecha_cierre
+                FROM clientes WHERE id_grupo = %s
+            """, (id_g,))
+            ginfo = cursor.fetchone()
+            if ginfo and ginfo['total'] and ginfo['total'] == ginfo['cerrados']:
+                _tc  = 1
+                _fct = ginfo['fecha_cierre']
+
         cliente_data['temporada_cerrada'] = bool(_tc)
         if _fct:
             cliente_data['fecha_cierre_temporada'] = (
