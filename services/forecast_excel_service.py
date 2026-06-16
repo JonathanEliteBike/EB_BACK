@@ -34,6 +34,8 @@ def ensure_excel_producto_table():
                 nombre VARCHAR(400) NOT NULL,
                 color VARCHAR(150) DEFAULT NULL,
                 talla VARCHAR(100) DEFAULT NULL,
+                marca VARCHAR(255) DEFAULT NULL,
+                modelo VARCHAR(255) DEFAULT NULL,
                 origen ENUM('excel', 'odoo') DEFAULT 'excel',
                 cargado_en DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 actualizado_en DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
@@ -41,6 +43,16 @@ def ensure_excel_producto_table():
                 FULLTEXT idx_ft_nombre (nombre)
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
         """)
+        # Migración: agregar columna si la tabla ya existía sin ella
+        for col_migrate in [
+            "ALTER TABLE forecast_excel_productos ADD COLUMN marca VARCHAR(255) DEFAULT NULL",
+            "ALTER TABLE forecast_excel_productos ADD COLUMN modelo VARCHAR(255) DEFAULT NULL",
+        ]:
+            try:
+                cur.execute(col_migrate)
+                conn.commit()
+            except Exception:
+                pass
         conn.commit()
     finally:
         cur.close()
@@ -175,6 +187,8 @@ def load_excel_products(file_content: bytes) -> dict:
         nombre = str(nombre).strip().upper()
         color = (str(ws.cell(row=r_idx, column=col_map.get('COLOR', 0)).value or '')).strip().upper()
         talla = (str(ws.cell(row=r_idx, column=col_map.get('TALLA', 0)).value or '')).strip().upper()
+        marca  = (str(ws.cell(row=r_idx, column=col_map.get('MARCA',  0)).value or '')).strip().upper()
+        modelo = (str(ws.cell(row=r_idx, column=col_map.get('MODELO', 0)).value or '')).strip().upper()
 
         if not sku:
             errores.append(f'Fila {r_idx}: SKU vacío')
@@ -186,10 +200,12 @@ def load_excel_products(file_content: bytes) -> dict:
 
         skus_cargados.add(sku)
         productos.append({
-            'sku': sku,
+            'sku':    sku,
             'nombre': nombre,
-            'color': color or None,
-            'talla': talla or None
+            'color':  color  or None,
+            'talla':  talla  or None,
+            'marca':  marca  or None,
+            'modelo': modelo or None,
         })
 
     if not productos:
@@ -218,14 +234,16 @@ def load_excel_products(file_content: bytes) -> dict:
         for p in productos:
             cur.execute("""
                 INSERT INTO forecast_excel_productos
-                    (sku, nombre, color, talla, origen, cargado_en)
-                VALUES (%s, %s, %s, %s, 'excel', CURRENT_TIMESTAMP)
+                    (sku, nombre, color, talla, marca, modelo, origen, cargado_en)
+                VALUES (%s, %s, %s, %s, %s, %s, 'excel', CURRENT_TIMESTAMP)
                 ON DUPLICATE KEY UPDATE
                     nombre = VALUES(nombre),
-                    color = VALUES(color),
-                    talla = VALUES(talla),
+                    color  = VALUES(color),
+                    talla  = VALUES(talla),
+                    marca  = VALUES(marca),
+                    modelo = VALUES(modelo),
                     actualizado_en = CURRENT_TIMESTAMP
-            """, (p['sku'], p['nombre'], p['color'], p['talla']))
+            """, (p['sku'], p['nombre'], p['color'], p['talla'], p['marca'], p['modelo']))
         conn.commit()
         logging.info('[load_excel_products] Loaded %d products', len(productos))
     except Exception as e:

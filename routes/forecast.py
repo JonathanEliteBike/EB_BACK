@@ -3394,13 +3394,13 @@ def buscar_producto():
                 })
 
             # También buscar en el catálogo Excel (apparel, etc.) aunque la whitelist esté activa
-            fb_conds2  = ' AND '.join(["(UPPER(sku) LIKE %s OR UPPER(nombre) LIKE %s)"] * len(tokens))
+            fb_conds2  = ' AND '.join(["(UPPER(sku) LIKE %s OR UPPER(nombre) LIKE %s OR UPPER(COALESCE(marca,'')) LIKE %s)"] * len(tokens))
             fb_params2 = []
             for tok in tokens:
                 lk2 = f'%{tok.upper()}%'
-                fb_params2.extend([lk2, lk2])
+                fb_params2.extend([lk2, lk2, lk2])
             cur.execute(f"""
-                SELECT sku, nombre AS nombre_src, color AS odoo_color, talla AS odoo_talla
+                SELECT sku, nombre AS nombre_src, color AS odoo_color, talla AS odoo_talla, marca, modelo
                 FROM forecast_excel_productos
                 WHERE origen = 'excel'
                   AND {fb_conds2}
@@ -3412,18 +3412,20 @@ def buscar_producto():
             excel_rows = excel_rows[:_SEARCH_PAGE]
             seen_skus = {r['sku'] for r in results}
             for r in excel_rows:
-                sku_ex = r.get('sku') or ''
+                sku_ex    = r.get('sku') or ''
                 if sku_ex in seen_skus:
                     continue
                 seen_skus.add(sku_ex)
                 nombre_ex = ' '.join((r.get('nombre_src') or '').split()).upper()
                 color_ex  = (r.get('odoo_color') or '').strip().upper() or 'N/A'
                 talla_ex  = (r.get('odoo_talla') or '').strip().upper() or 'N/A'
+                marca_ex  = (r.get('marca')  or '').strip().upper() or 'N/A'
+                modelo_ex = (r.get('modelo') or '').strip().upper()
                 results.append({
                     'sku':      sku_ex,
                     'producto': nombre_ex,
-                    'marca':    'N/A',
-                    'modelo':   '',
+                    'marca':    marca_ex,
+                    'modelo':   modelo_ex,
                     'color':    color_ex,
                     'talla':    talla_ex,
                     'label':    f"{sku_ex} — {nombre_ex}",
@@ -3436,13 +3438,13 @@ def buscar_producto():
 
         if use_excel:
             # Fallback Excel: también multi-token AND
-            fb_conds  = ' AND '.join(["(UPPER(sku) LIKE %s OR UPPER(nombre) LIKE %s)"] * len(tokens))
+            fb_conds  = ' AND '.join(["(UPPER(sku) LIKE %s OR UPPER(nombre) LIKE %s OR UPPER(COALESCE(marca,'')) LIKE %s)"] * len(tokens))
             fb_params = []
             for tok in tokens:
                 lk = f'%{tok.upper()}%'
-                fb_params.extend([lk, lk])
+                fb_params.extend([lk, lk, lk])
             cur.execute(f"""
-                SELECT sku, nombre AS nombre_src, color AS odoo_color, talla AS odoo_talla
+                SELECT sku, nombre AS nombre_src, color AS odoo_color, talla AS odoo_talla, marca, modelo
                 FROM forecast_excel_productos
                 WHERE origen = 'excel'
                   AND {fb_conds}
@@ -3460,11 +3462,13 @@ def buscar_producto():
                 color  = (r.get('odoo_color') or '').strip().upper() or 'N/A'
                 talla  = (r.get('odoo_talla') or '').strip().upper() or 'N/A'
                 nombre = (r.get('nombre_src') or '').strip().upper()
+                marca  = (r.get('marca')  or '').strip().upper() or 'N/A'
+                modelo = (r.get('modelo') or '').strip().upper()
                 results.append({
                     'sku':      r['sku'] or '',
                     'producto': nombre,
-                    'marca':    'N/A',
-                    'modelo':   '',
+                    'marca':    marca,
+                    'modelo':   modelo,
                     'color':    color,
                     'talla':    talla,
                     'label':    f"{r['sku']} — {nombre}",
