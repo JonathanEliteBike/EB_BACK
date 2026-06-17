@@ -2512,6 +2512,16 @@ def listar_forecast():
         except Exception as _e:
             logging.warning('[forecast] No se pudo obtener lista de precios de Odoo para %s: %s', clave, _e)
 
+        # PRECIO PUBLICO (sin IVA) solo para bicis del whitelist — lista ID 4 en Odoo
+        PRECIO_PUBLICO_PL_ID = 4
+        whitelist_skus = [r['sku'] for r in rows if r.get('fuente') == 'whitelist' and r.get('sku')]
+        pub_prices: dict = {}
+        if whitelist_skus:
+            try:
+                pub_prices = _get_single_pricelist_prices(PRECIO_PUBLICO_PL_ID, whitelist_skus)
+            except Exception as _ep:
+                logging.warning('[forecast] No se pudo obtener precio publico: %s', _ep)
+
         if partner_pricelist_id and all_skus:
             # Precios desde la lista de precios del distribuidor en Odoo
             raw_prices = _get_single_pricelist_prices(partner_pricelist_id, all_skus)
@@ -2522,8 +2532,9 @@ def listar_forecast():
                     # Fallback a SKU_CATALOG (Scott MY27)
                     cat_p = SKU_CATALOG.get(sku, {}).get('prices', {})
                     raw = cat_p.get(tier, cat_p.get('Distribuidor', 0.0))
-                r['precio']       = round(raw * IVA_FACTOR, 2)
-                r['nivel_precio'] = partner_pricelist_name or tier
+                r['precio']          = round(raw * IVA_FACTOR, 2)
+                r['nivel_precio']    = partner_pricelist_name or tier
+                r['precio_publico']  = round(pub_prices[sku] * IVA_FACTOR, 2) if pub_prices.get(sku) else None
                 if r.get('actualizado_en'):
                     r['actualizado_en'] = r['actualizado_en'].isoformat()
         else:
@@ -2532,8 +2543,9 @@ def listar_forecast():
                 sku = r.get('sku') or ''
                 cat_p = SKU_CATALOG.get(sku, {}).get('prices', {})
                 raw   = cat_p.get(tier, cat_p.get('Distribuidor', 0.0))
-                r['precio']       = round(raw * IVA_FACTOR, 2)
-                r['nivel_precio'] = tier
+                r['precio']          = round(raw * IVA_FACTOR, 2)
+                r['nivel_precio']    = tier
+                r['precio_publico']  = round(pub_prices[sku] * IVA_FACTOR, 2) if pub_prices.get(sku) else None
                 if r.get('actualizado_en'):
                     r['actualizado_en'] = r['actualizado_en'].isoformat()
 
