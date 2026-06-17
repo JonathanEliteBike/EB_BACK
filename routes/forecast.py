@@ -594,12 +594,24 @@ def _ensure_excel_producto_table():
                 nombre VARCHAR(255),
                 color VARCHAR(255),
                 talla VARCHAR(255),
+                marca VARCHAR(120) DEFAULT NULL,
+                modelo VARCHAR(255) DEFAULT NULL,
                 origen VARCHAR(50) DEFAULT 'excel',
                 cargado_en DATETIME DEFAULT CURRENT_TIMESTAMP,
                 actualizado_en DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
         """)
         conn.commit()
+        # Agregar columnas marca/modelo si la tabla ya existía sin ellas
+        for col_sql in [
+            "ALTER TABLE forecast_excel_productos ADD COLUMN marca  VARCHAR(120) DEFAULT NULL",
+            "ALTER TABLE forecast_excel_productos ADD COLUMN modelo VARCHAR(255) DEFAULT NULL",
+        ]:
+            try:
+                cur.execute(col_sql)
+                conn.commit()
+            except Exception:
+                conn.rollback()  # columna ya existe, ignorar
     except Exception as e:
         logging.warning('[forecast] Could not ensure forecast_excel_productos table: %s', e)
     finally:
