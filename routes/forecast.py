@@ -2559,6 +2559,105 @@ def listar_forecast():
         conn.close()
 
 
+@forecast_bp.route('/forecast/precios-catalogo', methods=['GET'])
+def precios_catalogo():
+    """
+    GET /forecast/precios-catalogo?clave=X
+    Retorna {precios: {sku: {precio, precio_publico}}, nivel_precio: str}
+    para TODOS los SKUs de la whitelist en un solo batch de Odoo.
+    Llamado al abrir el tab de proyecciones para hacer lookups instantáneos al agregar productos.
+    """
+    clave = request.args.get('clave', '').strip()
+
+    NIVEL_TO_TIER = {
+        'Partner Elite Plus!': 'Partner Elite Plus!',
+        'Partner Elite Plus':  'Partner Elite Plus!',
+        'Partner Elite':       'Partner Elite',
+        'Partner':             'Partner',
+        'Distribuidor':        'Distribuidor',
+    }
+
+    tier          = 'Distribuidor'
+    whitelist_skus = []
+    try:
+        conn = obtener_conexion()
+        cur  = conn.cursor(dictionary=True)
+        cur.execute("SELECT sku FROM forecast_sku_whitelist")
+        whitelist_skus = [r['sku'] for r in cur.fetchall()]
+        if clave:
+            cur.execute("SELECT nivel FROM clientes WHERE clave = %s LIMIT 1", (clave,))
+            cli   = cur.fetchone()
+            nivel = (cli or {}).get('nivel') or ''
+            tier  = NIVEL_TO_TIER.get(nivel, 'Distribuidor')
+        cur.close()
+        conn.close()
+    except Exception as e:
+        logging.warning('[precios-catalogo] MySQL error: %s', e)
+
+    precios      = {}
+    nivel_precio = tier
+
+    if not whitelist_skus:
+        return jsonify({'precios': {}, 'nivel_precio': nivel_precio}), 200
+
+    # Precio público (lista 4) — un solo batch de Odoo para todos los SKUs
+    try:
+        pub_prices = _get_single_pricelist_prices(4, whitelist_skus)
+        for sku, raw in pub_prices.items():
+            if raw:
+                precios.setdefault(sku, {})['precio_publico'] = round(raw * IVA_FACTOR, 2)
+    except Exception as e:
+        logging.warning('[precios-catalogo] precio_publico error: %s', e)
+
+    # Precio distribuidor — un solo batch de Odoo para todos los SKUs
+    try:
+        from utils.odoo_utils import get_odoo_models, ODOO_DB, ODOO_PASSWORD, ODOO_COMPANY_ID
+        uid_pl, models_pl, _ = get_odoo_models()
+        partner_pricelist_id   = None
+        partner_pricelist_name = ''
+        if uid_pl and clave:
+            partners_pl = models_pl.execute_kw(
+                ODOO_DB, uid_pl, ODOO_PASSWORD,
+                'res.partner', 'search_read',
+                [[('ref', '=', clave), ('company_id', '=', ODOO_COMPANY_ID)]],
+                {'fields': ['property_product_pricelist'], 'limit': 1}
+            )
+            if partners_pl:
+                pl = partners_pl[0].get('property_product_pricelist')
+                if pl and isinstance(pl, (list, tuple)) and len(pl) >= 2:
+                    partner_pricelist_id   = pl[0]
+                    partner_pricelist_name = str(pl[1])
+            if not partner_pricelist_id:
+                odoo_pl_name = _TIER_TO_ODOO_PL.get(tier, tier.upper())
+                pl_fallback  = models_pl.execute_kw(
+                    ODOO_DB, uid_pl, ODOO_PASSWORD,
+                    'product.pricelist', 'search_read',
+                    [[['name', '=', odoo_pl_name]]],
+                    {'fields': ['id', 'name'], 'order': 'id desc', 'limit': 1}
+                )
+                if pl_fallback:
+                    partner_pricelist_id   = pl_fallback[0]['id']
+                    partner_pricelist_name = pl_fallback[0]['name']
+
+        if partner_pricelist_id:
+            dist_prices = _get_single_pricelist_prices(partner_pricelist_id, whitelist_skus)
+            for sku, raw in dist_prices.items():
+                if raw:
+                    precios.setdefault(sku, {})['precio'] = round(raw * IVA_FACTOR, 2)
+            nivel_precio = partner_pricelist_name or tier
+        else:
+            for sku in whitelist_skus:
+                cat_p = SKU_CATALOG.get(sku, {}).get('prices', {})
+                raw   = cat_p.get(tier, cat_p.get('Distribuidor', 0.0))
+                if raw:
+                    precios.setdefault(sku, {})['precio'] = round(raw * IVA_FACTOR, 2)
+            nivel_precio = tier
+    except Exception as e:
+        logging.warning('[precios-catalogo] precio distribuidor error: %s', e)
+
+    return jsonify({'precios': precios, 'nivel_precio': nivel_precio}), 200
+
+
 @forecast_bp.route('/forecast/distribuidores-precios', methods=['GET'])
 def distribuidores_precios():
     """

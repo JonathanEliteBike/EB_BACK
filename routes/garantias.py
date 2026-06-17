@@ -1169,11 +1169,19 @@ def importar_garantias():
     finally:
         conn.close()
 
-    # Índice nombre_normalizado → correo
+    # Índice nombre_normalizado → correo (acepta nombre completo, correo completo o prefijo del correo)
     def _norm(s):
         return str(s or '').strip().lower()
 
     usuarios_idx = {_norm(u['nombre']): u['correo'] for u in usuarios_db}
+    # También indexar por correo completo y por prefijo antes del @
+    for u in usuarios_db:
+        correo = (u['correo'] or '').strip().lower()
+        if correo:
+            usuarios_idx[correo] = u['correo']
+            prefix = correo.split('@')[0]
+            if prefix:
+                usuarios_idx[prefix] = u['correo']
 
     insertados = 0
     errores    = []
