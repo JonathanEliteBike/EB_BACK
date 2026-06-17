@@ -2467,7 +2467,7 @@ def listar_forecast():
             LEFT JOIN odoo_catalogo p          ON p.referencia_interna = f.sku
             LEFT JOIN forecast_excel_productos ep ON ep.sku = f.sku AND p.referencia_interna IS NULL
             WHERE f.clave_cliente = %s AND f.periodo = %s
-            ORDER BY fuente, f.sku
+            ORDER BY fuente, f.actualizado_en DESC, f.sku
         """, (clave, periodo))
         rows = cur.fetchall()
 
