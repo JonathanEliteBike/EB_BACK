@@ -2431,7 +2431,20 @@ def listar_forecast():
         cur.execute("""
             SELECT
                 f.id,
-                p.referencia_interna AS sku, p.nombre_producto AS producto, p.marca, p.categoria AS modelo, p.color, p.talla,
+                f.sku,
+                COALESCE(p.nombre_producto, ep.nombre, f.producto, f.sku) AS producto,
+                CASE
+                    WHEN COALESCE(p.marca, ep.marca) IS NOT NULL AND COALESCE(p.marca, ep.marca) != 'N/A'
+                         THEN COALESCE(p.marca, ep.marca)
+                    WHEN f.marca IS NOT NULL AND f.marca != 'N/A' THEN f.marca
+                    WHEN UPPER(COALESCE(p.nombre_producto, ep.nombre, f.producto, '')) LIKE '%SCOTT%'   THEN 'SCOTT'
+                    WHEN UPPER(COALESCE(p.nombre_producto, ep.nombre, f.producto, '')) LIKE '%MEGAMO%'  THEN 'MEGAMO'
+                    WHEN UPPER(COALESCE(p.nombre_producto, ep.nombre, f.producto, '')) LIKE '%SYNCROS%' THEN 'SYNCROS'
+                    ELSE COALESCE(p.marca, ep.marca, f.marca, 'N/A')
+                END AS marca,
+                COALESCE(p.categoria,       ep.modelo, f.modelo)          AS modelo,
+                COALESCE(p.color,           ep.color,  f.color)           AS color,
+                COALESCE(p.talla,           ep.talla,  f.talla)           AS talla,
                 COALESCE(f.mayo, 0) AS mayo,
                 COALESCE(f.junio, 0) AS junio,
                 COALESCE(f.julio, 0) AS julio,
@@ -2448,11 +2461,13 @@ def listar_forecast():
                  COALESCE(f.agosto, 0) + COALESCE(f.septiembre, 0) + COALESCE(f.octubre, 0) +
                  COALESCE(f.noviembre, 0) + COALESCE(f.diciembre, 0) + COALESCE(f.enero, 0) +
                  COALESCE(f.febrero, 0) + COALESCE(f.marzo, 0) + COALESCE(f.abril, 0)) AS total,
+                CASE WHEN p.referencia_interna IS NOT NULL THEN 'whitelist' ELSE 'excel' END AS fuente,
                 f.actualizado_en
             FROM forecast_proyecciones f
-            INNER JOIN odoo_catalogo p ON p.referencia_interna = f.sku
+            LEFT JOIN odoo_catalogo p          ON p.referencia_interna = f.sku
+            LEFT JOIN forecast_excel_productos ep ON ep.sku = f.sku AND p.referencia_interna IS NULL
             WHERE f.clave_cliente = %s AND f.periodo = %s
-            ORDER BY p.marca, p.categoria, p.referencia_interna
+            ORDER BY fuente, f.sku
         """, (clave, periodo))
         rows = cur.fetchall()
 
@@ -3402,6 +3417,7 @@ def buscar_producto():
                     'modelo':   modelo,
                     'color':    color,
                     'talla':    talla,
+                    'fuente':   'whitelist',
                     'label':    f"{r['sku']} — {nombre}",
                 })
 
@@ -3440,6 +3456,7 @@ def buscar_producto():
                     'modelo':   modelo_ex,
                     'color':    color_ex,
                     'talla':    talla_ex,
+                    'fuente':   'excel',
                     'label':    f"{sku_ex} — {nombre_ex}",
                 })
             return jsonify({'results': results, 'has_more': has_more, 'offset': offset}), 200
@@ -3483,6 +3500,7 @@ def buscar_producto():
                     'modelo':   modelo,
                     'color':    color,
                     'talla':    talla,
+                    'fuente':   'excel',
                     'label':    f"{r['sku']} — {nombre}",
                 })
             return jsonify({'results': results, 'has_more': has_more, 'offset': offset}), 200

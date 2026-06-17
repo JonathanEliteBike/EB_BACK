@@ -53,6 +53,21 @@ def ensure_excel_producto_table():
                 conn.commit()
             except Exception:
                 pass
+        # Migración: inferir marca desde el nombre para registros sin marca
+        try:
+            cur.execute("""
+                UPDATE forecast_excel_productos
+                SET marca = CASE
+                    WHEN UPPER(nombre) LIKE '%SCOTT%'   THEN 'SCOTT'
+                    WHEN UPPER(nombre) LIKE '%MEGAMO%'  THEN 'MEGAMO'
+                    WHEN UPPER(nombre) LIKE '%SYNCROS%' THEN 'SYNCROS'
+                END
+                WHERE (marca IS NULL OR marca = '' OR marca = 'N/A')
+                  AND (UPPER(nombre) LIKE '%SCOTT%' OR UPPER(nombre) LIKE '%MEGAMO%' OR UPPER(nombre) LIKE '%SYNCROS%')
+            """)
+            conn.commit()
+        except Exception:
+            conn.rollback()
         conn.commit()
     finally:
         cur.close()
@@ -189,6 +204,11 @@ def load_excel_products(file_content: bytes) -> dict:
         talla = (str(ws.cell(row=r_idx, column=col_map.get('TALLA', 0)).value or '')).strip().upper()
         marca  = (str(ws.cell(row=r_idx, column=col_map.get('MARCA',  0)).value or '')).strip().upper()
         modelo = (str(ws.cell(row=r_idx, column=col_map.get('MODELO', 0)).value or '')).strip().upper()
+        if not marca:
+            nombre_upper = nombre.upper()
+            if 'SCOTT' in nombre_upper:    marca = 'SCOTT'
+            elif 'MEGAMO' in nombre_upper: marca = 'MEGAMO'
+            elif 'SYNCROS' in nombre_upper: marca = 'SYNCROS'
 
         if not sku:
             errores.append(f'Fila {r_idx}: SKU vacío')
