@@ -3,7 +3,7 @@ import json
 import logging
 import os
 import uuid
-from datetime import date
+from datetime import date, datetime
 
 from flask import Blueprint, jsonify, request, send_file, redirect
 from services.s3_service import subir_archivo_s3, generar_url_firmada_s3, existe_archivo_s3
@@ -957,6 +957,361 @@ def agregar_pieza():
         return jsonify({"ok": True, "nombre": nombre})
     except Exception as e:
         logging.exception("Error al agregar pieza: %s", e)
+        return jsonify({"error": str(e)}), 500
+    finally:
+        conn.close()
+
+
+# ── Importación masiva histórica ──────────────────────────────────────────────
+
+COLUMNAS_IMPORTACION = [
+    ("folio_anterior",    "Folio anterior (referencia)",   "GAR-001"),
+    ("distribuidor",      "Distribuidor *",                "Elite Bike GDL"),
+    ("contacto",          "Contacto *",                    "Juan López"),
+    ("puesto",            "Puesto",                        "Gerente"),
+    ("marca",             "Marca *",                       "Scott"),
+    ("modelo",            "Modelo del producto",           "Scale 960"),
+    ("descripcion_dano",  "Descripción del daño *",        "Fisura en tubo inferior del cuadro"),
+    ("estatus",           "Estatus *",                     "Cerrado"),
+    ("estatus_pieza",     "Estatus pieza",                 "Enviada al cliente"),
+    ("pieza_reemplazo",   "Pieza de reemplazo",            "CUADRO"),
+    ("fecha_registro",    "Fecha de registro *",           "2024-03-15"),
+    ("fecha_atencion",    "Fecha de atención (validación docs)", "2024-03-22"),
+    ("fecha_cierre",      "Fecha de cierre",               "2024-04-02"),
+    ("asignado_a",        "Asignado a (nombre exacto del usuario)", "Victor Alejandro Garnier Morga"),
+]
+
+ESTATUSES_VALIDOS      = ['Enviado', 'En revisión', 'Aprobado', 'Rechazado', 'Cerrado']
+ESTATUSES_PIEZA_VALIDOS = ['Sin pieza', 'Solicitada', 'En tránsito', 'En almacén', 'Enviada al cliente', 'Rechazada']
+MARCAS_VALIDAS         = ['Scott', 'Megamo', 'Syncros', 'Vittoria', 'Bosch', 'Otra']
+
+
+def _requiere_admin(request):
+    """Retorna (payload, None) si es admin, o (None, response_error) si no."""
+    auth_header = request.headers.get('Authorization', '')
+    raw_token = auth_header.split(' ')[1] if ' ' in auth_header else None
+    if not raw_token:
+        return None, (jsonify({"error": "No autorizado"}), 401)
+    payload = verificar_token(raw_token)
+    if not payload or not payload.get('id'):
+        return None, (jsonify({"error": "Token inválido"}), 401)
+    conn = obtener_conexion()
+    if not conn:
+        return None, (jsonify({"error": "Sin conexión a BD"}), 500)
+    try:
+        cursor = conn.cursor(dictionary=True)
+        cursor.execute("SELECT rol_id FROM usuarios WHERE id = %s", (payload['id'],))
+        user = cursor.fetchone()
+    finally:
+        conn.close()
+    if not user or user.get('rol_id') != 1:
+        return None, (jsonify({"error": "Solo administradores"}), 403)
+    return payload, None
+
+
+@garantias_bp.route("/importar/plantilla", methods=["GET"])
+def descargar_plantilla_importacion():
+    """Genera y devuelve el Excel plantilla para importación masiva de garantías."""
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+    from openpyxl.utils import get_column_letter
+    from openpyxl.worksheet.datavalidation import DataValidation
+
+    _, err = _requiere_admin(request)
+    if err:
+        return err
+
+    wb = Workbook()
+
+    # ── Hoja 1: Importar ────────────────────────────────────────────────────
+    ws = wb.active
+    ws.title = "Importar"
+
+    hdr_fill   = PatternFill("solid", fgColor="1A1A2E")
+    hdr_font   = Font(bold=True, color="FFFFFF", size=11)
+    req_fill   = PatternFill("solid", fgColor="C8102E")
+    ex_fill    = PatternFill("solid", fgColor="2A2A4E")
+    ex_font    = Font(color="AAAACC", italic=True, size=10)
+    thin       = Side(style='thin', color="444466")
+    border     = Border(left=thin, right=thin, top=thin, bottom=thin)
+    center     = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    left       = Alignment(horizontal="left",  vertical="center", wrap_text=True)
+
+    # Fila 1: instrucción general
+    ws.merge_cells("A1:N1")
+    ws["A1"] = (
+        "PLANTILLA DE IMPORTACIÓN MASIVA — GARANTÍAS ELITE BIKE  |  "
+        "Campos con * son obligatorios  |  Fechas en formato YYYY-MM-DD (ej. 2024-03-15)  |  "
+        "Consulta la hoja 'Usuarios' para los nombres exactos asignables"
+    )
+    ws["A1"].fill      = PatternFill("solid", fgColor="0D0D1A")
+    ws["A1"].font      = Font(bold=True, color="FFD700", size=10)
+    ws["A1"].alignment = Alignment(horizontal="left", vertical="center", wrap_text=True)
+    ws.row_dimensions[1].height = 32
+
+    # Fila 2: encabezados
+    for col_i, (_, label, _) in enumerate(COLUMNAS_IMPORTACION, start=1):
+        cell         = ws.cell(row=2, column=col_i, value=label)
+        cell.fill    = req_fill if label.endswith("*") else hdr_fill
+        cell.font    = hdr_font
+        cell.alignment = center
+        cell.border  = border
+    ws.row_dimensions[2].height = 36
+
+    # Fila 3: fila de ejemplo
+    for col_i, (_, _, ejemplo) in enumerate(COLUMNAS_IMPORTACION, start=1):
+        cell           = ws.cell(row=3, column=col_i, value=ejemplo)
+        cell.fill      = ex_fill
+        cell.font      = ex_font
+        cell.alignment = left
+        cell.border    = border
+    ws.row_dimensions[3].height = 22
+
+    # Anchos de columna
+    anchos = [15, 25, 22, 18, 14, 20, 40, 15, 22, 20, 16, 16, 16, 30]
+    for i, w in enumerate(anchos, start=1):
+        ws.column_dimensions[get_column_letter(i)].width = w
+
+    # Validaciones desplegables en columnas de estatus y marca (filas 4-300)
+    def add_dv(formula, col_letter):
+        dv = DataValidation(type="list", formula1=formula, allow_blank=True)
+        dv.sqref = f"{col_letter}4:{col_letter}300"
+        ws.add_data_validation(dv)
+
+    col_estatus      = get_column_letter(8)   # estatus
+    col_est_pieza    = get_column_letter(9)   # estatus_pieza
+    col_marca        = get_column_letter(5)   # marca
+
+    add_dv('"' + ','.join(ESTATUSES_VALIDOS) + '"',       col_estatus)
+    add_dv('"' + ','.join(ESTATUSES_PIEZA_VALIDOS) + '"', col_est_pieza)
+    add_dv('"' + ','.join(MARCAS_VALIDAS) + '"',          col_marca)
+
+    # ── Hoja 2: Usuarios ────────────────────────────────────────────────────
+    ws2 = wb.create_sheet("Usuarios disponibles")
+    ws2["A1"] = "Nombre exacto del usuario"
+    ws2["B1"] = "Correo"
+    ws2["A1"].font = Font(bold=True, color="FFFFFF")
+    ws2["B1"].font = Font(bold=True, color="FFFFFF")
+    ws2["A1"].fill = PatternFill("solid", fgColor="1A1A2E")
+    ws2["B1"].fill = PatternFill("solid", fgColor="1A1A2E")
+    ws2.column_dimensions["A"].width = 35
+    ws2.column_dimensions["B"].width = 35
+
+    conn = obtener_conexion()
+    if conn:
+        try:
+            cur = conn.cursor(dictionary=True)
+            cur.execute("SELECT nombre, correo FROM usuarios WHERE activo = 1 ORDER BY nombre")
+            for i, u in enumerate(cur.fetchall(), start=2):
+                ws2.cell(row=i, column=1, value=u.get('nombre') or '')
+                ws2.cell(row=i, column=2, value=u.get('correo') or '')
+        finally:
+            conn.close()
+
+    # ── Hoja 3: Valores válidos ──────────────────────────────────────────────
+    ws3 = wb.create_sheet("Valores válidos")
+    secciones = [
+        ("Estatus del ticket",    ESTATUSES_VALIDOS),
+        ("Estatus de la pieza",   ESTATUSES_PIEZA_VALIDOS),
+        ("Marcas válidas",        MARCAS_VALIDAS),
+    ]
+    col_offset = 1
+    for titulo, valores in secciones:
+        ws3.cell(row=1, column=col_offset, value=titulo).font = Font(bold=True)
+        for i, v in enumerate(valores, start=2):
+            ws3.cell(row=i, column=col_offset, value=v)
+        ws3.column_dimensions[get_column_letter(col_offset)].width = 25
+        col_offset += 2
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    return send_file(
+        buf,
+        as_attachment=True,
+        download_name="plantilla_importacion_garantias.xlsx",
+        mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
+
+
+@garantias_bp.route("/importar", methods=["POST"])
+def importar_garantias():
+    """Recibe el Excel completado y hace la inserción masiva."""
+    from openpyxl import load_workbook
+
+    _, err = _requiere_admin(request)
+    if err:
+        return err
+
+    if 'archivo' not in request.files:
+        return jsonify({"error": "No se recibió archivo"}), 400
+
+    file = request.files['archivo']
+    if not file.filename or not file.filename.lower().endswith('.xlsx'):
+        return jsonify({"error": "El archivo debe ser .xlsx"}), 400
+
+    try:
+        wb = load_workbook(filename=io.BytesIO(file.read()), data_only=True)
+    except Exception as e:
+        return jsonify({"error": f"No se pudo leer el Excel: {e}"}), 400
+
+    ws = wb["Importar"] if "Importar" in wb.sheetnames else wb.active
+
+    # Cargar usuarios del sistema para mapeo nombre → correo
+    conn = obtener_conexion()
+    if not conn:
+        return jsonify({"error": "Sin conexión a BD"}), 500
+
+    try:
+        cur = conn.cursor(dictionary=True)
+        cur.execute("SELECT id, nombre, correo FROM usuarios WHERE activo = 1")
+        usuarios_db = cur.fetchall()
+    finally:
+        conn.close()
+
+    # Índice nombre_normalizado → correo
+    def _norm(s):
+        return str(s or '').strip().lower()
+
+    usuarios_idx = {_norm(u['nombre']): u['correo'] for u in usuarios_db}
+
+    insertados = 0
+    errores    = []
+    filas_datos = list(ws.iter_rows(min_row=4, values_only=True))  # fila 1=instrucción, 2=header, 3=ejemplo
+
+    conn = obtener_conexion()
+    if not conn:
+        return jsonify({"error": "Sin conexión a BD"}), 500
+
+    try:
+        cursor = conn.cursor()
+
+        for fila_num, row in enumerate(filas_datos, start=4):
+            # Ignorar filas completamente vacías
+            if all(c is None or str(c).strip() == '' for c in row):
+                continue
+
+            def cel(idx):
+                v = row[idx] if idx < len(row) else None
+                return str(v).strip() if v is not None else ''
+
+            distribuidor    = cel(1)
+            contacto        = cel(2)
+            puesto          = cel(3)
+            marca           = cel(4)
+            modelo          = cel(5)
+            descripcion     = cel(6)
+            estatus         = cel(7) or 'Enviado'
+            estatus_pieza   = cel(8) or 'Sin pieza'
+            pieza_reemplazo = cel(9)
+            fecha_registro  = cel(10)
+            fecha_atencion  = cel(11)
+            fecha_cierre    = cel(12)
+            asignado_a      = cel(13)
+
+            # Validaciones obligatorias
+            fila_err = []
+            if not distribuidor:  fila_err.append("Falta distribuidor")
+            if not contacto:      fila_err.append("Falta contacto")
+            if not marca:         fila_err.append("Falta marca")
+            if not descripcion:   fila_err.append("Falta descripción del daño")
+            if not fecha_registro: fila_err.append("Falta fecha de registro")
+            if estatus not in ESTATUSES_VALIDOS:
+                fila_err.append(f"Estatus inválido: '{estatus}'")
+
+            # Parsear fecha_registro
+            fecha_creacion_dt = None
+            if fecha_registro:
+                for fmt in ('%Y-%m-%d', '%d/%m/%Y', '%d-%m-%Y'):
+                    try:
+                        fecha_creacion_dt = datetime.strptime(fecha_registro, fmt)
+                        break
+                    except ValueError:
+                        continue
+                if not fecha_creacion_dt:
+                    fila_err.append(f"Fecha de registro inválida: '{fecha_registro}' (use YYYY-MM-DD)")
+
+            if fila_err:
+                errores.append({"fila": fila_num, "errores": fila_err})
+                continue
+
+            # Resolver email del asignado
+            email_ticket = ''
+            if asignado_a:
+                email_ticket = usuarios_idx.get(_norm(asignado_a), '')
+                if not email_ticket:
+                    errores.append({
+                        "fila": fila_num,
+                        "errores": [f"Usuario '{asignado_a}' no encontrado — ticket importado sin asignar"]
+                    })
+
+            # Construir JSON de datos del formulario
+            datos_json = json.dumps({
+                "distribuidor":     distribuidor,
+                "contacto":         contacto,
+                "puesto":           puesto,
+                "marca":            marca,
+                "modelo":           modelo,
+                "descripcion_dano": descripcion,
+                "importado":        True,
+            }, ensure_ascii=False)
+
+            # Insertar registro principal
+            cursor.execute("""
+                INSERT INTO garantia_formularios
+                    (email, distribuidor, contacto, puesto, marca,
+                     datos, estatus, estatus_pieza, pieza_reemplazo, fecha_creacion)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            """, (
+                email_ticket, distribuidor, contacto, puesto, marca,
+                datos_json, estatus,
+                estatus_pieza if estatus_pieza in ESTATUSES_PIEZA_VALIDOS else 'Sin pieza',
+                pieza_reemplazo or None,
+                fecha_creacion_dt,
+            ))
+            new_id = cursor.lastrowid
+            folio  = f"GAR-{new_id:04d}"
+            cursor.execute("UPDATE garantia_formularios SET folio = %s WHERE id = %s", (folio, new_id))
+
+            # Fecha de cierre → fecha_actualizacion si estatus es terminal
+            if fecha_cierre and estatus in ('Cerrado', 'Rechazado'):
+                for fmt in ('%Y-%m-%d', '%d/%m/%Y', '%d-%m-%Y'):
+                    try:
+                        dt_cierre = datetime.strptime(fecha_cierre, fmt)
+                        cursor.execute(
+                            "UPDATE garantia_formularios SET fecha_actualizacion = %s WHERE id = %s",
+                            (dt_cierre, new_id)
+                        )
+                        break
+                    except ValueError:
+                        continue
+
+            # Fecha de atención → comentario tipo 'validacion' para la latencia
+            if fecha_atencion:
+                for fmt in ('%Y-%m-%d', '%d/%m/%Y', '%d-%m-%Y'):
+                    try:
+                        dt_atencion = datetime.strptime(fecha_atencion, fmt)
+                        cursor.execute("""
+                            INSERT INTO garantia_comentarios (formulario_id, autor, texto, tipo, fecha)
+                            VALUES (%s, %s, %s, %s, %s)
+                        """, (new_id, 'Sistema', 'Documentos validados (importación histórica)', 'validacion', dt_atencion))
+                        break
+                    except ValueError:
+                        continue
+
+            insertados += 1
+
+        conn.commit()
+        return jsonify({
+            "ok":        True,
+            "insertados": insertados,
+            "errores":   errores,
+            "mensaje":   f"{insertados} tickets importados correctamente" + (f", {len(errores)} con advertencias" if errores else ""),
+        })
+
+    except Exception as e:
+        conn.rollback()
+        logging.exception("Error en importación masiva de garantías: %s", e)
         return jsonify({"error": str(e)}), 500
     finally:
         conn.close()
