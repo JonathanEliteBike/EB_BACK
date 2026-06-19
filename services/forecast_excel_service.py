@@ -317,16 +317,17 @@ def list_excel_products(search: str = '', limit: int = 100, offset: int = 0) -> 
     cur = conn.cursor(dictionary=True)
     try:
         if search:
+            like = f'%{search}%'
             cur.execute("""
                 SELECT sku, nombre, color, talla, cargado_en, actualizado_en
                 FROM forecast_excel_productos
                 WHERE origen = 'excel' AND (
-                    sku = %s
-                    OR MATCH(nombre) AGAINST(%s IN BOOLEAN MODE)
+                    sku LIKE %s
+                    OR nombre LIKE %s
                 )
                 ORDER BY cargado_en DESC
                 LIMIT %s OFFSET %s
-            """, (search, search, limit, offset))
+            """, (like, like, limit, offset))
         else:
             cur.execute("""
                 SELECT sku, nombre, color, talla, cargado_en, actualizado_en
@@ -340,14 +341,15 @@ def list_excel_products(search: str = '', limit: int = 100, offset: int = 0) -> 
 
         # Total count
         if search:
+            like = f'%{search}%'
             cur.execute("""
                 SELECT COUNT(*) as cnt
                 FROM forecast_excel_productos
                 WHERE origen = 'excel' AND (
-                    sku = %s
-                    OR MATCH(nombre) AGAINST(%s IN BOOLEAN MODE)
+                    sku LIKE %s
+                    OR nombre LIKE %s
                 )
-            """, (search, search))
+            """, (like, like))
         else:
             cur.execute("SELECT COUNT(*) as cnt FROM forecast_excel_productos WHERE origen = 'excel'")
 
