@@ -3568,7 +3568,7 @@ def actualizar_forecast(fid):
         conn.close()
 
 
-_SEARCH_PAGE       = 50    # fallback general
+_SEARCH_PAGE       = 500   # fallback general — suficiente para mostrar todos sin paginación
 _SEARCH_PAGE_WL    = 2000  # whitelist: todos los SKUs Megamo+Scott en una sola página
 
 # Alias map for Spanish plural/variant forms that don't match DB names
