@@ -737,10 +737,17 @@ def _ensure_catalogo_table():
                 marca VARCHAR(255),
                 color VARCHAR(255),
                 talla VARCHAR(255),
-                actualizado_en DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+                actualizado_en DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                FULLTEXT INDEX idx_ft_nombre_producto (nombre_producto)
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
         """)
         conn.commit()
+        # Migración: agregar FULLTEXT si la tabla ya existía sin él
+        try:
+            cur.execute("ALTER TABLE odoo_catalogo ADD FULLTEXT INDEX idx_ft_nombre_producto (nombre_producto)")
+            conn.commit()
+        except Exception:
+            conn.rollback()  # índice ya existe, ignorar
     except Exception as e:
         logging.warning('[forecast] Could not ensure odoo_catalogo table: %s', e)
     finally:
@@ -781,8 +788,9 @@ def _ensure_excel_producto_table():
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
         """)
         conn.commit()
-        # Agregar columnas marca/modelo si la tabla ya existía sin ellas
+        # Agregar columnas si la tabla ya existía sin ellas
         for col_sql in [
+            "ALTER TABLE forecast_excel_productos ADD COLUMN origen VARCHAR(50) DEFAULT 'excel'",
             "ALTER TABLE forecast_excel_productos ADD COLUMN marca  VARCHAR(120) DEFAULT NULL",
             "ALTER TABLE forecast_excel_productos ADD COLUMN modelo VARCHAR(255) DEFAULT NULL",
             "ALTER TABLE forecast_excel_productos ADD COLUMN categoria VARCHAR(255) DEFAULT NULL",
@@ -3766,31 +3774,19 @@ def buscar_producto():
         use_whitelist = cur.fetchone()['cnt'] > 0
 
         if use_whitelist:
-            # Condición AND por cada token en la query INTERNA (usa columnas reales + FULLTEXT)
+            # Condición AND por cada token — LIKE en todas las columnas relevantes
             inner_conds  = []
             inner_params = []
             for tok in tokens:
                 lk = f'%{tok.upper()}%'
-                if len(tok) >= 3:
-                    # FULLTEXT en nombre_producto es 10x más rápido que LIKE %x%
-                    tok_ft = f'+{tok}*'
-                    inner_conds.append(
-                        "(MATCH(oc.nombre_producto) AGAINST(%s IN BOOLEAN MODE) "
-                        "OR UPPER(oc.referencia_interna) LIKE %s "
-                        "OR UPPER(COALESCE(oc.marca,'')) LIKE %s "
-                        "OR UPPER(COALESCE(oc.color,'')) LIKE %s "
-                        "OR UPPER(COALESCE(oc.talla,'')) LIKE %s)"
-                    )
-                    inner_params.extend([tok_ft, lk, lk, lk, lk])
-                else:
-                    inner_conds.append(
-                        "(UPPER(oc.nombre_producto) LIKE %s "
-                        "OR UPPER(oc.referencia_interna) LIKE %s "
-                        "OR UPPER(COALESCE(oc.marca,'')) LIKE %s "
-                        "OR UPPER(COALESCE(oc.color,'')) LIKE %s "
-                        "OR UPPER(COALESCE(oc.talla,'')) LIKE %s)"
-                    )
-                    inner_params.extend([lk, lk, lk, lk, lk])
+                inner_conds.append(
+                    "(UPPER(oc.nombre_producto) LIKE %s "
+                    "OR UPPER(oc.referencia_interna) LIKE %s "
+                    "OR UPPER(COALESCE(oc.marca,'')) LIKE %s "
+                    "OR UPPER(COALESCE(oc.color,'')) LIKE %s "
+                    "OR UPPER(COALESCE(oc.talla,'')) LIKE %s)"
+                )
+                inner_params.extend([lk, lk, lk, lk, lk])
 
             inner_where = ' AND '.join(inner_conds)
 
