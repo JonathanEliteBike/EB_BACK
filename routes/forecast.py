@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 """
 Forecast / Proyecciones B2B
 Gestión del forecast anual de compra por distribuidor.
@@ -8,6 +8,7 @@ from flask import Blueprint, jsonify, request, send_file
 from db_conexion import obtener_conexion
 from services.forecast_excel_service import (
     load_excel_products,
+    load_csv_apparel_products,
     list_excel_products,
     delete_excel_product,
     clear_excel_catalog,
@@ -784,6 +785,12 @@ def _ensure_excel_producto_table():
         for col_sql in [
             "ALTER TABLE forecast_excel_productos ADD COLUMN marca  VARCHAR(120) DEFAULT NULL",
             "ALTER TABLE forecast_excel_productos ADD COLUMN modelo VARCHAR(255) DEFAULT NULL",
+            "ALTER TABLE forecast_excel_productos ADD COLUMN categoria VARCHAR(255) DEFAULT NULL",
+            "ALTER TABLE forecast_excel_productos ADD COLUMN precio_distribuidor DECIMAL(10,2) DEFAULT NULL",
+            "ALTER TABLE forecast_excel_productos ADD COLUMN precio_partner DECIMAL(10,2) DEFAULT NULL",
+            "ALTER TABLE forecast_excel_productos ADD COLUMN precio_partner_elite DECIMAL(10,2) DEFAULT NULL",
+            "ALTER TABLE forecast_excel_productos ADD COLUMN precio_partner_elite_plus DECIMAL(10,2) DEFAULT NULL",
+            "ALTER TABLE forecast_excel_productos ADD COLUMN precio_publico DECIMAL(10,2) DEFAULT NULL",
         ]:
             try:
                 cur.execute(col_sql)
@@ -827,8 +834,13 @@ def _ensure_sku_whitelist_table():
 _ensure_sku_whitelist_table()
 
 
+_whitelist_db_loaded = False
+
 def _update_whitelist_skus():
-    """Populate forecast_sku_whitelist table with FORECAST_SKU_WHITELIST."""
+    """Populate forecast_sku_whitelist table with FORECAST_SKU_WHITELIST (cached once per process)."""
+    global _whitelist_db_loaded
+    if _whitelist_db_loaded:
+        return
     conn = _safe_obtener_conexion()
     if conn is None:
         return
@@ -841,6 +853,7 @@ def _update_whitelist_skus():
             cur.execute("INSERT IGNORE INTO forecast_sku_whitelist (sku) VALUES (%s)", (sku,))
         conn.commit()
         logging.info('[whitelist] Updated with %d SKUs', len(FORECAST_SKU_WHITELIST))
+        _whitelist_db_loaded = True
     except Exception as e:
         logging.warning('[whitelist] Error updating: %s', e)
         conn.rollback()
@@ -2640,6 +2653,11 @@ def listar_forecast():
                  COALESCE(f.noviembre, 0) + COALESCE(f.diciembre, 0) + COALESCE(f.enero, 0) +
                  COALESCE(f.febrero, 0) + COALESCE(f.marzo, 0) + COALESCE(f.abril, 0)) AS total,
                 CASE WHEN p.referencia_interna IS NOT NULL THEN 'whitelist' ELSE 'excel' END AS fuente,
+                ep.precio_distribuidor,
+                ep.precio_partner,
+                ep.precio_partner_elite,
+                ep.precio_partner_elite_plus,
+                ep.precio_publico AS ep_precio_publico,
                 f.actualizado_en
             FROM forecast_proyecciones f
             LEFT JOIN odoo_catalogo p          ON p.referencia_interna = f.sku
@@ -2700,30 +2718,47 @@ def listar_forecast():
             except Exception as _ep:
                 logging.warning('[forecast] No se pudo obtener precio publico: %s', _ep)
 
+        _TIER_TO_EP_COL = {
+            'Partner Elite Plus!': 'precio_partner_elite_plus',
+            'Partner Elite':       'precio_partner_elite',
+            'Partner':             'precio_partner',
+            'Distribuidor':        'precio_distribuidor',
+        }
         if partner_pricelist_id and all_skus:
-            # Precios desde la lista de precios del distribuidor en Odoo
             raw_prices = _get_single_pricelist_prices(partner_pricelist_id, all_skus)
             for r in rows:
                 sku = r.get('sku') or ''
                 raw = raw_prices.get(sku, 0.0)
                 if not raw:
-                    # Fallback a SKU_CATALOG (Scott MY27)
                     cat_p = SKU_CATALOG.get(sku, {}).get('prices', {})
                     raw = cat_p.get(tier, cat_p.get('Distribuidor', 0.0))
-                r['precio']          = round(raw * IVA_FACTOR, 2)
-                r['nivel_precio']    = partner_pricelist_name or tier
-                r['precio_publico']  = round(pub_prices[sku] * IVA_FACTOR, 2) if pub_prices.get(sku) else None
+                if not raw and r.get('fuente') == 'excel':
+                    raw = float(r.get(_TIER_TO_EP_COL.get(tier, 'precio_distribuidor')) or 0)
+                r['precio']       = round(float(raw) * IVA_FACTOR, 2)
+                r['nivel_precio'] = partner_pricelist_name or tier
+                if pub_prices.get(sku):
+                    r['precio_publico'] = round(float(pub_prices[sku]) * IVA_FACTOR, 2)
+                elif r.get('fuente') == 'excel' and r.get('ep_precio_publico'):
+                    r['precio_publico'] = round(float(r['ep_precio_publico']) * IVA_FACTOR, 2)
+                else:
+                    r['precio_publico'] = None
                 if r.get('actualizado_en'):
                     r['actualizado_en'] = r['actualizado_en'].isoformat()
         else:
-            # Sin conexión Odoo: usar SKU_CATALOG con el tier del distribuidor
             for r in rows:
                 sku = r.get('sku') or ''
                 cat_p = SKU_CATALOG.get(sku, {}).get('prices', {})
                 raw   = cat_p.get(tier, cat_p.get('Distribuidor', 0.0))
-                r['precio']          = round(raw * IVA_FACTOR, 2)
-                r['nivel_precio']    = tier
-                r['precio_publico']  = round(pub_prices[sku] * IVA_FACTOR, 2) if pub_prices.get(sku) else None
+                if not raw and r.get('fuente') == 'excel':
+                    raw = float(r.get(_TIER_TO_EP_COL.get(tier, 'precio_distribuidor')) or 0)
+                r['precio']       = round(float(raw) * IVA_FACTOR, 2)
+                r['nivel_precio'] = tier
+                if pub_prices.get(sku):
+                    r['precio_publico'] = round(float(pub_prices[sku]) * IVA_FACTOR, 2)
+                elif r.get('fuente') == 'excel' and r.get('ep_precio_publico'):
+                    r['precio_publico'] = round(float(r['ep_precio_publico']) * IVA_FACTOR, 2)
+                else:
+                    r['precio_publico'] = None
                 if r.get('actualizado_en'):
                     r['actualizado_en'] = r['actualizado_en'].isoformat()
 
@@ -2832,6 +2867,36 @@ def precios_catalogo():
             nivel_precio = tier
     except Exception as e:
         logging.warning('[precios-catalogo] precio distribuidor error: %s', e)
+
+    # Incluir precios de productos apparel (forecast_excel_productos) segun tier
+    _ep_tier_col = {
+        'Partner Elite Plus!': 'precio_partner_elite_plus',
+        'Partner Elite':       'precio_partner_elite',
+        'Partner':             'precio_partner',
+        'Distribuidor':        'precio_distribuidor',
+    }
+    ep_col = _ep_tier_col.get(tier, 'precio_distribuidor')
+    try:
+        conn_ep = obtener_conexion()
+        cur_ep  = conn_ep.cursor(dictionary=True)
+        cur_ep.execute(f"""
+            SELECT sku, {ep_col} AS precio_dist, precio_publico
+            FROM forecast_excel_productos
+            WHERE origen = 'excel'
+              AND {ep_col} IS NOT NULL
+        """)
+        for ep_row in cur_ep.fetchall():
+            ep_sku = ep_row['sku']
+            if ep_sku not in precios:
+                precios[ep_sku] = {}
+            if ep_row.get('precio_dist'):
+                precios[ep_sku]['precio'] = round(float(ep_row['precio_dist']) * IVA_FACTOR, 2)
+            if ep_row.get('precio_publico'):
+                precios[ep_sku]['precio_publico'] = round(float(ep_row['precio_publico']) * IVA_FACTOR, 2)
+        cur_ep.close()
+        conn_ep.close()
+    except Exception as _eep:
+        logging.warning('[precios-catalogo] Excel apparel prices error: %s', _eep)
 
     return jsonify({'precios': precios, 'nivel_precio': nivel_precio}), 200
 
@@ -3577,6 +3642,46 @@ def cargar_catalogo_excel():
     }), 200
 
 
+@forecast_bp.route('/forecast/importar-csv-apparel', methods=['POST'])
+def importar_csv_apparel():
+    """
+    POST /forecast/importar-csv-apparel  (multipart/form-data)
+    Field: file (.csv) con columnas:
+      MARCA, GENERIC, COLOUR CODE, SIZE CODE, VARIANT,
+      GENERIC DESCRIPTION (ignorado), MODEL, COLOUR DESCRIPTION, SIZE DESCRIPTION
+
+    Importa masivamente productos de apparel (ropa) que no existen en Odoo.
+    Los SKUs quedan disponibles inmediatamente en buscar-producto y en forecast.
+    """
+    archivo = request.files.get('file')
+    if not archivo:
+        return jsonify({'error': 'Falta el archivo (field: file)'}), 400
+
+    ext = (archivo.filename or '').rsplit('.', 1)[-1].lower()
+    if ext != 'csv':
+        return jsonify({'error': 'El archivo debe ser CSV (.csv)'}), 400
+
+    content = archivo.read()
+
+    # Intentar UTF-8 con BOM primero; si falla, latin-1
+    for enc in ('utf-8-sig', 'utf-8', 'latin-1'):
+        result = load_csv_apparel_products(content, encoding=enc)
+        if result.get('success') or result.get('total_filas_procesadas', 0) > 0:
+            break
+        if 'Columnas requeridas' in result.get('message', ''):
+            break  # error de estructura, no de encoding
+
+    if not result['success']:
+        return jsonify({'error': result.get('message', 'Error al procesar el CSV')}), 422
+
+    return jsonify({
+        'cargados':                result['cargados'],
+        'total_filas_procesadas':  result['total_filas_procesadas'],
+        'duplicados_actualizados': result['duplicados_actualizados'],
+        'advertencias':            result.get('errores', []),
+    }), 200
+
+
 @forecast_bp.route('/forecast/catalogo-excel', methods=['GET'])
 def estado_catalogo_excel():
     """GET /forecast/catalogo-excel — total de productos cargados desde Excel."""
@@ -3661,19 +3766,35 @@ def buscar_producto():
         use_whitelist = cur.fetchone()['cnt'] > 0
 
         if use_whitelist:
-            # Condición AND por cada token: todos deben aparecer en algún campo
-            tok_conds  = []
-            tok_params = []
+            # Condición AND por cada token en la query INTERNA (usa columnas reales + FULLTEXT)
+            inner_conds  = []
+            inner_params = []
             for tok in tokens:
                 lk = f'%{tok.upper()}%'
-                tok_conds.append(
-                    "(UPPER(nombre_src) LIKE %s OR UPPER(sku) LIKE %s OR UPPER(marca) LIKE %s OR UPPER(odoo_color) LIKE %s OR UPPER(odoo_talla) LIKE %s)"
-                )
-                tok_params.extend([lk, lk, lk, lk, lk])
+                if len(tok) >= 3:
+                    # FULLTEXT en nombre_producto es 10x más rápido que LIKE %x%
+                    tok_ft = f'+{tok}*'
+                    inner_conds.append(
+                        "(MATCH(oc.nombre_producto) AGAINST(%s IN BOOLEAN MODE) "
+                        "OR UPPER(oc.referencia_interna) LIKE %s "
+                        "OR UPPER(COALESCE(oc.marca,'')) LIKE %s "
+                        "OR UPPER(COALESCE(oc.color,'')) LIKE %s "
+                        "OR UPPER(COALESCE(oc.talla,'')) LIKE %s)"
+                    )
+                    inner_params.extend([tok_ft, lk, lk, lk, lk])
+                else:
+                    inner_conds.append(
+                        "(UPPER(oc.nombre_producto) LIKE %s "
+                        "OR UPPER(oc.referencia_interna) LIKE %s "
+                        "OR UPPER(COALESCE(oc.marca,'')) LIKE %s "
+                        "OR UPPER(COALESCE(oc.color,'')) LIKE %s "
+                        "OR UPPER(COALESCE(oc.talla,'')) LIKE %s)"
+                    )
+                    inner_params.extend([lk, lk, lk, lk, lk])
 
-            where_sql = ' AND '.join(tok_conds)
+            inner_where = ' AND '.join(inner_conds)
 
-            # Subquery GROUP BY elimina duplicados en odoo_catalogo para el mismo (sku, color, talla)
+            # WHERE en la query INTERNA permite usar el índice FULLTEXT antes del GROUP BY
             cur.execute(f"""
                 SELECT sku, nombre_src, categoria, marca, odoo_color, odoo_talla
                 FROM (
@@ -3686,16 +3807,16 @@ def buscar_producto():
                         COALESCE(NULLIF(TRIM(oc.talla), ''), 'N/A')             AS odoo_talla
                     FROM odoo_catalogo oc
                     INNER JOIN forecast_sku_whitelist wl ON wl.sku = oc.referencia_interna
+                    WHERE {inner_where}
                     GROUP BY oc.referencia_interna,
                              COALESCE(NULLIF(TRIM(oc.color), ''), 'N/A'),
                              COALESCE(NULLIF(TRIM(oc.talla), ''), 'N/A')
                 ) AS deduped
-                WHERE {where_sql}
                 ORDER BY
                     CASE WHEN sku = %s THEN 0 ELSE 1 END,
                     nombre_src
                 LIMIT %s OFFSET %s
-            """, (*tok_params, q_first, _SEARCH_PAGE_WL + 1, offset))
+            """, (*inner_params, q_first, _SEARCH_PAGE_WL + 1, offset))
             rows     = cur.fetchall()
             has_more = len(rows) > _SEARCH_PAGE_WL
             rows     = rows[:_SEARCH_PAGE_WL]
@@ -3731,8 +3852,8 @@ def buscar_producto():
                 WHERE origen = 'excel'
                   AND {fb_conds2}
                 ORDER BY CASE WHEN sku = %s THEN 0 ELSE 1 END, nombre
-                LIMIT %s
-            """, (*fb_params2, q_first, _SEARCH_PAGE + 1))
+                LIMIT %s OFFSET %s
+            """, (*fb_params2, q_first, _SEARCH_PAGE + 1, offset))
             excel_rows = cur.fetchall()
             has_more = has_more or len(excel_rows) > _SEARCH_PAGE
             excel_rows = excel_rows[:_SEARCH_PAGE]
