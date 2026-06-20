@@ -737,11 +737,21 @@ def _ensure_catalogo_table():
                 marca VARCHAR(255),
                 color VARCHAR(255),
                 talla VARCHAR(255),
+                lst_price DECIMAL(12,2) DEFAULT NULL,
                 actualizado_en DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
                 FULLTEXT INDEX idx_ft_nombre_producto (nombre_producto)
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
         """)
         conn.commit()
+        # Migraciones para tablas ya existentes
+        for _mig in [
+            "ALTER TABLE odoo_catalogo ADD COLUMN lst_price DECIMAL(12,2) DEFAULT NULL",
+        ]:
+            try:
+                cur.execute(_mig)
+                conn.commit()
+            except Exception:
+                conn.rollback()
         # Migración: agregar FULLTEXT si la tabla ya existía sin él
         try:
             cur.execute("ALTER TABLE odoo_catalogo ADD FULLTEXT INDEX idx_ft_nombre_producto (nombre_producto)")
@@ -887,7 +897,8 @@ def _get_whitelist_products() -> list:
         placeholders = ','.join(['%s'] * len(all_skus))
         cur.execute(f"""
             SELECT referencia_interna AS sku, nombre_producto AS nombre,
-                   categoria, marca, color, talla
+                   categoria, marca, color, talla,
+                   COALESCE(lst_price, 0) AS lst_price
             FROM odoo_catalogo
             WHERE referencia_interna IN ({placeholders})
             ORDER BY marca, nombre_producto
@@ -900,12 +911,13 @@ def _get_whitelist_products() -> list:
             cat    = r.get('categoria') or ''
             modelo = cat.split(' / ')[-1].strip() if ' / ' in cat else ''
             result.append({
-                'sku':      r['sku'] or '',
-                'producto': (r.get('nombre') or '').strip(),
-                'marca':    (r.get('marca') or '').strip(),
-                'modelo':   modelo,
-                'color':    (r.get('color') or '').upper().strip(),
-                'talla':    (r.get('talla') or '').upper().strip(),
+                'sku':       r['sku'] or '',
+                'producto':  (r.get('nombre') or '').strip(),
+                'marca':     (r.get('marca') or '').strip(),
+                'modelo':    modelo,
+                'color':     (r.get('color') or '').upper().strip(),
+                'talla':     (r.get('talla') or '').upper().strip(),
+                'lst_price': float(r.get('lst_price') or 0.0),
             })
         for sku in all_skus:
             if sku not in found_skus:
@@ -1180,7 +1192,7 @@ def _sync_catalogo_odoo_task():
                 'product.product', 'search_read',
                 [[['active', '=', True]]],
                 {'fields': ['id', 'default_code', 'name', 'categ_id',
-                            'product_template_attribute_value_ids'],
+                            'product_template_attribute_value_ids', 'lst_price'],
                  'limit': batch_size, 'offset': offset,
                  'order': 'id asc'}
             )
@@ -1230,20 +1242,22 @@ def _sync_catalogo_odoo_task():
                         color = pv['val']
                     elif any(k in pv['attr'] for k in ('TALLA', 'TAMAÑO', 'SIZE', 'TAMA')):
                         talla = pv['val']
-                rows.append((ref, nombre, categoria, marca, color, talla))
+                lst_price = float(p.get('lst_price') or 0.0)
+                rows.append((ref, nombre, categoria, marca, color, talla, lst_price))
 
             if rows:
                 cur.executemany(
                     """
                     INSERT INTO odoo_catalogo
-                        (referencia_interna, nombre_producto, categoria, marca, color, talla)
-                    VALUES (%s, %s, %s, %s, %s, %s)
+                        (referencia_interna, nombre_producto, categoria, marca, color, talla, lst_price)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s)
                     ON DUPLICATE KEY UPDATE
                         nombre_producto = VALUES(nombre_producto),
                         categoria       = VALUES(categoria),
                         marca           = VALUES(marca),
                         color           = VALUES(color),
                         talla           = VALUES(talla),
+                        lst_price       = VALUES(lst_price),
                         actualizado_en  = NOW()
                     """,
                     rows
@@ -1470,18 +1484,39 @@ def descargar_template():
     products = [p for p in _get_whitelist_products()
                 if (p.get('marca') or '').upper() == 'MEGAMO']
 
-    # Precios de Odoo para los productos Megamo
-    skus   = [p['sku'] for p in products]
-    prices = _get_odoo_prices_for_skus(skus) if skus else {}
+    # Precios: Odoo pricelists → SKU_CATALOG → lst_price del catálogo → factores estándar Megamo
+    skus        = [p['sku'] for p in products]
+    prices      = _get_odoo_prices_for_skus(skus) if skus else {}
+    # Mapa sku → lst_price del catálogo sincronizado (ya en products)
+    catalog_lsp = {p['sku']: p.get('lst_price', 0.0) for p in products}
 
-    # Fusionar con SKU_CATALOG como fallback (por si algún SKU no tiene precio en Odoo)
+    # Factores de descuento estándar Megamo (derivados de SKU_CATALOG)
+    _MEGAMO_TIER_FACTORS = {
+        'Partner Elite Plus!': 0.695,
+        'Partner Elite':       0.715,
+        'Partner':             0.740,
+        'Distribuidor':        0.760,
+    }
+
     for sku in skus:
         cat_entry  = SKU_CATALOG.get(sku, {})
         cat_prices = cat_entry.get('prices', {})
         odoo_entry = prices.get(sku, {})
+
+        # 1° Odoo pricelists (ya en odoo_entry), 2° SKU_CATALOG, 3° lst_price del catálogo
         for key in ['list_price'] + TIER_NAMES:
             if not odoo_entry.get(key):
                 odoo_entry[key] = cat_prices.get(key, 0.0)
+        if not odoo_entry.get('list_price'):
+            odoo_entry['list_price'] = catalog_lsp.get(sku, 0.0)
+
+        # 4° Fallback: si tenemos precio público pero faltan tiers, calcular con factores Megamo
+        lp = odoo_entry.get('list_price', 0.0)
+        if lp > 0:
+            for tier, factor in _MEGAMO_TIER_FACTORS.items():
+                if not odoo_entry.get(tier):
+                    odoo_entry[tier] = round(lp * factor, 2)
+
         prices[sku] = odoo_entry
 
     # ── Índices de columnas (1-based) ──────────────────────────────────────────
