@@ -1887,7 +1887,8 @@ def descargar_template_global():
     current_year = datetime.now().year
     periodo = f"{current_year}-{current_year + 1}"
 
-    products    = _get_whitelist_products()
+    products    = [p for p in _get_whitelist_products()
+                   if (p.get('marca') or '').upper() == 'MEGAMO']
     skus        = [p['sku'] for p in products]
     prices      = _get_odoo_prices_for_skus(skus) if skus else {}
     catalog_lsp = {p['sku']: p.get('lst_price', 0.0) for p in products}
