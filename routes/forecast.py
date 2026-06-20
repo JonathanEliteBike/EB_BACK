@@ -1517,6 +1517,12 @@ def descargar_template():
                 if not odoo_entry.get(tier):
                     odoo_entry[tier] = round(lp * factor, 2)
 
+        # 5° Último recurso: back-calcular PVP desde precio Distribuidor (Megamo: 76% del PVP)
+        if not odoo_entry.get('list_price'):
+            dist_price = float(odoo_entry.get('Distribuidor') or 0)
+            if dist_price > 0:
+                odoo_entry['list_price'] = round(dist_price / 0.760, 2)
+
         prices[sku] = odoo_entry
 
     # ── Índices de columnas (1-based) ──────────────────────────────────────────
@@ -1866,11 +1872,19 @@ def descargar_template_global():
     current_year = datetime.now().year
     periodo = f"{current_year}-{current_year + 1}"
 
-    products = _get_whitelist_products()
-    skus     = [p['sku'] for p in products]
-    prices   = _get_odoo_prices_for_skus(skus) if skus else {}
+    products    = _get_whitelist_products()
+    skus        = [p['sku'] for p in products]
+    prices      = _get_odoo_prices_for_skus(skus) if skus else {}
+    catalog_lsp = {p['sku']: p.get('lst_price', 0.0) for p in products}
 
-    # Fusionar con SKU_CATALOG
+    _MEG_FACTORS = {
+        'Partner Elite Plus!': 0.695,
+        'Partner Elite':       0.715,
+        'Partner':             0.740,
+        'Distribuidor':        0.760,
+    }
+
+    # Fallback completo: Odoo → SKU_CATALOG → lst_price → factores Megamo → back-calc desde Dist.
     for sku in skus:
         cat_entry  = SKU_CATALOG.get(sku, {})
         cat_prices = cat_entry.get('prices', {})
@@ -1878,6 +1892,17 @@ def descargar_template_global():
         for key in ['list_price'] + TIER_NAMES:
             if not odoo_entry.get(key):
                 odoo_entry[key] = cat_prices.get(key, 0.0)
+        if not odoo_entry.get('list_price'):
+            odoo_entry['list_price'] = catalog_lsp.get(sku, 0.0)
+        lp = float(odoo_entry.get('list_price') or 0)
+        if lp > 0:
+            for tier, factor in _MEG_FACTORS.items():
+                if not odoo_entry.get(tier):
+                    odoo_entry[tier] = round(lp * factor, 2)
+        if not odoo_entry.get('list_price'):
+            dist_price = float(odoo_entry.get('Distribuidor') or 0)
+            if dist_price > 0:
+                odoo_entry['list_price'] = round(dist_price / 0.760, 2)
         prices[sku] = odoo_entry
 
     # ── Índices de columnas (igual que template())
@@ -1964,6 +1989,7 @@ def descargar_template_global():
     tc.alignment = center
 
     # ── Fila 3: Encabezados de columnas ─────────────────────────────────────────────
+    _BLOCKED_LBL = {'May', 'Jun'}
     ws.row_dimensions[3].height = 22
     ALL_HEADERS = CAMPOS_INFO + ['Precio Público', 'Precio'] + MESES_LABELS + ['TOTAL', 'Total $']
     for ci, h in enumerate(ALL_HEADERS, start=1):
@@ -1979,26 +2005,36 @@ def descargar_template_global():
         elif h in ('TOTAL', 'Total $'):
             cell.fill = PatternFill('solid', fgColor=ORANGE)
             cell.font = Font(bold=True, color='FF000000', size=10)
+        elif h in _BLOCKED_LBL:
+            cell.fill  = PatternFill('solid', fgColor='FF2E2E2E')
+            cell.font  = Font(bold=True, color='FF666666', size=10)
+            cell.value = f'{h}\n⛔'
         else:
             cell.fill = PatternFill('solid', fgColor=ORANGE)
             cell.font = month_hdr_font
 
     # ── Fila 4: Instrucciones ──────────────────────────────────────────────────────
-    ws.row_dimensions[4].height = 30
+    ws.row_dimensions[4].height = 38
     ws.merge_cells(f'A4:{get_column_letter(VISIBLE_COLS)}4')
     note = ws['A4']
-    _instr_font2 = InlineFont(i=True, color='FF444444', sz=9)
-    _imp_font2   = InlineFont(b=True, color='FF222222', sz=11)
+    _instr_font2 = InlineFont(i=False, color='FF333333', sz=9)
+    _bold_font2  = InlineFont(b=True,  color='FF111111', sz=9)
+    _warn_font2  = InlineFont(b=True,  color='FFCC4400', sz=9)
     note.value = CellRichText(
-        TextBlock(_instr_font2,
-            '📌 INSTRUCCIONES: (1) Escriba su NOMBRE/CLAVE en el campo gris (arriba a la derecha de "CLAVE / NOMBRE DISTRIBUIDOR"). '
-            '(2) Seleccione su NIVEL DE DISTRIBUIDOR en la celda naranja (G1): Distribuidor, Partner, Partner Elite o Partner Elite Plus!  '
-            '(3) Los PRECIOS se actualizarán automáticamente en la columna H según el nivel que seleccione. '
-            '(4) Complete las CANTIDADES mensuales (columnas Mayo a Abril) de los productos que necesita. '
-            '(5) El TOTAL en unidades y precio se calcula automáticamente. Guarde y cargue este archivo en el sistema.  '),
-        TextBlock(_imp_font2,
-            '⚡ IMPORTANTE: Entre más rápido envíe sus proyecciones, mayor prioridad tendrán sus solicitudes. '
-            'Envíe este archivo a su Ejecutivo de Ventas antes del 30 de abril de 2026.'),
+        TextBlock(_bold_font2,  '① CLAVE: '),
+        TextBlock(_instr_font2, 'Escriba su nombre o clave en el campo gris (celda D1).     '),
+        TextBlock(_bold_font2,  '② NIVEL DE PRECIO: '),
+        TextBlock(_instr_font2, 'Seleccione su tipo en la celda naranja G1 (Distribuidor / Partner / Partner Elite / Partner Elite Plus!) '
+                                '— la columna H se actualiza automáticamente.     '),
+        TextBlock(_bold_font2,  '③ DISPONIBILIDAD: '),
+        TextBlock(_instr_font2, 'Las columnas May y Jun están '),
+        TextBlock(_warn_font2,  'BLOQUEADAS ⛔'),
+        TextBlock(_instr_font2, ' — solo puede capturar a partir de '),
+        TextBlock(_bold_font2,  'Julio. '),
+        TextBlock(_instr_font2, 'Celdas oscuras indican que el modelo llega más tarde.     '),
+        TextBlock(_bold_font2,  '④ CAPTURA: '),
+        TextBlock(_instr_font2, 'Ingrese cantidades por mes. Totales se calculan solos.     '),
+        TextBlock(_warn_font2,  '⚡ Entre más rápido envíe sus proyecciones, mayor prioridad tendrá su pedido.'),
     )
     note.fill      = PatternFill('solid', fgColor='FFFFF8F0')
     note.alignment = Alignment(horizontal='left', vertical='center', wrap_text=True)
@@ -2047,10 +2083,11 @@ def descargar_template_global():
         h.border        = border
         h.number_format = '"$"#,##0.00'
 
+        _MESES_BLOQ_G = {'mayo', 'junio'}
         cat_avail = SKU_CATALOG.get(sku, {}).get('avail', {})
         for mi in range(len(MESES)):
             mes_name = MESES[mi]
-            is_avail = cat_avail.get(mes_name, True)
+            is_avail = False if mes_name in _MESES_BLOQ_G else cat_avail.get(mes_name, True)
             c = ws.cell(row=row_idx, column=MONTH_START + mi)
             c.alignment     = center
             c.border        = border
