@@ -1601,6 +1601,7 @@ def descargar_template():
     tc.alignment = center
 
     # ── Fila 3: Encabezados de columnas ───────────────────────────────────────
+    BLOCKED_MONTH_LABELS = {'May', 'Jun'}   # columnas bloqueadas en toda la hoja
     ws.row_dimensions[3].height = 22
     ALL_HEADERS = CAMPOS_INFO + ['Precio Público', 'Precio'] + MESES_LABELS + ['TOTAL', 'Total $']
     for ci, h in enumerate(ALL_HEADERS, start=1):
@@ -1616,27 +1617,36 @@ def descargar_template():
         elif h in ('TOTAL', 'Total $'):
             cell.fill = PatternFill('solid', fgColor=ORANGE)
             cell.font = Font(bold=True, color='FF000000', size=10)
+        elif h in BLOCKED_MONTH_LABELS:
+            # Mayo y Junio: header gris oscuro — no disponibles para pedido
+            cell.fill = PatternFill('solid', fgColor='FF2E2E2E')
+            cell.font = Font(bold=True, color='FF666666', size=10)
+            cell.value = f'{h}\n⛔'
         else:
             cell.fill = PatternFill('solid', fgColor=ORANGE)
             cell.font = month_hdr_font
 
     # ── Fila 4: Instrucciones ──────────────────────────────────────────────────
-    ws.row_dimensions[4].height = 30
+    ws.row_dimensions[4].height = 38
     ws.merge_cells(f'A4:{get_column_letter(VISIBLE_COLS)}4')
     note = ws['A4']
-    _instr_font = InlineFont(i=True, color='FF444444', sz=9)
-    _imp_font   = InlineFont(b=True, color='FF222222', sz=11)
+    _instr_font = InlineFont(i=False, color='FF333333', sz=9)
+    _bold_font  = InlineFont(b=True,  color='FF111111', sz=9)
+    _warn_font  = InlineFont(b=True,  color='FFCC4400', sz=9)
     note.value = CellRichText(
-        TextBlock(_instr_font,
-            '📌 INSTRUCCIONES: (1) Seleccione su NIVEL DE DISTRIBUIDOR en la celda naranja (G1): '
-            'Distribuidor, Partner, Partner Elite o Partner Elite Plus!  '
-            '(2) Los PRECIOS se actualizarán automáticamente en la columna H según el nivel que seleccione. '
-            '(3) Complete las CANTIDADES mensuales (columnas Mayo a Abril) de los productos que necesita. '
-            '(4) El TOTAL en unidades y precio se calcula automáticamente. '
-            'Guarde y cargue este archivo en el sistema.  '),
-        TextBlock(_imp_font,
-            '⚡ IMPORTANTE: Entre más rápido envíe sus proyecciones, mayor prioridad tendrán sus solicitudes. '
-            'Envíe este archivo a su Ejecutivo de Ventas antes del 30 de abril de 2026.'),
+        TextBlock(_bold_font,  '① NIVEL DE PRECIO: '),
+        TextBlock(_instr_font, 'Seleccione su tipo en la celda naranja G1 (Distribuidor / Partner / Partner Elite / Partner Elite Plus!) '
+                               '— la columna H se actualiza automáticamente.     '),
+        TextBlock(_bold_font,  '② DISPONIBILIDAD: '),
+        TextBlock(_instr_font, 'Las columnas May y Jun están '),
+        TextBlock(_warn_font,  'BLOQUEADAS ⛔'),
+        TextBlock(_instr_font, ' — solo puede capturar a partir de '),
+        TextBlock(_bold_font,  'Julio. '),
+        TextBlock(_instr_font, 'Celdas oscuras dentro de los meses disponibles indican que el modelo llega más tarde.     '),
+        TextBlock(_bold_font,  '③ CAPTURA: '),
+        TextBlock(_instr_font, 'Ingrese las CANTIDADES por mes. Los totales (unidades y monto) se calculan solos.     '),
+        TextBlock(_warn_font,  '⚡ Entre más rápido envíe sus proyecciones, mayor prioridad tendrá su pedido. '
+                               'Envíe este archivo a su Ejecutivo de Ventas.'),
     )
     note.fill      = PatternFill('solid', fgColor='FFFFF8F0')
     note.alignment = Alignment(horizontal='left', vertical='center', wrap_text=True)
@@ -1688,11 +1698,13 @@ def descargar_template():
         h.border        = border
         h.number_format = '"$"#,##0.00'
 
-        # I-T: meses — desbloqueados si el producto está disponible, bloqueados si no
+        # I-T: meses — Mayo y Junio siempre bloqueados; demás meses según SKU_CATALOG
+        _MESES_BLOQ_TEMPLATE = {'mayo', 'junio'}
         cat_avail = SKU_CATALOG.get(sku, {}).get('avail', {})
         for mi in range(len(MESES)):
             mes_name = MESES[mi]
-            is_avail = cat_avail.get(mes_name, True)  # meses fuera del dict (Sep-Abr) = siempre disponibles
+            # Mayo y junio bloqueados para todos; resto según disponibilidad del modelo
+            is_avail = False if mes_name in _MESES_BLOQ_TEMPLATE else cat_avail.get(mes_name, True)
             c = ws.cell(row=row_idx, column=MONTH_START + mi)
             c.alignment     = center
             c.border        = border
