@@ -52,7 +52,7 @@ IVA_FACTOR  = 1.16   # precios en SKU_CATALOG y Odoo son sin IVA
 
 # Mapeo tier (MySQL) → nombre exacto de lista de precios en Odoo
 _TIER_TO_ODOO_PL: dict[str, str] = {
-    'Partner Elite Plus!': 'PARTNER ELITE',
+    'Partner Elite Plus!': 'PARTNER ELITE PLUS!',
     'Partner Elite':       'PARTNER ELITE',
     'Partner':             'PARTNER',
     'Distribuidor':        'DISTRIBUIDOR',
@@ -967,20 +967,29 @@ def _get_odoo_prices_for_skus(refs: list) -> dict:
         if not prod_id_by_ref:
             return result
 
-        pricelists = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD,
+        # Buscar todas las listas activas y mapear por keyword (robusto ante sufijos como "(MXN)")
+        all_pls = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD,
             'product.pricelist', 'search_read',
-            [[['name', 'in', list({_TIER_TO_ODOO_PL.get(t, t.upper()) for t in TIER_NAMES})]]],
+            [[['active', '=', True]]],
             {'fields': ['id', 'name']}
         )
-        if not pricelists:
-            logging.warning('[prices] No pricelists found in Odoo for %s', list(_TIER_TO_ODOO_PL.values()))
-            return result
-        # Expand: each Odoo pricelist may map to multiple TIER_NAMES
         pl_tier_list = []
-        for pl in pricelists:
-            for t in TIER_NAMES:
-                if _TIER_TO_ODOO_PL.get(t, t.upper()) == pl['name']:
-                    pl_tier_list.append({'id': pl['id'], 'name': t})
+        for pl in all_pls:
+            n = pl['name'].upper()
+            if 'PRECIO PUBLICO' in n or 'PRECIO PÚBLICO' in n:
+                pl_tier_list.append({'id': pl['id'], 'name': '__public__'})
+            elif 'PARTNER ELITE PLUS' in n:
+                pl_tier_list.append({'id': pl['id'], 'name': 'Partner Elite Plus!'})
+            elif 'PARTNER ELITE' in n:
+                pl_tier_list.append({'id': pl['id'], 'name': 'Partner Elite'})
+            elif 'PARTNER' in n:
+                pl_tier_list.append({'id': pl['id'], 'name': 'Partner'})
+            elif 'DISTRIBUIDOR' in n:
+                pl_tier_list.append({'id': pl['id'], 'name': 'Distribuidor'})
+        if not pl_tier_list:
+            logging.warning('[prices] No pricelists matched in Odoo (active pricelists: %s)',
+                            [p['name'] for p in all_pls])
+            return result
         pricelists = pl_tier_list
 
         all_prod_ids = list(prod_id_by_ref.values())
@@ -1027,14 +1036,20 @@ def _get_odoo_prices_for_skus(refs: list) -> dict:
                 if best_item:
                     compute = best_item.get('compute_price', 'fixed')
                     if compute == 'fixed':
-                        result[ref][tier] = float(best_item.get('fixed_price') or 0.0)
+                        price = float(best_item.get('fixed_price') or 0.0)
                     elif compute == 'percentage':
-                        pct = float(best_item.get('percent_price') or 0.0)
-                        result[ref][tier] = round(list_price * (1 - pct / 100), 2)
+                        pct   = float(best_item.get('percent_price') or 0.0)
+                        price = round(list_price * (1 - pct / 100), 2)
                     else:
                         disc      = float(best_item.get('price_discount') or 0.0)
                         surcharge = float(best_item.get('price_surcharge') or 0.0)
-                        result[ref][tier] = round(list_price * (1 - disc / 100) + surcharge, 2)
+                        price = round(list_price * (1 - disc / 100) + surcharge, 2)
+                    if tier == '__public__':
+                        # Precio Público → sobrescribe list_price (base para columna G)
+                        if price > 0:
+                            result[ref]['list_price'] = price
+                    else:
+                        result[ref][tier] = price
         return result
     except Exception as e:
         logging.exception('[prices] Error fetching Odoo prices: %s', e)
