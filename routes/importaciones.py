@@ -105,6 +105,27 @@ CAMPOS_CIERRE = [
 ]
 
 
+_COLS_PERMITIDAS: set = (
+    set(CAMPOS_LOGISTICA)
+    | set(CAMPOS_IMPORTACION)
+    | set(CAMPOS_DESPACHO)
+    | set(CAMPOS_ODOO)
+    | set(CAMPOS_ALMACEN)
+    | set(CAMPOS_RECEPCION)
+    | set(CAMPOS_CIERRE)
+    | {
+        "referencia", "nombre", "estado", "via_transporte", "notas",
+        "imp_dias_libres_almacenaje",
+        "cos_tipo_cambio_pedimento", "cos_valor_factura", "cos_cantidad_bicicletas",
+        "cos_flete_internacional_usd", "cos_gastos_forwarder_pesos",
+        "cos_seguro_pesos", "cos_custodia_pesos", "cos_maniobras_pesos",
+        "cos_cargos_adicionales_pesos", "cos_honorarios_pesos",
+        "cos_flete_terrestre_usd", "cos_pernoctas_usd", "cos_paquetexpress_usd",
+        "cos_demoras_usd", "cos_verificacion_pesos", "cos_lavado_contenedor_pesos",
+        "cos_monitoreo_pesos", "cos_impuestos_pagados_pesos", "cos_reconocimiento_aduanero",
+    }
+)
+
 _NO_CUENTA = {None, "", "NO"}
 
 def _calcular_progreso(row: dict) -> dict:
@@ -562,7 +583,9 @@ def crear():
         # Calcular campos derivados
         data = _recalcular_campos(data)
 
-        cols = [k for k in data if k != "id"]
+        cols = [k for k in data if k != "id" and k in _COLS_PERMITIDAS]
+        if not cols:
+            return jsonify({"error": "Sin campos válidos para insertar"}), 400
         placeholders = ", ".join(["%s"] * len(cols))
         col_names = ", ".join(cols)
         vals = [data[c] for c in cols]
@@ -627,8 +650,13 @@ def actualizar(id_imp):
             "imp_fecha_limite_cruce", "imp_dias_despacho_aduanero",
             "des_dias_transito_terrestre",
         ]
-        campos_a_actualizar = list(data.keys()) + [c for c in campos_calc if c not in data]
+        campos_a_actualizar = (
+            [c for c in data.keys() if c in _COLS_PERMITIDAS]
+            + [c for c in campos_calc if c not in data]
+        )
         campos_a_actualizar = list(dict.fromkeys(campos_a_actualizar))
+        if not campos_a_actualizar:
+            return jsonify({"error": "Sin campos válidos para actualizar"}), 400
 
         set_clause = ", ".join([f"`{c}` = %s" for c in campos_a_actualizar])
         vals = [merged.get(c) for c in campos_a_actualizar]
