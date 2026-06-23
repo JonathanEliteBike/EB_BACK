@@ -236,7 +236,7 @@ def inicializar_tablas():
                 imp_carta_aplicacion_uva        VARCHAR(10),
                 imp_articulos_verificar         TEXT,
                 imp_liberacion_folios           DATE,
-                imp_fecha_pago_pedimento        VARCHAR(100),
+                imp_fecha_pago_pedimento        DATE,
 
                 -- PROCESO DESPACHO Y REGRESO (14 items)
                 des_solicitud_cita_cruce        DATE,
