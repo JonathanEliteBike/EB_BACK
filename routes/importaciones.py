@@ -636,14 +636,14 @@ def actualizar(id_imp):
             return jsonify({"error": "No encontrado"}), 404
 
         if borrador_seccion:
-            # ── Guardar borrador: solo actualiza JSON, no toca columnas reales ──
-            borradores = _json.loads(existing.get("borradores") or "{}")
-            if borrador_seccion not in borradores:
-                borradores[borrador_seccion] = {}
-            borradores[borrador_seccion].update(data)
+            # ponytail: JSON_SET atómico elimina race condition de read-modify-write entre tabs
             cursor.execute(
-                "UPDATE importaciones SET borradores = %s WHERE id = %s",
-                (_json.dumps(borradores, ensure_ascii=False), id_imp)
+                "UPDATE importaciones SET borradores = JSON_SET(COALESCE(borradores, JSON_OBJECT()), %s, CAST(%s AS JSON)) WHERE id = %s",
+                (
+                    f"$.{borrador_seccion}",
+                    _json.dumps(data, ensure_ascii=False),
+                    id_imp,
+                )
             )
             conn.commit()
             return jsonify({"ok": True, "borrador": True}), 200
