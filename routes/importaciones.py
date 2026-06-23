@@ -133,8 +133,17 @@ _COLS_PERMITIDAS: set = (
 
 _SECCIONES_VALIDAS = {
     "logistica", "importacion", "despacho", "odoo",
-    "almacen", "recepcion", "cierre", "costos"
+    "almacen", "recepcion", "cierre",
+    "costos",  # campos cos_* se guardan en columnas directas, no en progreso
 }
+
+# Campos derivados que _recalcular_campos() inyecta en data — deben persistirse
+# en INSERT y UPDATE aunque no estén en _COLS_PERMITIDAS (son cálculos, no input usuario).
+_CAMPOS_CALC = [
+    "log_dias_salida_tras_entrega", "log_dias_transito_maritimo",
+    "imp_fecha_limite_cruce", "imp_dias_despacho_aduanero",
+    "des_dias_transito_terrestre",
+]
 
 _NO_CUENTA = {None, "", "NO"}
 
@@ -595,7 +604,10 @@ def crear():
         # Calcular campos derivados
         data = _recalcular_campos(data)
 
-        cols = [k for k in data if k != "id" and k in _COLS_PERMITIDAS]
+        cols = list(dict.fromkeys(
+            [k for k in data if k != "id" and k in _COLS_PERMITIDAS]
+            + [c for c in _CAMPOS_CALC if data.get(c) is not None]
+        ))
         if not cols:
             return jsonify({"error": "Sin campos válidos para insertar"}), 400
         placeholders = ", ".join(["%s"] * len(cols))
@@ -661,14 +673,9 @@ def actualizar(id_imp):
         merged = {**{k: v for k, v in existing.items()}, **data}
         merged = _recalcular_campos(merged)
 
-        campos_calc = [
-            "log_dias_salida_tras_entrega", "log_dias_transito_maritimo",
-            "imp_fecha_limite_cruce", "imp_dias_despacho_aduanero",
-            "des_dias_transito_terrestre",
-        ]
         campos_a_actualizar = (
             [c for c in data.keys() if c in _COLS_PERMITIDAS]
-            + [c for c in campos_calc if c not in data]
+            + [c for c in _CAMPOS_CALC if c not in data]
         )
         campos_a_actualizar = list(dict.fromkeys(campos_a_actualizar))
         if not campos_a_actualizar:
@@ -721,22 +728,7 @@ def eliminar(id_imp):
 
 @importaciones_bp.route("/resumen", methods=["GET"])
 def resumen():
-    conn = obtener_conexion()
-    if not conn:
-        return jsonify({"error": "Sin conexion a BD"}), 500
-    try:
-        cursor = conn.cursor(dictionary=True)
-        cursor.execute("SELECT * FROM importaciones WHERE estado != 'eliminado' ORDER BY created_at DESC")
-        resultado = []
-        for row in cursor.fetchall():
-            row = _serialize(row)
-            row["progreso"] = _calcular_progreso(row)
-            resultado.append(row)
-        return jsonify(resultado), 200
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-    finally:
-        conn.close()
+    return listar()
 
 
 # ── lógica de cálculos automáticos ───────────────────────────────────────────
@@ -756,7 +748,7 @@ def _recalcular_campos(data: dict) -> dict:
 
     # Fecha límite para cruce sin almacenajes (Llegada + días libres)
     dias_libres = data.get("imp_dias_libres_almacenaje")
-    if dias_libres is None:
+    if not dias_libres and dias_libres != 0:
         dias_libres = 17
     data["imp_fecha_limite_cruce"] = _add_days(
         data.get("imp_llegada_contenedor_puerto"),
