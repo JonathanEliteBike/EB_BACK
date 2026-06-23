@@ -131,6 +131,11 @@ _COLS_PERMITIDAS: set = (
     }
 )
 
+_SECCIONES_VALIDAS = {
+    "logistica", "importacion", "despacho", "odoo",
+    "almacen", "recepcion", "cierre", "costos"
+}
+
 _NO_CUENTA = {None, "", "NO"}
 
 def _calcular_progreso(row: dict) -> dict:
@@ -636,6 +641,10 @@ def actualizar(id_imp):
             return jsonify({"error": "No encontrado"}), 404
 
         if borrador_seccion:
+            if borrador_seccion not in _SECCIONES_VALIDAS:
+                return jsonify({"error": "Sección de borrador no válida"}), 400
+            if not data:
+                return jsonify({"ok": True, "borrador": True}), 200  # no-op, nothing to save
             # ponytail: JSON_SET atómico elimina race condition de read-modify-write entre tabs
             cursor.execute(
                 "UPDATE importaciones SET borradores = JSON_SET(COALESCE(borradores, JSON_OBJECT()), %s, CAST(%s AS JSON)) WHERE id = %s",
