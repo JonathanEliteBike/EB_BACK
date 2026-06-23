@@ -54,6 +54,7 @@ CAMPOS_LOGISTICA = [
     "log_fecha_booking", "log_eta_puerto", "log_buque", "log_no_viaje",
     "log_puerto_salida", "log_contenedor", "log_recepcion_bl_co",
     "log_confirmacion_bl_co", "log_certificado_seguro",
+    "log_envio_certificado",
     "log_recepcion_documentos",
 ]
 
@@ -81,6 +82,7 @@ CAMPOS_DESPACHO = [
     "des_fecha_entrega_almacen_prog", "des_lugar_destino", "des_llegada_almacen",
     "des_solicitud_carta_vacio", "des_fecha_lavado",
     "des_entrega_contenedor_naviera", "des_dias_sin_demoras", "des_fecha_limite_naviera",
+    "des_recepcion_eir",
 ]
 
 CAMPOS_ODOO = [
@@ -97,11 +99,14 @@ CAMPOS_ALMACEN = [
 CAMPOS_RECEPCION = [
     "rec_cedula_costeo", "rec_recepcion_odoo",
     "rec_folio_compra", "rec_liberacion_verificacion",
+    "rec_liberacion_final",
 ]
 
 CAMPOS_CIERRE = [
     "cie_recepcion_cuenta_gastos", "cie_saldo_favor_elite",
     "cie_liquidado_elite", "cie_saldo_favor_aa", "cie_liquidado_aa",
+    "cie_fecha_pago_elite",
+    "cie_fecha_pago_aa",
 ]
 
 
@@ -755,7 +760,9 @@ def _recalcular_campos(data: dict) -> dict:
     )
 
     # Fecha límite para cruce sin almacenajes (Llegada + días libres)
-    dias_libres = data.get("imp_dias_libres_almacenaje") or 17
+    dias_libres = data.get("imp_dias_libres_almacenaje")
+    if dias_libres is None:
+        dias_libres = 17
     data["imp_fecha_limite_cruce"] = _add_days(
         data.get("imp_llegada_contenedor_puerto"),
         int(dias_libres)
