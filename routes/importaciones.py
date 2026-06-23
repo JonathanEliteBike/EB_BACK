@@ -423,8 +423,10 @@ def dashboard():
         transito_prom = round(sum(transitos) / len(transitos), 1) if transitos else 0
 
         avances = []
+        _prog_cache: dict = {}
         for r in rows:
             prog = _calcular_progreso(r)
+            _prog_cache[r["id"]] = prog
             t = sum(s["total"] for s in prog.values())
             c = sum(s["completados"] for s in prog.values())
             avances.append(round(c / t * 100) if t else 0)
@@ -491,7 +493,7 @@ def dashboard():
         # ── Resumen por embarque ──────────────────────────────────────────────
         embarques_res = []
         for r in rows:
-            prog = _calcular_progreso(r)
+            prog = _prog_cache[r["id"]]
             t = sum(s["total"] for s in prog.values())
             c = sum(s["completados"] for s in prog.values())
             pct_global = round(c / t * 100) if t else 0
@@ -715,28 +717,12 @@ def resumen():
         return jsonify({"error": "Sin conexion a BD"}), 500
     try:
         cursor = conn.cursor(dictionary=True)
-        cursor.execute("""
-            SELECT id, referencia, nombre, estado,
-                   log_fecha_booking, log_eta_puerto,
-                   imp_llegada_contenedor_puerto, des_fecha_cruce_real,
-                   des_llegada_almacen, rec_liberacion_final
-            FROM importaciones
-            WHERE estado != 'eliminado'
-            ORDER BY created_at DESC
-        """)
-        rows = cursor.fetchall()
-
-        # Para el resumen necesitamos todos los campos para calcular progreso
-        cursor.execute("SELECT * FROM importaciones WHERE estado != 'eliminado'")
-        todos = {r["id"]: r for r in cursor.fetchall()}
-
+        cursor.execute("SELECT * FROM importaciones WHERE estado != 'eliminado' ORDER BY created_at DESC")
         resultado = []
-        for row in rows:
+        for row in cursor.fetchall():
             row = _serialize(row)
-            full = _serialize(todos.get(row["id"], {}))
-            row["progreso"] = _calcular_progreso(full)
+            row["progreso"] = _calcular_progreso(row)
             resultado.append(row)
-
         return jsonify(resultado), 200
     except Exception as e:
         return jsonify({"error": str(e)}), 500
