@@ -1,6 +1,6 @@
 import json as _json
 from flask import Blueprint, jsonify, request
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 from decimal import Decimal
 from db_conexion import obtener_conexion
 
@@ -149,6 +149,7 @@ _CAMPOS_CALC = [
     "log_dias_salida_tras_entrega", "log_dias_transito_maritimo",
     "imp_dias_libres_almacenaje", "imp_dias_despacho_aduanero",
     "des_dias_transito_terrestre",
+    "des_fecha_limite_naviera",   # calculada: ETA Puerto + días sin demoras
 ]
 
 _NO_CUENTA = {None, "", "NO"}
@@ -843,5 +844,17 @@ def _recalcular_campos(data: dict) -> dict:
         data.get("des_fecha_cruce_real"),
         data.get("des_llegada_almacen")
     )
+
+    # Fecha límite naviera = ETA Puerto + Días sin demoras para devolver contenedor
+    eta_puerto = data.get("log_eta_puerto")
+    dias_sin_demoras = data.get("des_dias_sin_demoras")
+    if eta_puerto is not None and dias_sin_demoras is not None:
+        try:
+            eta = date.fromisoformat(str(eta_puerto)[:10])
+            data["des_fecha_limite_naviera"] = (eta + timedelta(days=int(dias_sin_demoras))).isoformat()
+        except Exception:
+            data["des_fecha_limite_naviera"] = None
+    else:
+        data["des_fecha_limite_naviera"] = None
 
     return data
