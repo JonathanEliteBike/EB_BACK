@@ -127,6 +127,10 @@ CAMPOS_COSTOS = [
     "cos_flete_terrestre_usd", "cos_pernoctas_usd", "cos_paquetexpress_usd",
     "cos_demoras_usd", "cos_verificacion_pesos", "cos_lavado_contenedor_pesos",
     "cos_monitoreo_pesos", "cos_impuestos_pagados_pesos", "cos_reconocimiento_aduanero",
+    # Piezas por tipo de caja (cantidad; N/A si no aplica para esa importación)
+    "cos_caja_scott_r24", "cos_caja_scott_r20", "cos_caja_scott_adulto",
+    "cos_caja_scott_tw", "cos_caja_scott_tw_electrica", "cos_caja_megamo_track",
+    "cos_caja_megamo_reason", "cos_caja_megamo_vitae",
 ]
 
 
@@ -372,6 +376,16 @@ def inicializar_tablas():
                 cos_impuestos_pagados_pesos     DECIMAL(15,2),
                 cos_reconocimiento_aduanero     DECIMAL(15,2),
 
+                -- Piezas por tipo de caja (INT; NULL = no ingresado, __NA__ → campos_na)
+                cos_caja_scott_r24              INT,
+                cos_caja_scott_r20              INT,
+                cos_caja_scott_adulto           INT,
+                cos_caja_scott_tw               INT,
+                cos_caja_scott_tw_electrica     INT,
+                cos_caja_megamo_track           INT,
+                cos_caja_megamo_reason          INT,
+                cos_caja_megamo_vitae           INT,
+
                 -- Conversiones a USD (calculadas: pesos / tipo_cambio_pedimento)
                 cos_gastos_forwarder_usd        DECIMAL(15,4),
                 cos_seguro_usd                  DECIMAL(15,4),
@@ -418,6 +432,15 @@ def inicializar_tablas():
             "ALTER TABLE importaciones ADD COLUMN IF NOT EXISTS cos_monitoreo_usd DECIMAL(15,4) AFTER cos_lavado_contenedor_usd",
             "ALTER TABLE importaciones ADD COLUMN IF NOT EXISTS cos_impuestos_pagados_usd DECIMAL(15,4) AFTER cos_monitoreo_usd",
             "ALTER TABLE importaciones ADD COLUMN IF NOT EXISTS cos_reconocimiento_aduanero_usd DECIMAL(15,4) AFTER cos_impuestos_pagados_usd",
+            # Piezas por tipo de caja
+            "ALTER TABLE importaciones ADD COLUMN IF NOT EXISTS cos_caja_scott_r24 INT AFTER cos_reconocimiento_aduanero",
+            "ALTER TABLE importaciones ADD COLUMN IF NOT EXISTS cos_caja_scott_r20 INT AFTER cos_caja_scott_r24",
+            "ALTER TABLE importaciones ADD COLUMN IF NOT EXISTS cos_caja_scott_adulto INT AFTER cos_caja_scott_r20",
+            "ALTER TABLE importaciones ADD COLUMN IF NOT EXISTS cos_caja_scott_tw INT AFTER cos_caja_scott_adulto",
+            "ALTER TABLE importaciones ADD COLUMN IF NOT EXISTS cos_caja_scott_tw_electrica INT AFTER cos_caja_scott_tw",
+            "ALTER TABLE importaciones ADD COLUMN IF NOT EXISTS cos_caja_megamo_track INT AFTER cos_caja_scott_tw_electrica",
+            "ALTER TABLE importaciones ADD COLUMN IF NOT EXISTS cos_caja_megamo_reason INT AFTER cos_caja_megamo_track",
+            "ALTER TABLE importaciones ADD COLUMN IF NOT EXISTS cos_caja_megamo_vitae INT AFTER cos_caja_megamo_reason",
         ]
         for sql in migraciones:
             try:
