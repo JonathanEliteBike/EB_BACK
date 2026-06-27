@@ -15,6 +15,17 @@ def _serialize(row: dict) -> dict:
             row[k] = float(v)
         elif isinstance(v, (datetime, date)):
             row[k] = v.isoformat()
+    # mysql-connector devuelve columnas JSON como string — parsear aquí
+    if isinstance(row.get("borradores"), str):
+        try:
+            row["borradores"] = _json.loads(row["borradores"])
+        except Exception:
+            row["borradores"] = {}
+    if isinstance(row.get("campos_na"), str):
+        try:
+            row["campos_na"] = _json.loads(row["campos_na"])
+        except Exception:
+            row["campos_na"] = []
     return row
 
 
@@ -31,16 +42,6 @@ def _calc_dias(fecha_desde, fecha_hasta):
     return None
 
 
-def _add_days(fecha, dias: int):
-    if fecha:
-        try:
-            if isinstance(fecha, str):
-                fecha = datetime.strptime(fecha, "%Y-%m-%d").date()
-            from datetime import timedelta
-            return (fecha + timedelta(days=dias)).isoformat()
-        except Exception:
-            return None
-    return None
 
 
 # ── Porcentajes de avance por sección ────────────────────────────────────────
@@ -48,7 +49,7 @@ def _add_days(fecha, dias: int):
 
 CAMPOS_LOGISTICA = [
     "log_fecha_notificacion", "log_fecha_entrega", "log_titulo_correo_salida",
-    "log_titulo_correo_2", "log_confirmacion_enterado", "log_origen", "log_tipo_productos",
+    "log_confirmacion_enterado", "log_origen", "log_tipo_productos",
     "log_fecha_solicitud_cotizaciones", "log_confirmacion_cotizacion",
     "log_costo_flete", "log_fecha_shipping_instructions", "log_confirmacion_booking",
     "log_fecha_booking", "log_eta_puerto", "log_buque", "log_no_viaje",
@@ -109,6 +110,16 @@ CAMPOS_CIERRE = [
     "cie_fecha_pago_aa",
 ]
 
+CAMPOS_COSTOS = [
+    "cos_tipo_cambio_pedimento", "cos_valor_factura", "cos_cantidad_bicicletas",
+    "cos_flete_internacional_usd", "cos_gastos_forwarder_pesos",
+    "cos_seguro_pesos", "cos_custodia_pesos", "cos_maniobras_pesos",
+    "cos_cargos_adicionales_pesos", "cos_honorarios_pesos",
+    "cos_flete_terrestre_usd", "cos_pernoctas_usd", "cos_paquetexpress_usd",
+    "cos_demoras_usd", "cos_verificacion_pesos", "cos_lavado_contenedor_pesos",
+    "cos_monitoreo_pesos", "cos_impuestos_pagados_pesos", "cos_reconocimiento_aduanero",
+]
+
 
 _COLS_PERMITIDAS: set = (
     set(CAMPOS_LOGISTICA)
@@ -120,7 +131,6 @@ _COLS_PERMITIDAS: set = (
     | set(CAMPOS_CIERRE)
     | {
         "referencia", "nombre", "estado", "via_transporte", "notas",
-        "imp_dias_libres_almacenaje",
         "cos_tipo_cambio_pedimento", "cos_valor_factura", "cos_cantidad_bicicletas",
         "cos_flete_internacional_usd", "cos_gastos_forwarder_pesos",
         "cos_seguro_pesos", "cos_custodia_pesos", "cos_maniobras_pesos",
@@ -134,33 +144,58 @@ _COLS_PERMITIDAS: set = (
 _SECCIONES_VALIDAS = {
     "logistica", "importacion", "despacho", "odoo",
     "almacen", "recepcion", "cierre",
-    "costos",  # campos cos_* se guardan en columnas directas, no en progreso
+    "costos",
 }
 
 # Campos derivados que _recalcular_campos() inyecta en data — deben persistirse
 # en INSERT y UPDATE aunque no estén en _COLS_PERMITIDAS (son cálculos, no input usuario).
 _CAMPOS_CALC = [
     "log_dias_salida_tras_entrega", "log_dias_transito_maritimo",
-    "imp_fecha_limite_cruce", "imp_dias_despacho_aduanero",
+    "imp_dias_libres_almacenaje", "imp_dias_despacho_aduanero",
     "des_dias_transito_terrestre",
 ]
 
 _NO_CUENTA = {None, "", "NO"}
 
 def _calcular_progreso(row: dict) -> dict:
+    # Collect all N/A fields (officially saved + draft borradores)
+    campos_na_db = set()
+    raw_na = row.get("campos_na")
+    if raw_na:
+        if isinstance(raw_na, str):
+            try: raw_na = _json.loads(raw_na)
+            except: raw_na = []
+        campos_na_db = set(raw_na if isinstance(raw_na, list) else [])
+
+    borradores = row.get("borradores") or {}
+    if isinstance(borradores, str):
+        try: borradores = _json.loads(borradores)
+        except: borradores = {}
+    na_borradores = {
+        campo
+        for sec in borradores.values()
+        for campo, val in (sec.items() if isinstance(sec, dict) else [])
+        if val == "__NA__"
+    }
+    all_na = campos_na_db | na_borradores
+
     def pct(campos):
         total = len(campos)
-        hechos = sum(1 for c in campos if row.get(c) not in _NO_CUENTA)
+        hechos = sum(
+            1 for c in campos
+            if row.get(c) not in _NO_CUENTA or c in all_na
+        )
         return {"total": total, "completados": hechos, "pct": round(hechos / total * 100) if total else 0}
 
     return {
-        "logistica": pct(CAMPOS_LOGISTICA),
+        "logistica":   pct(CAMPOS_LOGISTICA),
         "importacion": pct(CAMPOS_IMPORTACION),
-        "despacho": pct(CAMPOS_DESPACHO),
-        "odoo": pct(CAMPOS_ODOO),
-        "almacen": pct(CAMPOS_ALMACEN),
-        "recepcion": pct(CAMPOS_RECEPCION),
-        "cierre": pct(CAMPOS_CIERRE),
+        "despacho":    pct(CAMPOS_DESPACHO),
+        "odoo":        pct(CAMPOS_ODOO),
+        "almacen":     pct(CAMPOS_ALMACEN),
+        "recepcion":   pct(CAMPOS_RECEPCION),
+        "cierre":      pct(CAMPOS_CIERRE),
+        "costos":      pct(CAMPOS_COSTOS),
     }
 
 
@@ -189,7 +224,6 @@ def inicializar_tablas():
                 log_fecha_notificacion          DATE,
                 log_fecha_entrega               DATE,
                 log_titulo_correo_salida        TEXT,
-                log_titulo_correo_2             TEXT,
                 log_confirmacion_enterado       DATE,
                 log_origen                      VARCHAR(100),
                 log_tipo_productos              TEXT,
@@ -326,10 +360,25 @@ def inicializar_tablas():
                 notas                           TEXT,
 
                 -- Datos en edicion (no cuentan en porcentajes)
-                borradores                      JSON
+                borradores                      JSON,
+
+                -- N/A fields (campos marcados como No Aplica)
+                campos_na                       JSON
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
         """)
         conn.commit()
+
+        # Migraciones para instancias existentes
+        migraciones = [
+            "ALTER TABLE importaciones ADD COLUMN IF NOT EXISTS campos_na JSON AFTER borradores",
+        ]
+        for sql in migraciones:
+            try:
+                cursor.execute(sql)
+            except Exception:
+                pass
+        conn.commit()
+
         return jsonify({"ok": True, "mensaje": "Tabla importaciones creada/verificada"}), 201
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -378,6 +427,7 @@ def obtener(id_imp):
         if not row:
             return jsonify({"error": "No encontrado"}), 404
         row = _serialize(row)
+        row = _recalcular_campos(row)
         row["progreso"] = _calcular_progreso(row)
         return jsonify(row), 200
     except Exception as e:
@@ -532,20 +582,23 @@ def dashboard():
                 2
             )
 
+            nbici = r.get("cos_cantidad_bicicletas")
             embarques_res.append({
-                "id":                         r["id"],
-                "referencia":                 r["referencia"],
-                "nombre":                     r.get("nombre") or "",
-                "via_transporte":             r.get("via_transporte") or "MARITIMO",
-                "log_origen":                 r.get("log_origen") or "",
-                "estado":                     r.get("estado") or "activo",
-                "pct_global":                 pct_global,
-                "log_fecha_booking":          r.get("log_fecha_booking"),
-                "des_llegada_almacen":        r.get("des_llegada_almacen"),
-                "log_dias_transito_maritimo": r.get("log_dias_transito_maritimo"),
+                "id":                          r["id"],
+                "referencia":                  r["referencia"],
+                "nombre":                      r.get("nombre") or "",
+                "via_transporte":              r.get("via_transporte") or "MARITIMO",
+                "log_origen":                  r.get("log_origen") or "",
+                "log_tipo_productos":          r.get("log_tipo_productos") or "",
+                "estado":                      r.get("estado") or "activo",
+                "pct_global":                  pct_global,
+                "des_llegada_almacen":         r.get("des_llegada_almacen"),
                 "cos_flete_internacional_usd": float(r["cos_flete_internacional_usd"]) if r.get("cos_flete_internacional_usd") else None,
-                "costo_total_pesos":          costo_total_pesos,
-                "progreso":                   prog,
+                "costo_total_pesos":           costo_total_pesos,
+                "cos_cantidad_bicicletas":     int(nbici) if nbici else None,
+                "costo_por_bicicleta":         round(costo_total_pesos / float(nbici), 2) if nbici and costo_total_pesos else None,
+                "notas":                       r.get("notas") or "",
+                "progreso":                    prog,
             })
 
         # ── Opciones para filtros ─────────────────────────────────────────────
@@ -657,19 +710,39 @@ def actualizar(id_imp):
                 return jsonify({"error": "Sección de borrador no válida"}), 400
             if not data:
                 return jsonify({"ok": True, "borrador": True}), 200  # no-op, nothing to save
-            # ponytail: JSON_SET atómico elimina race condition de read-modify-write entre tabs
+            # JSON_MERGE_PATCH anidado: fusiona campos nuevos con borrador existente de la sección
+            # en lugar de reemplazarlo — preserva campos editados en sesiones anteriores
             cursor.execute(
-                "UPDATE importaciones SET borradores = JSON_SET(COALESCE(borradores, JSON_OBJECT()), %s, CAST(%s AS JSON)) WHERE id = %s",
-                (
-                    f"$.{borrador_seccion}",
-                    _json.dumps(data, ensure_ascii=False),
-                    id_imp,
-                )
+                f"""UPDATE importaciones SET borradores = JSON_MERGE_PATCH(
+                    COALESCE(borradores, JSON_OBJECT()),
+                    JSON_OBJECT('{borrador_seccion}', JSON_MERGE_PATCH(
+                        COALESCE(JSON_EXTRACT(borradores, '$.{borrador_seccion}'), JSON_OBJECT()),
+                        CAST(%s AS JSON)
+                    ))
+                ) WHERE id = %s""",
+                (_json.dumps(data, ensure_ascii=False), id_imp),
             )
             conn.commit()
             return jsonify({"ok": True, "borrador": True}), 200
 
         # ── Guardar oficial: actualiza columnas reales y limpia borradores ──
+        # Separar campos marcados como __NA__ → van a campos_na, se guardan NULL en columna real
+        existing_campos_na_raw = existing.get("campos_na") or "[]"
+        if isinstance(existing_campos_na_raw, str):
+            try: existing_campos_na = set(_json.loads(existing_campos_na_raw))
+            except: existing_campos_na = set()
+        elif isinstance(existing_campos_na_raw, list):
+            existing_campos_na = set(existing_campos_na_raw)
+        else:
+            existing_campos_na = set()
+
+        for campo, valor in list(data.items()):
+            if valor == "__NA__":
+                existing_campos_na.add(campo)
+                data[campo] = None  # Store NULL in the actual column
+            elif campo in existing_campos_na:
+                existing_campos_na.discard(campo)  # Real value overrides N/A
+
         merged = {**{k: v for k, v in existing.items()}, **data}
         merged = _recalcular_campos(merged)
 
@@ -683,6 +756,10 @@ def actualizar(id_imp):
 
         set_clause = ", ".join([f"`{c}` = %s" for c in campos_a_actualizar])
         vals = [merged.get(c) for c in campos_a_actualizar]
+
+        # Always persist campos_na
+        set_clause += ", campos_na = %s"
+        vals.append(_json.dumps(sorted(existing_campos_na), ensure_ascii=False))
 
         if seccion_oficial:
             borradores = _json.loads(existing.get("borradores") or "{}")
@@ -740,25 +817,27 @@ def _recalcular_campos(data: dict) -> dict:
         data.get("log_fecha_booking")
     )
 
-    # Días de tránsito marítimo (ETA puerto - Booking)
+    # Días de tránsito marítimo (Llegada contenedor a puerto - Booking)
     data["log_dias_transito_maritimo"] = _calc_dias(
         data.get("log_fecha_booking"),
-        data.get("log_eta_puerto")
+        data.get("imp_llegada_contenedor_puerto")
     )
 
-    # Fecha límite para cruce sin almacenajes (Llegada + días libres)
-    dias_libres = data.get("imp_dias_libres_almacenaje")
-    if not dias_libres and dias_libres != 0:
-        dias_libres = 17
-    data["imp_fecha_limite_cruce"] = _add_days(
-        data.get("imp_llegada_contenedor_puerto"),
-        int(dias_libres)
-    )
+    # Días libres en terminal (Fecha límite - Llegada a puerto)
+    fecha_limite = data.get("imp_fecha_limite_cruce")
+    llegada = data.get("imp_llegada_contenedor_puerto")
+    if fecha_limite and llegada:
+        try:
+            fl = date.fromisoformat(str(fecha_limite)[:10])
+            ll = date.fromisoformat(str(llegada)[:10])
+            data["imp_dias_libres_almacenaje"] = (fl - ll).days
+        except Exception:
+            pass
 
-    # Días de despacho aduanero (Pago pedimento - Llegada a puerto)
+    # Días de despacho aduanero (Fecha cruce real - Llegada a puerto)
     data["imp_dias_despacho_aduanero"] = _calc_dias(
         data.get("imp_llegada_contenedor_puerto"),
-        data.get("imp_fecha_pago_pedimento")
+        data.get("des_fecha_cruce_real")
     )
 
     # Días de tránsito terrestre (Llegada almacen - Cruce real)
