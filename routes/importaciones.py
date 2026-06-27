@@ -48,6 +48,7 @@ def _calc_dias(fecha_desde, fecha_hasta):
 # Campos que cuentan para cada sección (valor no nulo = completado)
 
 CAMPOS_LOGISTICA = [
+    "odoo_importador",                           # pos 1 — Importador (RBF / ROY MORAN)
     "log_fecha_notificacion", "log_fecha_entrega", "log_titulo_correo_salida",
     "log_confirmacion_enterado", "log_origen", "log_tipo_productos",
     "log_fecha_solicitud_cotizaciones", "log_confirmacion_cotizacion",
@@ -87,7 +88,6 @@ CAMPOS_DESPACHO = [
 ]
 
 CAMPOS_ODOO = [
-    "odoo_importador",
     "odoo_codificacion", "odoo_alta_catalogo", "odoo_alta_precios",
     "odoo_alta_orden_compra", "odoo_folio_orden",
     "log_recepcion_documentos",
