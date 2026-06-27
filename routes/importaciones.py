@@ -56,7 +56,7 @@ CAMPOS_LOGISTICA = [
     "log_puerto_salida", "log_contenedor", "log_recepcion_bl_co",
     "log_confirmacion_bl_co", "log_certificado_seguro",
     "log_envio_certificado",
-    "log_recepcion_documentos",
+    # log_recepcion_documentos moved to CAMPOS_ODOO
 ]
 
 CAMPOS_IMPORTACION = [
@@ -87,8 +87,10 @@ CAMPOS_DESPACHO = [
 ]
 
 CAMPOS_ODOO = [
+    "odoo_importador",
     "odoo_codificacion", "odoo_alta_catalogo", "odoo_alta_precios",
     "odoo_alta_orden_compra", "odoo_folio_orden",
+    "log_recepcion_documentos",
 ]
 
 CAMPOS_ALMACEN = [
@@ -129,15 +131,9 @@ _COLS_PERMITIDAS: set = (
     | set(CAMPOS_ALMACEN)
     | set(CAMPOS_RECEPCION)
     | set(CAMPOS_CIERRE)
+    | set(CAMPOS_COSTOS)
     | {
         "referencia", "nombre", "estado", "via_transporte", "notas",
-        "cos_tipo_cambio_pedimento", "cos_valor_factura", "cos_cantidad_bicicletas",
-        "cos_flete_internacional_usd", "cos_gastos_forwarder_pesos",
-        "cos_seguro_pesos", "cos_custodia_pesos", "cos_maniobras_pesos",
-        "cos_cargos_adicionales_pesos", "cos_honorarios_pesos",
-        "cos_flete_terrestre_usd", "cos_pernoctas_usd", "cos_paquetexpress_usd",
-        "cos_demoras_usd", "cos_verificacion_pesos", "cos_lavado_contenedor_pesos",
-        "cos_monitoreo_pesos", "cos_impuestos_pagados_pesos", "cos_reconocimiento_aduanero",
     }
 )
 
@@ -304,7 +300,8 @@ def inicializar_tablas():
                 des_fecha_limite_naviera        DATE,
                 des_recepcion_eir               DATE,
 
-                -- PROCESO ALTA ORDEN EN ODOO (5 items)
+                -- PROCESO ALTA ORDEN EN ODOO (7 items)
+                odoo_importador                 VARCHAR(50),
                 odoo_codificacion               VARCHAR(10),
                 odoo_alta_catalogo              VARCHAR(10),
                 odoo_alta_precios               VARCHAR(10),
@@ -371,6 +368,7 @@ def inicializar_tablas():
         # Migraciones para instancias existentes
         migraciones = [
             "ALTER TABLE importaciones ADD COLUMN IF NOT EXISTS campos_na JSON AFTER borradores",
+            "ALTER TABLE importaciones ADD COLUMN IF NOT EXISTS odoo_importador VARCHAR(50) AFTER odoo_folio_orden",
         ]
         for sql in migraciones:
             try:
