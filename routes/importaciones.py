@@ -158,6 +158,11 @@ _CAMPOS_CALC = [
     "des_dias_transito_terrestre",
     "des_fecha_limite_naviera",      # calculada: ETA Puerto + días sin demoras
     "alm_real_dias_etiquetado",      # calculada: terminación - inicio etiquetado
+    # Conversiones USD: pesos / tipo_cambio_pedimento
+    "cos_gastos_forwarder_usd", "cos_seguro_usd", "cos_custodia_usd",
+    "cos_maniobras_usd", "cos_cargos_adicionales_usd", "cos_honorarios_usd",
+    "cos_verificacion_usd", "cos_lavado_contenedor_usd", "cos_monitoreo_usd",
+    "cos_impuestos_pagados_usd", "cos_reconocimiento_aduanero_usd",
 ]
 
 _NO_CUENTA = {None, "", "NO"}
@@ -367,6 +372,19 @@ def inicializar_tablas():
                 cos_impuestos_pagados_pesos     DECIMAL(15,2),
                 cos_reconocimiento_aduanero     DECIMAL(15,2),
 
+                -- Conversiones a USD (calculadas: pesos / tipo_cambio_pedimento)
+                cos_gastos_forwarder_usd        DECIMAL(15,4),
+                cos_seguro_usd                  DECIMAL(15,4),
+                cos_custodia_usd                DECIMAL(15,4),
+                cos_maniobras_usd               DECIMAL(15,4),
+                cos_cargos_adicionales_usd      DECIMAL(15,4),
+                cos_honorarios_usd              DECIMAL(15,4),
+                cos_verificacion_usd            DECIMAL(15,4),
+                cos_lavado_contenedor_usd       DECIMAL(15,4),
+                cos_monitoreo_usd               DECIMAL(15,4),
+                cos_impuestos_pagados_usd       DECIMAL(15,4),
+                cos_reconocimiento_aduanero_usd DECIMAL(15,4),
+
                 -- Notas adicionales
                 notas                           TEXT,
 
@@ -388,6 +406,18 @@ def inicializar_tablas():
             "ALTER TABLE importaciones ADD COLUMN IF NOT EXISTS alm_inicio_etiquetado DATE AFTER alm_proyectado_dias_etiquetado",
             "ALTER TABLE importaciones ADD COLUMN IF NOT EXISTS alm_terminacion_etiquetado DATE AFTER alm_inicio_etiquetado",
             "ALTER TABLE importaciones ADD COLUMN IF NOT EXISTS alm_real_dias_etiquetado INT AFTER alm_terminacion_etiquetado",
+            # Conversiones USD de costos en pesos
+            "ALTER TABLE importaciones ADD COLUMN IF NOT EXISTS cos_gastos_forwarder_usd DECIMAL(15,4) AFTER cos_reconocimiento_aduanero",
+            "ALTER TABLE importaciones ADD COLUMN IF NOT EXISTS cos_seguro_usd DECIMAL(15,4) AFTER cos_gastos_forwarder_usd",
+            "ALTER TABLE importaciones ADD COLUMN IF NOT EXISTS cos_custodia_usd DECIMAL(15,4) AFTER cos_seguro_usd",
+            "ALTER TABLE importaciones ADD COLUMN IF NOT EXISTS cos_maniobras_usd DECIMAL(15,4) AFTER cos_custodia_usd",
+            "ALTER TABLE importaciones ADD COLUMN IF NOT EXISTS cos_cargos_adicionales_usd DECIMAL(15,4) AFTER cos_maniobras_usd",
+            "ALTER TABLE importaciones ADD COLUMN IF NOT EXISTS cos_honorarios_usd DECIMAL(15,4) AFTER cos_cargos_adicionales_usd",
+            "ALTER TABLE importaciones ADD COLUMN IF NOT EXISTS cos_verificacion_usd DECIMAL(15,4) AFTER cos_honorarios_usd",
+            "ALTER TABLE importaciones ADD COLUMN IF NOT EXISTS cos_lavado_contenedor_usd DECIMAL(15,4) AFTER cos_verificacion_usd",
+            "ALTER TABLE importaciones ADD COLUMN IF NOT EXISTS cos_monitoreo_usd DECIMAL(15,4) AFTER cos_lavado_contenedor_usd",
+            "ALTER TABLE importaciones ADD COLUMN IF NOT EXISTS cos_impuestos_pagados_usd DECIMAL(15,4) AFTER cos_monitoreo_usd",
+            "ALTER TABLE importaciones ADD COLUMN IF NOT EXISTS cos_reconocimiento_aduanero_usd DECIMAL(15,4) AFTER cos_impuestos_pagados_usd",
         ]
         for sql in migraciones:
             try:
@@ -880,5 +910,27 @@ def _recalcular_campos(data: dict) -> dict:
         data.get("alm_inicio_etiquetado"),
         data.get("alm_terminacion_etiquetado")
     )
+
+    # Conversiones USD = pesos / tipo_cambio_pedimento
+    tc = data.get("cos_tipo_cambio_pedimento")
+    _pesos_usd = [
+        ("cos_gastos_forwarder_pesos",   "cos_gastos_forwarder_usd"),
+        ("cos_seguro_pesos",             "cos_seguro_usd"),
+        ("cos_custodia_pesos",           "cos_custodia_usd"),
+        ("cos_maniobras_pesos",          "cos_maniobras_usd"),
+        ("cos_cargos_adicionales_pesos", "cos_cargos_adicionales_usd"),
+        ("cos_honorarios_pesos",         "cos_honorarios_usd"),
+        ("cos_verificacion_pesos",       "cos_verificacion_usd"),
+        ("cos_lavado_contenedor_pesos",  "cos_lavado_contenedor_usd"),
+        ("cos_monitoreo_pesos",          "cos_monitoreo_usd"),
+        ("cos_impuestos_pagados_pesos",  "cos_impuestos_pagados_usd"),
+        ("cos_reconocimiento_aduanero",  "cos_reconocimiento_aduanero_usd"),
+    ]
+    for campo_pesos, campo_usd in _pesos_usd:
+        pesos = data.get(campo_pesos)
+        try:
+            data[campo_usd] = round(float(pesos) / float(tc), 4) if pesos and tc else None
+        except Exception:
+            data[campo_usd] = None
 
     return data
