@@ -95,8 +95,15 @@ CAMPOS_ODOO = [
 
 CAMPOS_ALMACEN = [
     "alm_base_datos_etiquetas", "alm_base_datos_verificacion",
-    "alm_liberacion_etiquetado", "alm_envio_info_uva",
-    "alm_liberacion_uva", "alm_fecha_limite_etiquetado",
+    "alm_fecha_limite_etiquetado",           # moved to pos 3
+    "alm_liberacion_etiquetado",             # pos 4 (N/A supported via campos_na)
+    "alm_liberacion_etiquetado_uva",         # pos 5 (new, N/A supported)
+    "alm_envio_info_uva",
+    "alm_liberacion_uva",
+    "alm_proyectado_dias_etiquetado",        # new user input
+    "alm_inicio_etiquetado",                 # new
+    "alm_terminacion_etiquetado",            # new
+    # alm_real_dias_etiquetado is _CAMPOS_CALC — excluded from CAMPOS_ALMACEN
 ]
 
 CAMPOS_RECEPCION = [
@@ -149,7 +156,8 @@ _CAMPOS_CALC = [
     "log_dias_salida_tras_entrega", "log_dias_transito_maritimo",
     "imp_dias_libres_almacenaje", "imp_dias_despacho_aduanero",
     "des_dias_transito_terrestre",
-    "des_fecha_limite_naviera",   # calculada: ETA Puerto + días sin demoras
+    "des_fecha_limite_naviera",      # calculada: ETA Puerto + días sin demoras
+    "alm_real_dias_etiquetado",      # calculada: terminación - inicio etiquetado
 ]
 
 _NO_CUENTA = {None, "", "NO"}
@@ -309,13 +317,18 @@ def inicializar_tablas():
                 odoo_alta_orden_compra          DATE,
                 odoo_folio_orden                VARCHAR(255),
 
-                -- PROCESO CON ALMACEN (6 items)
+                -- PROCESO CON ALMACEN (11 items)
                 alm_base_datos_etiquetas        DATE,
                 alm_base_datos_verificacion     DATE,
+                alm_fecha_limite_etiquetado     DATE,
                 alm_liberacion_etiquetado       DATE,
+                alm_liberacion_etiquetado_uva   DATE,
                 alm_envio_info_uva              DATE,
                 alm_liberacion_uva              DATE,
-                alm_fecha_limite_etiquetado     DATE,
+                alm_proyectado_dias_etiquetado  INT,
+                alm_inicio_etiquetado           DATE,
+                alm_terminacion_etiquetado      DATE,
+                alm_real_dias_etiquetado        INT,
 
                 -- PROCESO RECEPCION (4 items)
                 rec_cedula_costeo               VARCHAR(10),
@@ -370,6 +383,11 @@ def inicializar_tablas():
         migraciones = [
             "ALTER TABLE importaciones ADD COLUMN IF NOT EXISTS campos_na JSON AFTER borradores",
             "ALTER TABLE importaciones ADD COLUMN IF NOT EXISTS odoo_importador VARCHAR(50) AFTER odoo_folio_orden",
+            "ALTER TABLE importaciones ADD COLUMN IF NOT EXISTS alm_liberacion_etiquetado_uva DATE AFTER alm_fecha_limite_etiquetado",
+            "ALTER TABLE importaciones ADD COLUMN IF NOT EXISTS alm_proyectado_dias_etiquetado INT AFTER alm_liberacion_etiquetado_uva",
+            "ALTER TABLE importaciones ADD COLUMN IF NOT EXISTS alm_inicio_etiquetado DATE AFTER alm_proyectado_dias_etiquetado",
+            "ALTER TABLE importaciones ADD COLUMN IF NOT EXISTS alm_terminacion_etiquetado DATE AFTER alm_inicio_etiquetado",
+            "ALTER TABLE importaciones ADD COLUMN IF NOT EXISTS alm_real_dias_etiquetado INT AFTER alm_terminacion_etiquetado",
         ]
         for sql in migraciones:
             try:
@@ -856,5 +874,11 @@ def _recalcular_campos(data: dict) -> dict:
             data["des_fecha_limite_naviera"] = None
     else:
         data["des_fecha_limite_naviera"] = None
+
+    # Real días de etiquetado = fecha terminación - fecha inicio
+    data["alm_real_dias_etiquetado"] = _calc_dias(
+        data.get("alm_inicio_etiquetado"),
+        data.get("alm_terminacion_etiquetado")
+    )
 
     return data
