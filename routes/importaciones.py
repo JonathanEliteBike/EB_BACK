@@ -624,6 +624,81 @@ def dashboard():
             por_estado[e] = por_estado.get(e, 0) + 1
         por_estado_list = [{"estado": k, "count": v} for k, v in por_estado.items()]
 
+        # ── Latencias ─────────────────────────────────────────────────────────
+        def _lat_dias(row, f_ini, f_fin):
+            a, b = row.get(f_ini), row.get(f_fin)
+            if not a or not b:
+                return None
+            try:
+                from datetime import date as _date
+                def _parse(v):
+                    return v if isinstance(v, _date) else _date.fromisoformat(str(v)[:10])
+                d = (_parse(b) - _parse(a)).days
+                return d if d >= 0 else None
+            except Exception:
+                return None
+
+        # Total (log_fecha_entrega → rec_liberacion_final)
+        _all_lat = [d for d in (_lat_dias(r, "log_fecha_entrega", "rec_liberacion_final") for r in rows) if d is not None]
+        latencia_total_dias = round(sum(_all_lat) / len(_all_lat), 1) if _all_lat else None
+
+        # Por origen
+        _lo_s: dict = {}; _lo_n: dict = {}
+        for r in rows:
+            d = _lat_dias(r, "log_fecha_entrega", "rec_liberacion_final")
+            if d is not None:
+                o = (r.get("log_origen") or "Sin origen").strip().upper()
+                _lo_s[o] = _lo_s.get(o, 0) + d; _lo_n[o] = _lo_n.get(o, 0) + 1
+        latencia_x_origen = sorted(
+            [{"origen": o, "dias_promedio": round(_lo_s[o] / _lo_n[o], 1), "n": _lo_n[o]} for o in _lo_s],
+            key=lambda x: -x["dias_promedio"]
+        )
+
+        # Por embarque
+        _lat_emb_raw = [(r, _lat_dias(r, "log_fecha_entrega", "rec_liberacion_final")) for r in rows]
+        latencia_x_embarque = sorted(
+            [{"id": r["id"], "referencia": r["referencia"], "nombre": r.get("nombre") or "",
+              "log_origen": (r.get("log_origen") or "").strip().upper(), "dias": d}
+             for r, d in _lat_emb_raw if d is not None],
+            key=lambda x: -x["dias"]
+        )
+
+        # Almacén: des_llegada_almacen → rec_recepcion_odoo
+        _d_alm = [d for d in (_lat_dias(r, "des_llegada_almacen", "rec_recepcion_odoo") for r in rows) if d is not None]
+        latencia_almacen = {"dias_promedio": round(sum(_d_alm) / len(_d_alm), 1) if _d_alm else None, "n": len(_d_alm)}
+
+        # Contabilidad: des_fecha_cruce_real → log_recepcion_documentos
+        _d_cont = [d for d in (_lat_dias(r, "des_fecha_cruce_real", "log_recepcion_documentos") for r in rows) if d is not None]
+        latencia_contabilidad = {"dias_promedio": round(sum(_d_cont) / len(_d_cont), 1) if _d_cont else None, "n": len(_d_cont)}
+
+        # Tránsito: log_fecha_entrega → des_llegada_almacen
+        _d_trans = [d for d in (_lat_dias(r, "log_fecha_entrega", "des_llegada_almacen") for r in rows) if d is not None]
+        latencia_transito = {"dias_promedio": round(sum(_d_trans) / len(_d_trans), 1) if _d_trans else None, "n": len(_d_trans)}
+
+        # Tránsito x importador
+        _lti_s: dict = {}; _lti_n: dict = {}
+        for r in rows:
+            d = _lat_dias(r, "log_fecha_entrega", "des_llegada_almacen")
+            if d is not None:
+                imp = (r.get("odoo_importador") or "Sin importador").strip()
+                _lti_s[imp] = _lti_s.get(imp, 0) + d; _lti_n[imp] = _lti_n.get(imp, 0) + 1
+        latencia_transito_x_importador = sorted(
+            [{"importador": imp, "dias_promedio": round(_lti_s[imp] / _lti_n[imp], 1), "n": _lti_n[imp]} for imp in _lti_s],
+            key=lambda x: x["importador"]
+        )
+
+        # Costo paquetería x importación (USD)
+        _cam_paq = ["cos_maniobras_usd", "cos_cargos_adicionales_usd", "cos_flete_terrestre_usd",
+                    "cos_flete_internacional_usd", "cos_pernoctas_usd", "cos_paquetexpress_usd",
+                    "cos_demoras_usd", "cos_lavado_contenedor_usd", "cos_reconocimiento_aduanero_usd"]
+        costo_paqueteria = sorted(
+            [{"id": r["id"], "referencia": r["referencia"], "nombre": r.get("nombre") or "",
+              "log_origen": (r.get("log_origen") or "").strip().upper(),
+              "total_usd": round(sum(float(r.get(c) or 0) for c in _cam_paq), 2)}
+             for r in rows],
+            key=lambda x: -x["total_usd"]
+        )
+
         # ── Resumen por embarque ──────────────────────────────────────────────
         embarques_res = []
         for r in rows:
@@ -699,6 +774,16 @@ def dashboard():
             "flete_por_via": flete_por_via,
             "por_estado":    por_estado_list,
             "embarques":     embarques_res,
+            "latencias": {
+                "total_dias":              latencia_total_dias,
+                "x_origen":               latencia_x_origen,
+                "x_embarque":             latencia_x_embarque,
+                "almacen":                latencia_almacen,
+                "contabilidad":           latencia_contabilidad,
+                "transito":               latencia_transito,
+                "transito_x_importador":  latencia_transito_x_importador,
+            },
+            "costo_paqueteria": costo_paqueteria,
             "filtros": {
                 "origenes": all_origenes,
                 "anios":    all_anios,
