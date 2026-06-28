@@ -773,6 +773,29 @@ def dashboard():
                 "progreso":                    prog,
             })
 
+        # ── Precio por bicicleta promedio x tipo de caja ─────────────────────
+        _CAJAS_LABELS = [
+            ("cos_precio_bici_scott_r24",          "SCOTT R-24",          "0.16 m³"),
+            ("cos_precio_bici_scott_r20",          "SCOTT R-20",          "0.14 m³"),
+            ("cos_precio_bici_scott_adulto",       "SCOTT Adulto",        "0.25 m³"),
+            ("cos_precio_bici_scott_tw",           "SCOTT TW",            "0.42 m³"),
+            ("cos_precio_bici_scott_tw_electrica", "SCOTT TW Eléctrica",  "0.45 m³"),
+            ("cos_precio_bici_megamo_track",       "Megamo Track/Pulse",  "0.32 m³"),
+            ("cos_precio_bici_megamo_reason",      "Megamo Reason/Flame", "0.42 m³"),
+            ("cos_precio_bici_megamo_vitae",       "Megamo Vitae",        "0.46 m³"),
+        ]
+        precio_bici_x_caja = []
+        for campo, label, vol in _CAJAS_LABELS:
+            vals = [float(r[campo]) for r in rows if r.get(campo)]
+            if vals:
+                precio_bici_x_caja.append({
+                    "label": label, "vol": vol,
+                    "promedio": round(sum(vals) / len(vals), 2),
+                    "n": len(vals),
+                })
+        _vals_tot = [float(r["cos_precio_bici_total"]) for r in rows if r.get("cos_precio_bici_total")]
+        precio_bici_total_promedio = round(sum(_vals_tot) / len(_vals_tot), 2) if _vals_tot else None
+
         # ── Opciones para filtros ─────────────────────────────────────────────
         all_origenes = sorted({
             (r.get("log_origen") or "").strip().upper()
@@ -811,6 +834,8 @@ def dashboard():
                 "transito_x_importador":  latencia_transito_x_importador,
             },
             "costo_paqueteria": costo_paqueteria,
+            "precio_bici_x_caja": precio_bici_x_caja,
+            "precio_bici_total_promedio": precio_bici_total_promedio,
             "filtros": {
                 "origenes": all_origenes,
                 "anios":    all_anios,
