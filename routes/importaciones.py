@@ -713,10 +713,11 @@ def dashboard():
             key=lambda x: x["importador"]
         )
 
-        # Costo paquetería x importación (USD)
+        # Costo paquetería x importación (USD) — mismos 11 conceptos que precio/bici
         _cam_paq = ["cos_maniobras_usd", "cos_cargos_adicionales_usd", "cos_flete_terrestre_usd",
                     "cos_flete_internacional_usd", "cos_pernoctas_usd", "cos_paquetexpress_usd",
-                    "cos_demoras_usd", "cos_lavado_contenedor_usd", "cos_reconocimiento_aduanero_usd"]
+                    "cos_demoras_usd", "cos_lavado_contenedor_usd", "cos_reconocimiento_aduanero_usd",
+                    "cos_gastos_forwarder_usd", "cos_custodia_usd"]
         costo_paqueteria = sorted(
             [{"id": r["id"], "referencia": r["referencia"], "nombre": r.get("nombre") or "",
               "log_origen": (r.get("log_origen") or "").strip().upper(),
