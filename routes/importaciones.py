@@ -167,6 +167,12 @@ _CAMPOS_CALC = [
     "cos_maniobras_usd", "cos_cargos_adicionales_usd", "cos_honorarios_usd",
     "cos_verificacion_usd", "cos_lavado_contenedor_usd", "cos_monitoreo_usd",
     "cos_impuestos_pagados_usd", "cos_reconocimiento_aduanero_usd",
+    # Precio por bicicleta por tipo de caja (distribución proporcional por volumen)
+    "cos_precio_bici_scott_r24", "cos_precio_bici_scott_r20",
+    "cos_precio_bici_scott_adulto", "cos_precio_bici_scott_tw",
+    "cos_precio_bici_scott_tw_electrica", "cos_precio_bici_megamo_track",
+    "cos_precio_bici_megamo_reason", "cos_precio_bici_megamo_vitae",
+    "cos_precio_bici_total",
 ]
 
 _NO_CUENTA = {None, "", "NO"}
@@ -399,6 +405,17 @@ def inicializar_tablas():
                 cos_impuestos_pagados_usd       DECIMAL(15,4),
                 cos_reconocimiento_aduanero_usd DECIMAL(15,4),
 
+                -- Precio por bicicleta por tipo de caja (distribución proporcional por volumen)
+                cos_precio_bici_scott_r24          DECIMAL(15,4),
+                cos_precio_bici_scott_r20          DECIMAL(15,4),
+                cos_precio_bici_scott_adulto       DECIMAL(15,4),
+                cos_precio_bici_scott_tw           DECIMAL(15,4),
+                cos_precio_bici_scott_tw_electrica DECIMAL(15,4),
+                cos_precio_bici_megamo_track       DECIMAL(15,4),
+                cos_precio_bici_megamo_reason      DECIMAL(15,4),
+                cos_precio_bici_megamo_vitae       DECIMAL(15,4),
+                cos_precio_bici_total              DECIMAL(15,4),
+
                 -- Notas adicionales
                 notas                           TEXT,
 
@@ -441,6 +458,15 @@ def inicializar_tablas():
             "ALTER TABLE importaciones ADD COLUMN IF NOT EXISTS cos_caja_megamo_track INT AFTER cos_caja_scott_tw_electrica",
             "ALTER TABLE importaciones ADD COLUMN IF NOT EXISTS cos_caja_megamo_reason INT AFTER cos_caja_megamo_track",
             "ALTER TABLE importaciones ADD COLUMN IF NOT EXISTS cos_caja_megamo_vitae INT AFTER cos_caja_megamo_reason",
+            "ALTER TABLE importaciones ADD COLUMN IF NOT EXISTS cos_precio_bici_scott_r24          DECIMAL(15,4) AFTER cos_reconocimiento_aduanero_usd",
+            "ALTER TABLE importaciones ADD COLUMN IF NOT EXISTS cos_precio_bici_scott_r20          DECIMAL(15,4) AFTER cos_precio_bici_scott_r24",
+            "ALTER TABLE importaciones ADD COLUMN IF NOT EXISTS cos_precio_bici_scott_adulto       DECIMAL(15,4) AFTER cos_precio_bici_scott_r20",
+            "ALTER TABLE importaciones ADD COLUMN IF NOT EXISTS cos_precio_bici_scott_tw           DECIMAL(15,4) AFTER cos_precio_bici_scott_adulto",
+            "ALTER TABLE importaciones ADD COLUMN IF NOT EXISTS cos_precio_bici_scott_tw_electrica DECIMAL(15,4) AFTER cos_precio_bici_scott_tw",
+            "ALTER TABLE importaciones ADD COLUMN IF NOT EXISTS cos_precio_bici_megamo_track       DECIMAL(15,4) AFTER cos_precio_bici_scott_tw_electrica",
+            "ALTER TABLE importaciones ADD COLUMN IF NOT EXISTS cos_precio_bici_megamo_reason      DECIMAL(15,4) AFTER cos_precio_bici_megamo_track",
+            "ALTER TABLE importaciones ADD COLUMN IF NOT EXISTS cos_precio_bici_megamo_vitae       DECIMAL(15,4) AFTER cos_precio_bici_megamo_reason",
+            "ALTER TABLE importaciones ADD COLUMN IF NOT EXISTS cos_precio_bici_total              DECIMAL(15,4) AFTER cos_precio_bici_megamo_vitae",
         ]
         for sql in migraciones:
             try:
@@ -1040,5 +1066,59 @@ def _recalcular_campos(data: dict) -> dict:
             data[campo_usd] = round(float(pesos) / float(tc), 4) if pesos and tc else None
         except Exception:
             data[campo_usd] = None
+
+    # ── Precio por bicicleta por tipo de caja ────────────────────────────────
+    # Suma los 11 conceptos de distribución logística (todos ya en USD)
+    _CAMPOS_SUM_USD = [
+        "cos_maniobras_usd", "cos_cargos_adicionales_usd",
+        "cos_flete_terrestre_usd", "cos_flete_internacional_usd",
+        "cos_pernoctas_usd", "cos_paquetexpress_usd",
+        "cos_demoras_usd", "cos_lavado_contenedor_usd",
+        "cos_reconocimiento_aduanero_usd", "cos_gastos_forwarder_usd",
+        "cos_custodia_usd",
+    ]
+    # (campo_cantidad, m³_por_caja, campo_resultado)
+    _CAJAS = [
+        ("cos_caja_scott_r24",          0.16, "cos_precio_bici_scott_r24"),
+        ("cos_caja_scott_r20",          0.14, "cos_precio_bici_scott_r20"),
+        ("cos_caja_scott_adulto",       0.25, "cos_precio_bici_scott_adulto"),
+        ("cos_caja_scott_tw",           0.42, "cos_precio_bici_scott_tw"),
+        ("cos_caja_scott_tw_electrica", 0.45, "cos_precio_bici_scott_tw_electrica"),
+        ("cos_caja_megamo_track",       0.32, "cos_precio_bici_megamo_track"),
+        ("cos_caja_megamo_reason",      0.42, "cos_precio_bici_megamo_reason"),
+        ("cos_caja_megamo_vitae",       0.46, "cos_precio_bici_megamo_vitae"),
+    ]
+    total_usd_dist = sum(float(data.get(f) or 0) for f in _CAMPOS_SUM_USD)
+
+    # Cajas activas (con cantidad válida, sin N/A)
+    cajas_activas = []
+    for campo, vol, campo_precio in _CAJAS:
+        raw = data.get(campo)
+        if raw is not None and str(raw) != "__NA__":
+            try:
+                qty = int(raw)
+                if qty > 0:
+                    cajas_activas.append((qty, vol, campo_precio))
+            except Exception:
+                pass
+
+    total_vol = sum(qty * vol for qty, vol, _ in cajas_activas)
+    total_bikes = sum(qty for qty, _, _ in cajas_activas)
+
+    if total_usd_dist > 0 and total_vol > 0:
+        activos_precios = {cp for _, _, cp in cajas_activas}
+        for qty, vol, campo_precio in cajas_activas:
+            pct = (qty * vol) / total_vol
+            data[campo_precio] = round((total_usd_dist * pct) / qty, 4)
+        for _, _, campo_precio in _CAJAS:
+            if campo_precio not in activos_precios:
+                data[campo_precio] = None
+    else:
+        for _, _, campo_precio in _CAJAS:
+            data[campo_precio] = None
+
+    data["cos_precio_bici_total"] = (
+        round(total_usd_dist / total_bikes, 4) if total_usd_dist > 0 and total_bikes > 0 else None
+    )
 
     return data
