@@ -3254,7 +3254,8 @@ def obtener_retroactivo_individual(identificador):
                 tr.importe_final, tr.porcentaje_retroactivo, tr.porcentaje_retroactivo_apparel,
                 tr.compra_adicional, tr.retroactivo_total, tr.importe, tr.estatus, tr.NC, tr.FACT,
                 COALESCE(c.temporada_cerrada, 0)   AS temporada_cerrada,
-                c.fecha_cierre_temporada
+                c.fecha_cierre_temporada,
+                c.fecha_cierre_apparel
             FROM tabla_retroactivos tr
             LEFT JOIN clientes c ON UPPER(TRIM(tr.CLAVE)) = UPPER(TRIM(c.clave))
             WHERE tr.CLAVE = %s OR tr.CLIENTE LIKE %s
@@ -3268,8 +3269,9 @@ def obtener_retroactivo_individual(identificador):
             return jsonify({"mensaje": "Cliente no encontrado"}), 404
 
         # Guardar campos de cierre antes de la serialización genérica
-        _tc  = cliente_data.get('temporada_cerrada')
-        _fct = cliente_data.get('fecha_cierre_temporada')
+        _tc   = cliente_data.get('temporada_cerrada')
+        _fct  = cliente_data.get('fecha_cierre_temporada')
+        _fca  = cliente_data.get('fecha_cierre_apparel')
 
         for clave, valor in cliente_data.items():
             cliente_data[clave] = convertir_decimal_y_fecha(valor)
@@ -3307,6 +3309,13 @@ def obtener_retroactivo_individual(identificador):
             )
         else:
             cliente_data['fecha_cierre_temporada'] = None
+
+        if _fca:
+            cliente_data['fecha_cierre_apparel'] = (
+                _fca.strftime('%Y-%m-%d') if hasattr(_fca, 'strftime') else str(_fca)
+            )
+        else:
+            cliente_data['fecha_cierre_apparel'] = None
 
         minima_anual = cliente_data.get('COMPRA_MINIMA_ANUAL', 0) or 0
         minima_apparel = cliente_data.get('COMPRA_MINIMA_APPAREL', 0) or 0
