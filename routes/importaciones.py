@@ -248,7 +248,7 @@ def inicializar_tablas():
                 log_origen                      VARCHAR(100),
                 log_tipo_productos              TEXT,
                 log_fecha_solicitud_cotizaciones DATE,
-                log_confirmacion_cotizacion     TEXT,
+                log_confirmacion_cotizacion     DATE,
                 log_costo_flete                 VARCHAR(255),
                 log_fecha_shipping_instructions DATE,
                 log_confirmacion_booking        DATE,
