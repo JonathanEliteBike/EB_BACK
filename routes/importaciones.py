@@ -775,14 +775,14 @@ def dashboard():
 
         # ── Precio por bicicleta promedio x tipo de caja (calculado en tiempo real) ──
         _CAJAS_DEF = [
-            ("cos_caja_scott_r24",          0.16, "SCOTT R-24",          "0.16 m³"),
-            ("cos_caja_scott_r20",          0.14, "SCOTT R-20",          "0.14 m³"),
-            ("cos_caja_scott_adulto",       0.25, "SCOTT Adulto",        "0.25 m³"),
-            ("cos_caja_scott_tw",           0.42, "SCOTT TW",            "0.42 m³"),
-            ("cos_caja_scott_tw_electrica", 0.45, "SCOTT TW Eléctrica",  "0.45 m³"),
-            ("cos_caja_megamo_track",       0.32, "Megamo Track/Pulse",  "0.32 m³"),
-            ("cos_caja_megamo_reason",      0.42, "Megamo Reason/Flame", "0.42 m³"),
-            ("cos_caja_megamo_vitae",       0.46, "Megamo Vitae",        "0.46 m³"),
+            ("cos_caja_scott_r24",          0.1640, "SCOTT R-24",          "0.164 m³"),
+            ("cos_caja_scott_r20",          0.1360, "SCOTT R-20",          "0.136 m³"),
+            ("cos_caja_scott_adulto",       0.2500, "SCOTT Adulto",        "0.25 m³"),
+            ("cos_caja_scott_tw",           0.4228, "SCOTT TW",            "0.4228 m³"),
+            ("cos_caja_scott_tw_electrica", 0.4500, "SCOTT TW Eléctrica",  "0.45 m³"),
+            ("cos_caja_megamo_track",       0.3200, "Megamo Track/Pulse",  "0.32 m³"),
+            ("cos_caja_megamo_reason",      0.4200, "Megamo Reason/Flame", "0.42 m³"),
+            ("cos_caja_megamo_vitae",       0.4600, "Megamo Vitae",        "0.46 m³"),
         ]
         def _precio_bici_row(r):
             """Calcula precio/bici por modelo para un row desde inputs crudos."""
@@ -1166,14 +1166,14 @@ def _recalcular_campos(data: dict) -> dict:
     ]
     # (campo_cantidad, m³_por_caja, campo_resultado)
     _CAJAS = [
-        ("cos_caja_scott_r24",          0.16, "cos_precio_bici_scott_r24"),
-        ("cos_caja_scott_r20",          0.14, "cos_precio_bici_scott_r20"),
-        ("cos_caja_scott_adulto",       0.25, "cos_precio_bici_scott_adulto"),
-        ("cos_caja_scott_tw",           0.42, "cos_precio_bici_scott_tw"),
-        ("cos_caja_scott_tw_electrica", 0.45, "cos_precio_bici_scott_tw_electrica"),
-        ("cos_caja_megamo_track",       0.32, "cos_precio_bici_megamo_track"),
-        ("cos_caja_megamo_reason",      0.42, "cos_precio_bici_megamo_reason"),
-        ("cos_caja_megamo_vitae",       0.46, "cos_precio_bici_megamo_vitae"),
+        ("cos_caja_scott_r24",          0.1640, "cos_precio_bici_scott_r24"),
+        ("cos_caja_scott_r20",          0.1360, "cos_precio_bici_scott_r20"),
+        ("cos_caja_scott_adulto",       0.2500, "cos_precio_bici_scott_adulto"),
+        ("cos_caja_scott_tw",           0.4228, "cos_precio_bici_scott_tw"),
+        ("cos_caja_scott_tw_electrica", 0.4500, "cos_precio_bici_scott_tw_electrica"),
+        ("cos_caja_megamo_track",       0.3200, "cos_precio_bici_megamo_track"),
+        ("cos_caja_megamo_reason",      0.4200, "cos_precio_bici_megamo_reason"),
+        ("cos_caja_megamo_vitae",       0.4600, "cos_precio_bici_megamo_vitae"),
     ]
     total_usd_dist = sum(float(data.get(f) or 0) for f in _CAMPOS_SUM_USD)
 
