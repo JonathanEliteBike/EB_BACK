@@ -1002,6 +1002,14 @@ def _recalcular_acumulados_previo(conexion, cursor):
     """, (DEFAULT_INICIO, FECHA_CORTE))
     totales = {row['clave']: row for row in cursor.fetchall()}
 
+    # Claves cerradas — no sobrescribir su previo con ceros durante sync global
+    cursor.execute("""
+        SELECT UPPER(TRIM(clave)) AS clave
+        FROM clientes
+        WHERE temporada_cerrada = 1
+    """)
+    claves_cerradas = {row['clave'] for row in cursor.fetchall()}
+
     cursor.execute("SELECT clave, id_grupo FROM clientes WHERE id_grupo IS NOT NULL")
     miembros_grupo = {}
     for row in cursor.fetchall():
@@ -1046,6 +1054,9 @@ def _recalcular_acumulados_previo(conexion, cursor):
             p_vittoria = {p: sf(claves, f'vittoria_{p}') for p in PERIODS}
             p_scott    = {p: sf(claves, f'scott_{p}')    for p in PERIODS}
         else:
+            clave_upper = str(fila['clave'] or '').strip().upper()
+            if clave_upper not in totales and clave_upper in claves_cerradas:
+                continue  # Preservar previo de distribuidores cerrados; el sync global no los toca
             row      = totales.get(fila['clave']) or {}
             syncros  = flt(row.get('syncros'))
             apparel  = flt(row.get('apparel'))
