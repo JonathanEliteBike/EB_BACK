@@ -175,7 +175,7 @@ _CAMPOS_CALC = [
     "cos_precio_bici_total",
 ]
 
-_NO_CUENTA = {None, "", "NO"}
+_NO_CUENTA = {None, ""}
 
 def _calcular_progreso(row: dict) -> dict:
     # Collect all N/A fields (officially saved + draft borradores)
