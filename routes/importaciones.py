@@ -768,7 +768,7 @@ def dashboard():
                 "cos_flete_internacional_usd": float(r["cos_flete_internacional_usd"]) if r.get("cos_flete_internacional_usd") else None,
                 "costo_total_pesos":           costo_total_pesos,
                 "cos_cantidad_bicicletas":     int(nbici) if nbici else None,
-                "costo_por_bicicleta":         round(costo_total_pesos / float(nbici), 2) if nbici and costo_total_pesos else None,
+                "costo_por_bicicleta":         round(costo_total_pesos / tc / float(nbici), 2) if nbici and costo_total_pesos and tc else None,
                 "notas":                       r.get("notas") or "",
                 "progreso":                    prog,
             })
