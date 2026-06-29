@@ -74,7 +74,7 @@ CAMPOS_IMPORTACION = [
     "imp_carta_declaracion_marca", "imp_carta_aplicacion_uva",
     "imp_articulos_verificar", "imp_liberacion_folios",
     "imp_fecha_pago_pedimento", "imp_fecha_traduccion",
-    "imp_fecha_numeros_serie", "imp_carta_porte",
+    "imp_fecha_numeros_serie",
     "imp_fecha_limite_cruce",
 ]
 
