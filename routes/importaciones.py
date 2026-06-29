@@ -773,28 +773,89 @@ def dashboard():
                 "progreso":                    prog,
             })
 
-        # ── Precio por bicicleta promedio x tipo de caja ─────────────────────
-        _CAJAS_LABELS = [
-            ("cos_precio_bici_scott_r24",          "SCOTT R-24",          "0.16 m³"),
-            ("cos_precio_bici_scott_r20",          "SCOTT R-20",          "0.14 m³"),
-            ("cos_precio_bici_scott_adulto",       "SCOTT Adulto",        "0.25 m³"),
-            ("cos_precio_bici_scott_tw",           "SCOTT TW",            "0.42 m³"),
-            ("cos_precio_bici_scott_tw_electrica", "SCOTT TW Eléctrica",  "0.45 m³"),
-            ("cos_precio_bici_megamo_track",       "Megamo Track/Pulse",  "0.32 m³"),
-            ("cos_precio_bici_megamo_reason",      "Megamo Reason/Flame", "0.42 m³"),
-            ("cos_precio_bici_megamo_vitae",       "Megamo Vitae",        "0.46 m³"),
+        # ── Precio por bicicleta promedio x tipo de caja (calculado en tiempo real) ──
+        _CAJAS_DEF = [
+            ("cos_caja_scott_r24",          0.16, "SCOTT R-24",          "0.16 m³"),
+            ("cos_caja_scott_r20",          0.14, "SCOTT R-20",          "0.14 m³"),
+            ("cos_caja_scott_adulto",       0.25, "SCOTT Adulto",        "0.25 m³"),
+            ("cos_caja_scott_tw",           0.42, "SCOTT TW",            "0.42 m³"),
+            ("cos_caja_scott_tw_electrica", 0.45, "SCOTT TW Eléctrica",  "0.45 m³"),
+            ("cos_caja_megamo_track",       0.32, "Megamo Track/Pulse",  "0.32 m³"),
+            ("cos_caja_megamo_reason",      0.42, "Megamo Reason/Flame", "0.42 m³"),
+            ("cos_caja_megamo_vitae",       0.46, "Megamo Vitae",        "0.46 m³"),
         ]
+        def _precio_bici_row(r):
+            """Calcula precio/bici por modelo para un row desde inputs crudos."""
+            tc = r.get("cos_tipo_cambio_pedimento")
+            try: tc = float(tc) if tc else None
+            except: tc = None
+
+            # Sumar costos de distribución en USD
+            total_usd = 0.0
+            for f in ["cos_flete_terrestre_usd", "cos_flete_internacional_usd",
+                      "cos_pernoctas_usd", "cos_paquetexpress_usd", "cos_demoras_usd"]:
+                try: total_usd += float(r.get(f) or 0)
+                except: pass
+            for campo_p, campo_u in [
+                ("cos_maniobras_pesos",          "cos_maniobras_usd"),
+                ("cos_cargos_adicionales_pesos", "cos_cargos_adicionales_usd"),
+                ("cos_lavado_contenedor_pesos",  "cos_lavado_contenedor_usd"),
+                ("cos_reconocimiento_aduanero",  "cos_reconocimiento_aduanero_usd"),
+                ("cos_gastos_forwarder_pesos",   "cos_gastos_forwarder_usd"),
+                ("cos_custodia_pesos",           "cos_custodia_usd"),
+            ]:
+                v_usd = r.get(campo_u)
+                if v_usd is not None:
+                    try: total_usd += float(v_usd); continue
+                    except: pass
+                v_pesos = r.get(campo_p)
+                if v_pesos and tc:
+                    try: total_usd += float(v_pesos) / tc
+                    except: pass
+
+            # Cajas activas con cantidad válida
+            cajas_activas = []
+            for campo_c, vol, label, _ in _CAJAS_DEF:
+                raw = r.get(campo_c)
+                if raw is not None and str(raw) != "__NA__":
+                    try:
+                        qty = int(raw)
+                        if qty > 0:
+                            cajas_activas.append((qty, vol, label))
+                    except: pass
+
+            if not cajas_activas or total_usd <= 0:
+                return None
+            total_vol = sum(q * v for q, v, _ in cajas_activas)
+            total_bikes = sum(q for q, _, _ in cajas_activas)
+            model_prices = {
+                label: round((total_usd * (qty * vol) / total_vol) / qty, 4)
+                for qty, vol, label in cajas_activas
+            }
+            return model_prices, round(total_usd / total_bikes, 4)
+
+        # Acumular precio/bici por modelo
+        _model_vals: dict = {}
+        _total_vals: list = []
+        for r in rows:
+            res = _precio_bici_row(r)
+            if res is None:
+                continue
+            model_prices, total_price = res
+            for label, price in model_prices.items():
+                _model_vals.setdefault(label, []).append(price)
+            _total_vals.append(total_price)
+
         precio_bici_x_caja = []
-        for campo, label, vol in _CAJAS_LABELS:
-            vals = [float(r[campo]) for r in rows if r.get(campo)]
+        for _, _, label, vol_str in _CAJAS_DEF:
+            vals = _model_vals.get(label, [])
             if vals:
                 precio_bici_x_caja.append({
-                    "label": label, "vol": vol,
+                    "label": label, "vol": vol_str,
                     "promedio": round(sum(vals) / len(vals), 2),
                     "n": len(vals),
                 })
-        _vals_tot = [float(r["cos_precio_bici_total"]) for r in rows if r.get("cos_precio_bici_total")]
-        precio_bici_total_promedio = round(sum(_vals_tot) / len(_vals_tot), 2) if _vals_tot else None
+        precio_bici_total_promedio = round(sum(_total_vals) / len(_total_vals), 2) if _total_vals else None
 
         # ── Opciones para filtros ─────────────────────────────────────────────
         all_origenes = sorted({
