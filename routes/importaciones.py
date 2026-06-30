@@ -659,8 +659,7 @@ def dashboard():
                 from datetime import date as _date
                 def _parse(v):
                     return v if isinstance(v, _date) else _date.fromisoformat(str(v)[:10])
-                d = (_parse(b) - _parse(a)).days
-                return d if d >= 0 else None
+                return (_parse(b) - _parse(a)).days
             except Exception:
                 return None
 
