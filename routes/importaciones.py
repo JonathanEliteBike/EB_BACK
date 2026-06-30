@@ -713,6 +713,30 @@ def dashboard():
             key=lambda x: x["importador"]
         )
 
+        # Etiquetado: proyectado vs real
+        _proy_etiq = [r["alm_proyectado_dias_etiquetado"] for r in rows if r.get("alm_proyectado_dias_etiquetado")]
+        _real_etiq = [r["alm_real_dias_etiquetado"] for r in rows if r.get("alm_real_dias_etiquetado")]
+        _etiq_x_emb = []
+        for r in rows:
+            proy = r.get("alm_proyectado_dias_etiquetado")
+            real = r.get("alm_real_dias_etiquetado")
+            if proy is not None or real is not None:
+                _etiq_x_emb.append({
+                    "id":          r["id"],
+                    "referencia":  r["referencia"],
+                    "nombre":      r.get("nombre") or "",
+                    "proyectado":  proy,
+                    "real":        real,
+                    "diferencia":  (real - proy) if (proy is not None and real is not None) else None,
+                })
+        latencia_etiquetado = {
+            "proyectado_promedio": round(sum(_proy_etiq) / len(_proy_etiq), 1) if _proy_etiq else None,
+            "real_promedio":       round(sum(_real_etiq) / len(_real_etiq), 1) if _real_etiq else None,
+            "n_proyectado":        len(_proy_etiq),
+            "n_real":              len(_real_etiq),
+            "x_embarque":         sorted(_etiq_x_emb, key=lambda x: -(x["diferencia"] or 0)),
+        }
+
         # Costo paquetería x importación (USD) — mismos 11 conceptos que precio/bici
         _cam_paq = ["cos_maniobras_usd", "cos_cargos_adicionales_usd", "cos_flete_terrestre_usd",
                     "cos_flete_internacional_usd", "cos_pernoctas_usd", "cos_paquetexpress_usd",
@@ -893,6 +917,7 @@ def dashboard():
                 "contabilidad":           latencia_contabilidad,
                 "transito":               latencia_transito,
                 "transito_x_importador":  latencia_transito_x_importador,
+                "etiquetado":             latencia_etiquetado,
             },
             "costo_paqueteria": costo_paqueteria,
             "precio_bici_x_caja": precio_bici_x_caja,
