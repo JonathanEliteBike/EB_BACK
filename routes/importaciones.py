@@ -1063,6 +1063,28 @@ def actualizar(id_imp):
         vals.append(id_imp)
         cursor.execute(f"UPDATE importaciones SET {set_clause} WHERE id = %s", vals)
         conn.commit()
+
+        # ── Auto-transición de estado según progreso global ───────────────────
+        cursor.execute("SELECT * FROM importaciones WHERE id = %s", (id_imp,))
+        saved = cursor.fetchone()
+        if saved:
+            prog   = _calcular_progreso(saved)
+            t      = sum(s["total"]      for s in prog.values())
+            c      = sum(s["completados"] for s in prog.values())
+            pct_g  = round(c / t * 100) if t else 0
+            estado_actual = saved.get("estado") or "activo"
+
+            if pct_g == 100 and estado_actual == "activo":
+                cursor.execute(
+                    "UPDATE importaciones SET estado = 'cerrado' WHERE id = %s", (id_imp,)
+                )
+                conn.commit()
+            elif pct_g < 100 and estado_actual == "cerrado":
+                cursor.execute(
+                    "UPDATE importaciones SET estado = 'activo' WHERE id = %s", (id_imp,)
+                )
+                conn.commit()
+
         return jsonify({"ok": True}), 200
     except Exception as e:
         conn.rollback()
