@@ -678,15 +678,22 @@ def dashboard():
             except Exception:
                 return None
 
+        # Tránsito aéreo: booking → llegada almacén (solo AEREO con ambas fechas)
+        _trans_aereo = [d for r in rows
+                        if r.get("via_transporte") == "AEREO"
+                        for d in [_lat_dias(r, "log_fecha_booking", "des_llegada_almacen")]
+                        if d is not None and d >= 0]
+        transito_aereo_prom = round(sum(_trans_aereo) / len(_trans_aereo), 1) if _trans_aereo else None
+
         # Total (log_fecha_entrega → rec_liberacion_final)
-        _all_lat = [d for d in (_lat_dias(r, "log_fecha_entrega", "rec_liberacion_final") for r in rows) if d is not None]
+        _all_lat = [d for d in (_lat_dias(r, "log_fecha_entrega", "rec_liberacion_final") for r in rows) if d is not None and d >= 0]
         latencia_total_dias = round(sum(_all_lat) / len(_all_lat), 1) if _all_lat else None
 
         # Por origen
         _lo_s: dict = {}; _lo_n: dict = {}
         for r in rows:
             d = _lat_dias(r, "log_fecha_entrega", "rec_liberacion_final")
-            if d is not None:
+            if d is not None and d >= 0:
                 o = _norm_origen(r.get("log_origen")) or "Sin origen"
                 _lo_s[o] = _lo_s.get(o, 0) + d; _lo_n[o] = _lo_n.get(o, 0) + 1
         latencia_x_origen = sorted(
@@ -702,27 +709,27 @@ def dashboard():
               "fecha_ini": str(r.get("log_fecha_entrega") or "")[:10],
               "fecha_fin": str(r.get("rec_liberacion_final") or "")[:10],
               "dias": d}
-             for r, d in _lat_emb_raw if d is not None],
+             for r, d in _lat_emb_raw if d is not None and d >= 0],
             key=lambda x: -x["dias"]
         )
 
         # Almacén: des_llegada_almacen → rec_recepcion_odoo
-        _d_alm = [d for d in (_lat_dias(r, "des_llegada_almacen", "rec_recepcion_odoo") for r in rows) if d is not None]
+        _d_alm = [d for d in (_lat_dias(r, "des_llegada_almacen", "rec_recepcion_odoo") for r in rows) if d is not None and d >= 0]
         latencia_almacen = {"dias_promedio": round(sum(_d_alm) / len(_d_alm), 1) if _d_alm else None, "n": len(_d_alm)}
 
         # Contabilidad: des_fecha_cruce_real → log_recepcion_documentos
-        _d_cont = [d for d in (_lat_dias(r, "des_fecha_cruce_real", "log_recepcion_documentos") for r in rows) if d is not None]
+        _d_cont = [d for d in (_lat_dias(r, "des_fecha_cruce_real", "log_recepcion_documentos") for r in rows) if d is not None and d >= 0]
         latencia_contabilidad = {"dias_promedio": round(sum(_d_cont) / len(_d_cont), 1) if _d_cont else None, "n": len(_d_cont)}
 
         # Tránsito: log_fecha_entrega → des_llegada_almacen
-        _d_trans = [d for d in (_lat_dias(r, "log_fecha_entrega", "des_llegada_almacen") for r in rows) if d is not None]
+        _d_trans = [d for d in (_lat_dias(r, "log_fecha_entrega", "des_llegada_almacen") for r in rows) if d is not None and d >= 0]
         latencia_transito = {"dias_promedio": round(sum(_d_trans) / len(_d_trans), 1) if _d_trans else None, "n": len(_d_trans)}
 
         # Almacén x embarque
         _alm_emb = []
         for r in rows:
             d = _lat_dias(r, "des_llegada_almacen", "rec_recepcion_odoo")
-            if d is not None:
+            if d is not None and d >= 0:
                 _alm_emb.append({"id": r["id"], "referencia": r["referencia"], "nombre": r.get("nombre") or "",
                                   "log_origen": _norm_origen(r.get("log_origen")),
                                   "fecha_ini": str(r.get("des_llegada_almacen") or "")[:10],
@@ -733,7 +740,7 @@ def dashboard():
         _cont_emb = []
         for r in rows:
             d = _lat_dias(r, "des_fecha_cruce_real", "log_recepcion_documentos")
-            if d is not None:
+            if d is not None and d >= 0:
                 _cont_emb.append({"id": r["id"], "referencia": r["referencia"], "nombre": r.get("nombre") or "",
                                    "log_origen": _norm_origen(r.get("log_origen")),
                                    "fecha_ini": str(r.get("des_fecha_cruce_real") or "")[:10],
@@ -744,7 +751,7 @@ def dashboard():
         _trans_emb = []
         for r in rows:
             d = _lat_dias(r, "log_fecha_entrega", "des_llegada_almacen")
-            if d is not None:
+            if d is not None and d >= 0:
                 _trans_emb.append({"id": r["id"], "referencia": r["referencia"], "nombre": r.get("nombre") or "",
                                    "log_origen": _norm_origen(r.get("log_origen")),
                                    "fecha_ini": str(r.get("log_fecha_entrega") or "")[:10],
@@ -755,7 +762,7 @@ def dashboard():
         _lti_s: dict = {}; _lti_n: dict = {}
         for r in rows:
             d = _lat_dias(r, "log_fecha_entrega", "des_llegada_almacen")
-            if d is not None:
+            if d is not None and d >= 0:
                 imp = (r.get("odoo_importador") or "Sin importador").strip()
                 _lti_s[imp] = _lti_s.get(imp, 0) + d; _lti_n[imp] = _lti_n.get(imp, 0) + 1
         latencia_transito_x_importador = sorted(
@@ -979,6 +986,8 @@ def dashboard():
                 "flete_total_usd":                 flete_total,
                 "flete_promedio_usd":              flete_prom,
                 "transito_maritimo_promedio_dias": transito_prom,
+                "transito_aereo_promedio_dias":   transito_aereo_prom,
+                "transito_aereo_n":               len(_trans_aereo),
                 "pct_avance_promedio":             pct_prom,
             },
             "por_via":       por_via_list,
