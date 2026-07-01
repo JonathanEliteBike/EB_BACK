@@ -131,6 +131,9 @@ CAMPOS_COSTOS = [
     "cos_caja_scott_r24", "cos_caja_scott_r20", "cos_caja_scott_adulto",
     "cos_caja_scott_tw", "cos_caja_scott_tw_electrica", "cos_caja_megamo_track",
     "cos_caja_megamo_reason", "cos_caja_megamo_vitae",
+    # Proyección de costos
+    "cos_flete_proyectado_usd", "cos_tipo_cambio_proyectado",
+    "cos_maniobras_proyectado_pesos", "cos_honorarios_proyectado_pesos",
 ]
 
 
@@ -467,6 +470,10 @@ def inicializar_tablas():
             "ALTER TABLE importaciones ADD COLUMN IF NOT EXISTS cos_precio_bici_megamo_reason      DECIMAL(15,4) AFTER cos_precio_bici_megamo_track",
             "ALTER TABLE importaciones ADD COLUMN IF NOT EXISTS cos_precio_bici_megamo_vitae       DECIMAL(15,4) AFTER cos_precio_bici_megamo_reason",
             "ALTER TABLE importaciones ADD COLUMN IF NOT EXISTS cos_precio_bici_total              DECIMAL(15,4) AFTER cos_precio_bici_megamo_vitae",
+            "ALTER TABLE importaciones ADD COLUMN IF NOT EXISTS cos_flete_proyectado_usd           DECIMAL(15,2) AFTER cos_precio_bici_total",
+            "ALTER TABLE importaciones ADD COLUMN IF NOT EXISTS cos_tipo_cambio_proyectado         DECIMAL(10,4) AFTER cos_flete_proyectado_usd",
+            "ALTER TABLE importaciones ADD COLUMN IF NOT EXISTS cos_maniobras_proyectado_pesos     DECIMAL(15,2) AFTER cos_tipo_cambio_proyectado",
+            "ALTER TABLE importaciones ADD COLUMN IF NOT EXISTS cos_honorarios_proyectado_pesos    DECIMAL(15,2) AFTER cos_maniobras_proyectado_pesos",
         ]
         for sql in migraciones:
             try:
@@ -821,6 +828,31 @@ def dashboard():
                 2
             )
 
+            # Costo Real (subconjunto definido para la tarjeta PROY/REAL)
+            costo_real_pesos = round(
+                float(r.get("cos_maniobras_pesos")          or 0) +
+                float(r.get("cos_cargos_adicionales_pesos") or 0) +
+                float(r.get("cos_demoras_usd")              or 0) * tc +
+                float(r.get("cos_lavado_contenedor_pesos")  or 0) +
+                float(r.get("cos_reconocimiento_aduanero")  or 0) +
+                float(r.get("cos_flete_internacional_usd")  or 0) * tc +
+                float(r.get("cos_flete_terrestre_usd")      or 0) * tc +
+                float(r.get("cos_custodia_pesos")           or 0) +
+                float(r.get("cos_paquetexpress_usd")        or 0) * tc +
+                float(r.get("cos_gastos_forwarder_pesos")   or 0) +
+                float(r.get("cos_honorarios_pesos")         or 0),
+                2
+            )
+
+            # Costo Proyectado
+            tc_proy = float(r.get("cos_tipo_cambio_proyectado") or 0)
+            costo_proyectado_pesos = round(
+                float(r.get("cos_flete_proyectado_usd")        or 0) * tc_proy +
+                float(r.get("cos_maniobras_proyectado_pesos")  or 0) +
+                float(r.get("cos_honorarios_proyectado_pesos") or 0),
+                2
+            ) if tc_proy else None
+
             nbici = r.get("cos_cantidad_bicicletas")
             embarques_res.append({
                 "id":                          r["id"],
@@ -832,8 +864,11 @@ def dashboard():
                 "estado":                      r.get("estado") or "activo",
                 "pct_global":                  pct_global,
                 "des_llegada_almacen":         r.get("des_llegada_almacen"),
+                "des_fecha_entrega_almacen_prog": r.get("des_fecha_entrega_almacen_prog"),
                 "cos_flete_internacional_usd": float(r["cos_flete_internacional_usd"]) if r.get("cos_flete_internacional_usd") else None,
                 "costo_total_pesos":           costo_total_pesos,
+                "costo_real_pesos":            costo_real_pesos if costo_real_pesos else None,
+                "costo_proyectado_pesos":      costo_proyectado_pesos,
                 "cos_cantidad_bicicletas":     int(nbici) if nbici else None,
                 "costo_por_bicicleta":         round(costo_total_pesos / tc / float(nbici), 2) if nbici and costo_total_pesos and tc else None,
                 "notas":                       r.get("notas") or "",
