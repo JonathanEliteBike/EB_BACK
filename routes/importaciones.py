@@ -536,6 +536,14 @@ def obtener(id_imp):
 
 @importaciones_bp.route("/dashboard", methods=["GET"])
 def dashboard():
+    import unicodedata as _ud
+    _ORIGEN_CANON = {"ESPANA": "ESPAÑA", "BELGICA": "BÉLGICA"}
+    def _norm_origen(s):
+        if not s:
+            return ""
+        key = "".join(c for c in _ud.normalize("NFD", s.strip().upper()) if _ud.category(c) != "Mn")
+        return _ORIGEN_CANON.get(key, key)
+
     via    = request.args.get("via",    "").strip()
     estado = request.args.get("estado", "").strip()
     origen = request.args.get("origen", "").strip()
@@ -602,7 +610,7 @@ def dashboard():
         # ── Por origen (top 10) ───────────────────────────────────────────────
         por_origen: dict = {}
         for r in rows:
-            o = (r.get("log_origen") or "Sin origen").strip().upper()
+            o = _norm_origen(r.get("log_origen")) or "Sin origen"
             por_origen[o] = por_origen.get(o, 0) + 1
         por_origen_list = sorted(
             [{"origen": k, "count": v} for k, v in por_origen.items()],
@@ -672,18 +680,21 @@ def dashboard():
         for r in rows:
             d = _lat_dias(r, "log_fecha_entrega", "rec_liberacion_final")
             if d is not None:
-                o = (r.get("log_origen") or "Sin origen").strip().upper()
+                o = _norm_origen(r.get("log_origen")) or "Sin origen"
                 _lo_s[o] = _lo_s.get(o, 0) + d; _lo_n[o] = _lo_n.get(o, 0) + 1
         latencia_x_origen = sorted(
             [{"origen": o, "dias_promedio": round(_lo_s[o] / _lo_n[o], 1), "n": _lo_n[o]} for o in _lo_s],
             key=lambda x: -x["dias_promedio"]
         )
 
-        # Por embarque
+        # Por embarque (total: log_fecha_entrega → rec_liberacion_final)
         _lat_emb_raw = [(r, _lat_dias(r, "log_fecha_entrega", "rec_liberacion_final")) for r in rows]
         latencia_x_embarque = sorted(
             [{"id": r["id"], "referencia": r["referencia"], "nombre": r.get("nombre") or "",
-              "log_origen": (r.get("log_origen") or "").strip().upper(), "dias": d}
+              "log_origen": _norm_origen(r.get("log_origen")),
+              "fecha_ini": str(r.get("log_fecha_entrega") or "")[:10],
+              "fecha_fin": str(r.get("rec_liberacion_final") or "")[:10],
+              "dias": d}
              for r, d in _lat_emb_raw if d is not None],
             key=lambda x: -x["dias"]
         )
@@ -699,6 +710,39 @@ def dashboard():
         # Tránsito: log_fecha_entrega → des_llegada_almacen
         _d_trans = [d for d in (_lat_dias(r, "log_fecha_entrega", "des_llegada_almacen") for r in rows) if d is not None]
         latencia_transito = {"dias_promedio": round(sum(_d_trans) / len(_d_trans), 1) if _d_trans else None, "n": len(_d_trans)}
+
+        # Almacén x embarque
+        _alm_emb = []
+        for r in rows:
+            d = _lat_dias(r, "des_llegada_almacen", "rec_recepcion_odoo")
+            if d is not None:
+                _alm_emb.append({"id": r["id"], "referencia": r["referencia"], "nombre": r.get("nombre") or "",
+                                  "log_origen": _norm_origen(r.get("log_origen")),
+                                  "fecha_ini": str(r.get("des_llegada_almacen") or "")[:10],
+                                  "fecha_fin": str(r.get("rec_recepcion_odoo") or "")[:10], "dias": d})
+        _alm_emb.sort(key=lambda x: -x["dias"])
+
+        # Contabilidad x embarque
+        _cont_emb = []
+        for r in rows:
+            d = _lat_dias(r, "des_fecha_cruce_real", "log_recepcion_documentos")
+            if d is not None:
+                _cont_emb.append({"id": r["id"], "referencia": r["referencia"], "nombre": r.get("nombre") or "",
+                                   "log_origen": _norm_origen(r.get("log_origen")),
+                                   "fecha_ini": str(r.get("des_fecha_cruce_real") or "")[:10],
+                                   "fecha_fin": str(r.get("log_recepcion_documentos") or "")[:10], "dias": d})
+        _cont_emb.sort(key=lambda x: -x["dias"])
+
+        # Tránsito x embarque
+        _trans_emb = []
+        for r in rows:
+            d = _lat_dias(r, "log_fecha_entrega", "des_llegada_almacen")
+            if d is not None:
+                _trans_emb.append({"id": r["id"], "referencia": r["referencia"], "nombre": r.get("nombre") or "",
+                                   "log_origen": _norm_origen(r.get("log_origen")),
+                                   "fecha_ini": str(r.get("log_fecha_entrega") or "")[:10],
+                                   "fecha_fin": str(r.get("des_llegada_almacen") or "")[:10], "dias": d})
+        _trans_emb.sort(key=lambda x: -x["dias"])
 
         # Tránsito x importador
         _lti_s: dict = {}; _lti_n: dict = {}
@@ -743,7 +787,7 @@ def dashboard():
                     "cos_gastos_forwarder_usd", "cos_custodia_usd"]
         costo_paqueteria = sorted(
             [{"id": r["id"], "referencia": r["referencia"], "nombre": r.get("nombre") or "",
-              "log_origen": (r.get("log_origen") or "").strip().upper(),
+              "log_origen": _norm_origen(r.get("log_origen")),
               "total_usd": round(sum(float(r.get(c) or 0) for c in _cam_paq), 2)}
              for r in rows],
             key=lambda x: -x["total_usd"]
@@ -882,7 +926,7 @@ def dashboard():
 
         # ── Opciones para filtros ─────────────────────────────────────────────
         all_origenes = sorted({
-            (r.get("log_origen") or "").strip().upper()
+            _norm_origen(r.get("log_origen"))
             for r in rows if r.get("log_origen")
         })
         all_anios = sorted({
@@ -912,9 +956,9 @@ def dashboard():
                 "total_dias":              latencia_total_dias,
                 "x_origen":               latencia_x_origen,
                 "x_embarque":             latencia_x_embarque,
-                "almacen":                latencia_almacen,
-                "contabilidad":           latencia_contabilidad,
-                "transito":               latencia_transito,
+                "almacen":                {**latencia_almacen,      "x_embarque": _alm_emb},
+                "contabilidad":           {**latencia_contabilidad, "x_embarque": _cont_emb},
+                "transito":               {**latencia_transito,     "x_embarque": _trans_emb},
                 "transito_x_importador":  latencia_transito_x_importador,
                 "etiquetado":             latencia_etiquetado,
             },
