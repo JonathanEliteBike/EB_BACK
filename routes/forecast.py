@@ -546,12 +546,132 @@ FORECAST_SKU_WHITELIST = [
     'MH47117508N', 'MH47117104L', 'MH47117204L', 'MH47117304L',
     'MH47117404L', 'MH47117504L', 'MH47117105A', 'MH47117205A',
     'MH47117305A', 'MH47117405A', 'MH47117505A',
+    # ── Scott MY27 nuevos ──────────────────────────────────────────────────
+    # SCOTT SPARK RC WC
+    '427536-8086006', '427536-8086008', '427536-8086010',
+    # SCOTT SPARK RC EXPERT
+    '427539-8350006', '427539-8350008', '427539-8350010',
+    # SCOTT SPARK RC TEAM ISSUE (427537)
+    '427537-8532006', '427537-8532008', '427537-8532010',
+    # SCOTT SPARK RC TEAM ISSUE (427540)
+    '427540-8527006', '427540-8527008', '427540-8527010', '427540-8527012',
+    # SCOTT RANSOM RC
+    '427563-8535008', '427563-8535010',
+    # SCOTT FOIL RC 10
+    '427590-8522002', '427590-8522004', '427590-8522006', '427590-8522008', '427590-8522010',
+    '427590-3020002', '427590-3020004', '427590-3020006', '427590-3020008', '427590-3020010',
+    # SCOTT FOIL RC 20
+    '427591-8086002', '427591-8086004', '427591-8086006', '427591-8086008', '427591-8086010',
+    # SCOTT FOIL RC PRO
+    '427588-8575004', '427588-8575006', '427588-8575008', '427588-8575010',
+    # SCOTT FOIL RC TEAM
+    '427589-8350004', '427589-8350006', '427589-8350008', '427589-8350010',
+    # SCOTT SPARK RC COMP
+    '427541-0002006', '427541-0002008', '427541-0002010', '427541-0002012',
+    # SCOTT ADDICT RC PRO
+    '427598-8575004', '427598-8575006', '427598-8575008',
+    # SCOTT SPARK RC ELITE
+    '427995-8585006', '427995-8585008', '427995-8585010',
+    # SCOTT ROXTER 200
+    '427986-8565222', '427986-8588222',
+    # SCOTT ROXTER 400
+    '427987-1494222', '427987-8606222',
+    # ── Scott adicionales (Contessa / Contrail / Scale / Roxter MY26) ────────
+    '286383-704', '286383-706',
+    '290310-704', '290310-706', '290310-908',
+    '425790-3761222', '425790-8269222',
+    '425791-3028222', '425791-8268222',
+    '425792-2308222', '425792-4173222',
+    '425793-8265222',
+    '425794-3774222',
 ]
 
 # Catálogo oficial MY27 — precios reales + disponibilidad mensual (May-Ago).
 # Meses NOT en este dict (Sep-Abr) siempre son disponibles.
 # avail: True = puede pedirse, False = mes bloqueado (celda oscura, solo lectura).
 SKU_CATALOG: dict = {
+    # ── Scott MY27 nuevos ─────────────────────────────────────────────────────
+    # SPARK RC WC — llega Julio
+    '427536-8086006': {'prices': {'Distribuidor': 140862.07, 'Partner': 137155.17, 'Partner Elite': 132521.55, 'Partner Elite Plus!': 128814.66, 'list_price': 185344.83}, 'avail': {'mayo': False, 'junio': False}},
+    '427536-8086008': {'prices': {'Distribuidor': 140862.07, 'Partner': 137155.17, 'Partner Elite': 132521.55, 'Partner Elite Plus!': 128814.66, 'list_price': 185344.83}, 'avail': {'mayo': False, 'junio': False}},
+    '427536-8086010': {'prices': {'Distribuidor': 140862.07, 'Partner': 137155.17, 'Partner Elite': 132521.55, 'Partner Elite Plus!': 128814.66, 'list_price': 185344.83}, 'avail': {'mayo': False, 'junio': False}},
+    # SPARK RC EXPERT — llega Julio
+    '427539-8350006': {'prices': {'Distribuidor': 94127.59, 'Partner': 91803.45, 'Partner Elite': 88898.28, 'Partner Elite Plus!': 86574.14, 'list_price': 116206.9}, 'avail': {'mayo': False, 'junio': False}},
+    '427539-8350008': {'prices': {'Distribuidor': 94127.59, 'Partner': 91803.45, 'Partner Elite': 88898.28, 'Partner Elite Plus!': 86574.14, 'list_price': 116206.9}, 'avail': {'mayo': False, 'junio': False}},
+    '427539-8350010': {'prices': {'Distribuidor': 94127.59, 'Partner': 91803.45, 'Partner Elite': 88898.28, 'Partner Elite Plus!': 86574.14, 'list_price': 116206.9}, 'avail': {'mayo': False, 'junio': False}},
+    # SPARK RC TEAM ISSUE (427537) — llega Septiembre
+    '427537-8532006': {'prices': {'Distribuidor': 129530.17, 'Partner': 126331.9, 'Partner Elite': 122334.05, 'Partner Elite Plus!': 119135.78, 'list_price': 159913.79}, 'avail': {'mayo': False, 'junio': False, 'julio': False, 'agosto': False}},
+    '427537-8532008': {'prices': {'Distribuidor': 129530.17, 'Partner': 126331.9, 'Partner Elite': 122334.05, 'Partner Elite Plus!': 119135.78, 'list_price': 159913.79}, 'avail': {'mayo': False, 'junio': False, 'julio': False, 'agosto': False}},
+    '427537-8532010': {'prices': {'Distribuidor': 129530.17, 'Partner': 126331.9, 'Partner Elite': 122334.05, 'Partner Elite Plus!': 119135.78, 'list_price': 159913.79}, 'avail': {'mayo': False, 'junio': False, 'julio': False, 'agosto': False}},
+    # SPARK RC TEAM ISSUE (427540) — Sep todas
+    '427540-8527006': {'prices': {'Distribuidor': 76670.69, 'Partner': 74777.59, 'Partner Elite': 72411.21, 'Partner Elite Plus!': 70518.1, 'list_price': 94655.17}, 'avail': {'mayo': False, 'junio': False, 'julio': False, 'agosto': False}},
+    '427540-8527008': {'prices': {'Distribuidor': 76670.69, 'Partner': 74777.59, 'Partner Elite': 72411.21, 'Partner Elite Plus!': 70518.1, 'list_price': 94655.17}, 'avail': {'mayo': False, 'junio': False, 'julio': False, 'agosto': False}},
+    '427540-8527010': {'prices': {'Distribuidor': 76670.69, 'Partner': 74777.59, 'Partner Elite': 72411.21, 'Partner Elite Plus!': 70518.1, 'list_price': 94655.17}, 'avail': {'mayo': False, 'junio': False, 'julio': False, 'agosto': False}},
+    '427540-8527012': {'prices': {'Distribuidor': 76670.69, 'Partner': 74777.59, 'Partner Elite': 72411.21, 'Partner Elite Plus!': 70518.1, 'list_price': 94655.17}, 'avail': {'mayo': False, 'junio': False, 'julio': False, 'agosto': False}},
+    # RANSOM RC — Dic/Sep por talla
+    '427563-8535008': {'prices': {'Distribuidor': 143216.38, 'Partner': 139680.17, 'Partner Elite': 135259.91, 'Partner Elite Plus!': 131723.71, 'list_price': 176810.34}, 'avail': {'mayo': False, 'junio': False, 'julio': False, 'agosto': False, 'septiembre': False, 'octubre': False, 'noviembre': False}},
+    '427563-8535010': {'prices': {'Distribuidor': 143216.38, 'Partner': 139680.17, 'Partner Elite': 135259.91, 'Partner Elite Plus!': 131723.71, 'list_price': 176810.34}, 'avail': {'mayo': False, 'junio': False, 'julio': False, 'agosto': False, 'septiembre': False, 'octubre': False, 'noviembre': False}},
+    # FOIL RC 10 (8522) — Sep todas
+    '427590-8522002': {'prices': {'Distribuidor': 92102.59, 'Partner': 89828.45, 'Partner Elite': 86985.78, 'Partner Elite Plus!': 84711.64, 'list_price': 113706.9}, 'avail': {'mayo': False, 'junio': False, 'julio': False, 'agosto': False}},
+    '427590-8522004': {'prices': {'Distribuidor': 92102.59, 'Partner': 89828.45, 'Partner Elite': 86985.78, 'Partner Elite Plus!': 84711.64, 'list_price': 113706.9}, 'avail': {'mayo': False, 'junio': False, 'julio': False, 'agosto': False}},
+    '427590-8522006': {'prices': {'Distribuidor': 92102.59, 'Partner': 89828.45, 'Partner Elite': 86985.78, 'Partner Elite Plus!': 84711.64, 'list_price': 113706.9}, 'avail': {'mayo': False, 'junio': False, 'julio': False, 'agosto': False}},
+    '427590-8522008': {'prices': {'Distribuidor': 92102.59, 'Partner': 89828.45, 'Partner Elite': 86985.78, 'Partner Elite Plus!': 84711.64, 'list_price': 113706.9}, 'avail': {'mayo': False, 'junio': False, 'julio': False, 'agosto': False}},
+    '427590-8522010': {'prices': {'Distribuidor': 92102.59, 'Partner': 89828.45, 'Partner Elite': 86985.78, 'Partner Elite Plus!': 84711.64, 'list_price': 113706.9}, 'avail': {'mayo': False, 'junio': False, 'julio': False, 'agosto': False}},
+    # FOIL RC 10 (3020) — Dic todas
+    '427590-3020002': {'prices': {'Distribuidor': 92102.59, 'Partner': 89828.45, 'Partner Elite': 86985.78, 'Partner Elite Plus!': 84711.64, 'list_price': 113706.9}, 'avail': {'mayo': False, 'junio': False, 'julio': False, 'agosto': False, 'septiembre': False, 'octubre': False, 'noviembre': False}},
+    '427590-3020004': {'prices': {'Distribuidor': 92102.59, 'Partner': 89828.45, 'Partner Elite': 86985.78, 'Partner Elite Plus!': 84711.64, 'list_price': 113706.9}, 'avail': {'mayo': False, 'junio': False, 'julio': False, 'agosto': False, 'septiembre': False, 'octubre': False, 'noviembre': False}},
+    '427590-3020006': {'prices': {'Distribuidor': 92102.59, 'Partner': 89828.45, 'Partner Elite': 86985.78, 'Partner Elite Plus!': 84711.64, 'list_price': 113706.9}, 'avail': {'mayo': False, 'junio': False, 'julio': False, 'agosto': False, 'septiembre': False, 'octubre': False, 'noviembre': False}},
+    '427590-3020008': {'prices': {'Distribuidor': 92102.59, 'Partner': 89828.45, 'Partner Elite': 86985.78, 'Partner Elite Plus!': 84711.64, 'list_price': 113706.9}, 'avail': {'mayo': False, 'junio': False, 'julio': False, 'agosto': False, 'septiembre': False, 'octubre': False, 'noviembre': False}},
+    '427590-3020010': {'prices': {'Distribuidor': 92102.59, 'Partner': 89828.45, 'Partner Elite': 86985.78, 'Partner Elite Plus!': 84711.64, 'list_price': 113706.9}, 'avail': {'mayo': False, 'junio': False, 'julio': False, 'agosto': False, 'septiembre': False, 'octubre': False, 'noviembre': False}},
+    # FOIL RC 20 — Sep todas
+    '427591-8086002': {'prices': {'Distribuidor': 78835.34, 'Partner': 76888.79, 'Partner Elite': 74455.6, 'Partner Elite Plus!': 72509.05, 'list_price': 97327.59}, 'avail': {'mayo': False, 'junio': False, 'julio': False, 'agosto': False}},
+    '427591-8086004': {'prices': {'Distribuidor': 78835.34, 'Partner': 76888.79, 'Partner Elite': 74455.6, 'Partner Elite Plus!': 72509.05, 'list_price': 97327.59}, 'avail': {'mayo': False, 'junio': False, 'julio': False, 'agosto': False}},
+    '427591-8086006': {'prices': {'Distribuidor': 78835.34, 'Partner': 76888.79, 'Partner Elite': 74455.6, 'Partner Elite Plus!': 72509.05, 'list_price': 97327.59}, 'avail': {'mayo': False, 'junio': False, 'julio': False, 'agosto': False}},
+    '427591-8086008': {'prices': {'Distribuidor': 78835.34, 'Partner': 76888.79, 'Partner Elite': 74455.6, 'Partner Elite Plus!': 72509.05, 'list_price': 97327.59}, 'avail': {'mayo': False, 'junio': False, 'julio': False, 'agosto': False}},
+    '427591-8086010': {'prices': {'Distribuidor': 78835.34, 'Partner': 76888.79, 'Partner Elite': 74455.6, 'Partner Elite Plus!': 72509.05, 'list_price': 97327.59}, 'avail': {'mayo': False, 'junio': False, 'julio': False, 'agosto': False}},
+    # FOIL RC PRO — Diciembre
+    '427588-8575004': {'prices': {'Distribuidor': 142168.97, 'Partner': 138658.62, 'Partner Elite': 134270.69, 'Partner Elite Plus!': 130760.34, 'list_price': 175517.24}, 'avail': {'mayo': False, 'junio': False, 'julio': False, 'agosto': False, 'septiembre': False, 'octubre': False, 'noviembre': False}},
+    '427588-8575006': {'prices': {'Distribuidor': 142168.97, 'Partner': 138658.62, 'Partner Elite': 134270.69, 'Partner Elite Plus!': 130760.34, 'list_price': 175517.24}, 'avail': {'mayo': False, 'junio': False, 'julio': False, 'agosto': False, 'septiembre': False, 'octubre': False, 'noviembre': False}},
+    '427588-8575008': {'prices': {'Distribuidor': 142168.97, 'Partner': 138658.62, 'Partner Elite': 134270.69, 'Partner Elite Plus!': 130760.34, 'list_price': 175517.24}, 'avail': {'mayo': False, 'junio': False, 'julio': False, 'agosto': False, 'septiembre': False, 'octubre': False, 'noviembre': False}},
+    '427588-8575010': {'prices': {'Distribuidor': 142168.97, 'Partner': 138658.62, 'Partner Elite': 134270.69, 'Partner Elite Plus!': 130760.34, 'list_price': 175517.24}, 'avail': {'mayo': False, 'junio': False, 'julio': False, 'agosto': False, 'septiembre': False, 'octubre': False, 'noviembre': False}},
+    # FOIL RC TEAM — Dic todas
+    '427589-8350004': {'prices': {'Distribuidor': 119614.66, 'Partner': 116661.21, 'Partner Elite': 112969.4, 'Partner Elite Plus!': 110015.95, 'list_price': 147672.41}, 'avail': {'mayo': False, 'junio': False, 'julio': False, 'agosto': False, 'septiembre': False, 'octubre': False, 'noviembre': False}},
+    '427589-8350006': {'prices': {'Distribuidor': 119614.66, 'Partner': 116661.21, 'Partner Elite': 112969.4, 'Partner Elite Plus!': 110015.95, 'list_price': 147672.41}, 'avail': {'mayo': False, 'junio': False, 'julio': False, 'agosto': False, 'septiembre': False, 'octubre': False, 'noviembre': False}},
+    '427589-8350008': {'prices': {'Distribuidor': 119614.66, 'Partner': 116661.21, 'Partner Elite': 112969.4, 'Partner Elite Plus!': 110015.95, 'list_price': 147672.41}, 'avail': {'mayo': False, 'junio': False, 'julio': False, 'agosto': False, 'septiembre': False, 'octubre': False, 'noviembre': False}},
+    '427589-8350010': {'prices': {'Distribuidor': 119614.66, 'Partner': 116661.21, 'Partner Elite': 112969.4, 'Partner Elite Plus!': 110015.95, 'list_price': 147672.41}, 'avail': {'mayo': False, 'junio': False, 'julio': False, 'agosto': False, 'septiembre': False, 'octubre': False, 'noviembre': False}},
+    # SPARK RC COMP — Oct todas
+    '427541-0002006': {'prices': {'Distribuidor': 61455.17, 'Partner': 59837.93, 'Partner Elite': 57816.38, 'Partner Elite Plus!': 56199.14, 'list_price': 80862.07}, 'avail': {'mayo': False, 'junio': False, 'julio': False, 'agosto': False, 'septiembre': False}},
+    '427541-0002008': {'prices': {'Distribuidor': 61455.17, 'Partner': 59837.93, 'Partner Elite': 57816.38, 'Partner Elite Plus!': 56199.14, 'list_price': 80862.07}, 'avail': {'mayo': False, 'junio': False, 'julio': False, 'agosto': False, 'septiembre': False}},
+    '427541-0002010': {'prices': {'Distribuidor': 61455.17, 'Partner': 59837.93, 'Partner Elite': 57816.38, 'Partner Elite Plus!': 56199.14, 'list_price': 80862.07}, 'avail': {'mayo': False, 'junio': False, 'julio': False, 'agosto': False, 'septiembre': False}},
+    '427541-0002012': {'prices': {'Distribuidor': 61455.17, 'Partner': 59837.93, 'Partner Elite': 57816.38, 'Partner Elite Plus!': 56199.14, 'list_price': 80862.07}, 'avail': {'mayo': False, 'junio': False, 'julio': False, 'agosto': False, 'septiembre': False}},
+    # ADDICT RC PRO — Octubre
+    '427598-8575004': {'prices': {'Distribuidor': 143914.66, 'Partner': 140361.21, 'Partner Elite': 135919.4, 'Partner Elite Plus!': 132365.95, 'list_price': 177672.41}, 'avail': {'mayo': False, 'junio': False, 'julio': False, 'agosto': False, 'septiembre': False, 'octubre': False, 'noviembre': False}},
+    '427598-8575006': {'prices': {'Distribuidor': 143914.66, 'Partner': 140361.21, 'Partner Elite': 135919.4, 'Partner Elite Plus!': 132365.95, 'list_price': 177672.41}, 'avail': {'mayo': False, 'junio': False, 'julio': False, 'agosto': False, 'septiembre': False, 'octubre': False, 'noviembre': False}},
+    '427598-8575008': {'prices': {'Distribuidor': 143914.66, 'Partner': 140361.21, 'Partner Elite': 135919.4, 'Partner Elite Plus!': 132365.95, 'list_price': 177672.41}, 'avail': {'mayo': False, 'junio': False, 'julio': False, 'agosto': False, 'septiembre': False, 'octubre': False, 'noviembre': False}},
+    # SPARK RC ELITE — Octubre
+    '427995-8585006': {'prices': {'Distribuidor': 76670.69, 'Partner': 74777.59, 'Partner Elite': 72411.21, 'Partner Elite Plus!': 70518.1, 'list_price': 94655.17}, 'avail': {'mayo': False, 'junio': False, 'julio': False, 'agosto': False, 'septiembre': False}},
+    '427995-8585008': {'prices': {'Distribuidor': 76670.69, 'Partner': 74777.59, 'Partner Elite': 72411.21, 'Partner Elite Plus!': 70518.1, 'list_price': 94655.17}, 'avail': {'mayo': False, 'junio': False, 'julio': False, 'agosto': False, 'septiembre': False}},
+    '427995-8585010': {'prices': {'Distribuidor': 76670.69, 'Partner': 74777.59, 'Partner Elite': 72411.21, 'Partner Elite Plus!': 70518.1, 'list_price': 94655.17}, 'avail': {'mayo': False, 'junio': False, 'julio': False, 'agosto': False, 'septiembre': False}},
+    # ROXTER 200 — Octubre
+    '427986-8565222': {'prices': {'Distribuidor': 7600.0, 'Partner': 7400.0, 'Partner Elite': 7150.0, 'Partner Elite Plus!': 6950.0, 'list_price': 10000.0}, 'avail': {'mayo': False, 'junio': False, 'julio': False, 'agosto': False, 'septiembre': False}},
+    '427986-8588222': {'prices': {'Distribuidor': 7600.0, 'Partner': 7400.0, 'Partner Elite': 7150.0, 'Partner Elite Plus!': 6950.0, 'list_price': 10000.0}, 'avail': {'mayo': False, 'junio': False, 'julio': False, 'agosto': False, 'septiembre': False}},
+    # ROXTER 400 — Octubre
+    '427987-1494222': {'prices': {'Distribuidor': 7075.86, 'Partner': 6889.66, 'Partner Elite': 6656.9, 'Partner Elite Plus!': 6470.69, 'list_price': 9310.34}, 'avail': {'mayo': False, 'junio': False, 'julio': False, 'agosto': False, 'septiembre': False}},
+    '427987-8606222': {'prices': {'Distribuidor': 7075.86, 'Partner': 6889.66, 'Partner Elite': 6656.9, 'Partner Elite Plus!': 6470.69, 'list_price': 9310.34}, 'avail': {'mayo': False, 'junio': False, 'julio': False, 'agosto': False, 'septiembre': False}},
+    # ── Scott adicionales (Contessa / Contrail / Scale / Roxter MY26) — disponibles desde julio
+    '286383-704':     {'prices': {'Distribuidor': 7241.38, 'Partner': 7241.38, 'Partner Elite': 7241.38, 'Partner Elite Plus!': 7241.38, 'list_price': 9896.55}, 'avail': {'mayo': False, 'junio': False}},
+    '286383-706':     {'prices': {'Distribuidor': 7241.38, 'Partner': 7241.38, 'Partner Elite': 7241.38, 'Partner Elite Plus!': 7241.38, 'list_price': 9896.55}, 'avail': {'mayo': False, 'junio': False}},
+    '290310-704':     {'prices': {'Distribuidor': 7241.38, 'Partner': 7241.38, 'Partner Elite': 7241.38, 'Partner Elite Plus!': 7241.38, 'list_price': 9896.55}, 'avail': {'mayo': False, 'junio': False}},
+    '290310-706':     {'prices': {'Distribuidor': 7241.38, 'Partner': 7241.38, 'Partner Elite': 7241.38, 'Partner Elite Plus!': 7241.38, 'list_price': 9896.55}, 'avail': {'mayo': False, 'junio': False}},
+    '290310-908':     {'prices': {'Distribuidor': 7241.38, 'Partner': 7241.38, 'Partner Elite': 7241.38, 'Partner Elite Plus!': 7241.38, 'list_price': 9896.55}, 'avail': {'mayo': False, 'junio': False}},
+    '425790-3761222': {'prices': {'Distribuidor': 6077.59, 'Partner': 6077.59, 'Partner Elite': 6077.59, 'Partner Elite Plus!': 6077.59, 'list_price': 8280.17}, 'avail': {'mayo': False, 'junio': False}},
+    '425790-8269222': {'prices': {'Distribuidor': 6077.59, 'Partner': 6077.59, 'Partner Elite': 6077.59, 'Partner Elite Plus!': 6077.59, 'list_price': 8280.17}, 'avail': {'mayo': False, 'junio': False}},
+    '425791-3028222': {'prices': {'Distribuidor': 5646.55, 'Partner': 5646.55, 'Partner Elite': 5646.55, 'Partner Elite Plus!': 5646.55, 'list_price': 7693.97}, 'avail': {'mayo': False, 'junio': False}},
+    '425791-8268222': {'prices': {'Distribuidor': 5646.55, 'Partner': 5646.55, 'Partner Elite': 5646.55, 'Partner Elite Plus!': 5646.55, 'list_price': 7693.97}, 'avail': {'mayo': False, 'junio': False}},
+    '425792-2308222': {'prices': {'Distribuidor': 6810.34, 'Partner': 6810.34, 'Partner Elite': 6810.34, 'Partner Elite Plus!': 6810.34, 'list_price': 9306.03}, 'avail': {'mayo': False, 'junio': False}},
+    '425792-4173222': {'prices': {'Distribuidor': 6810.34, 'Partner': 6810.34, 'Partner Elite': 6810.34, 'Partner Elite Plus!': 6810.34, 'list_price': 9306.03}, 'avail': {'mayo': False, 'junio': False}},
+    '425793-8265222': {'prices': {'Distribuidor': 8258.62, 'Partner': 8043.1,  'Partner Elite': 7767.24, 'Partner Elite Plus!': 7551.72, 'list_price': 10862.07}, 'avail': {'mayo': False, 'junio': False}},
+    '425794-3774222': {'prices': {'Distribuidor': 7801.72, 'Partner': 7594.83, 'Partner Elite': 7336.21, 'Partner Elite Plus!': 7551.72, 'list_price': 10258.62}, 'avail': {'mayo': False, 'junio': False}},
     # ── CONTRAIL 40 ── llega MAYO(F): disponible desde junio (junio(F) no bloquea — ya llegó en mayo)
     '427102-0001004': {'prices': {'Distribuidor': 10155.17, 'Partner': 9887.93, 'Partner Elite': 9553.88, 'Partner Elite Plus!': 9286.64, 'list_price': 13362.07}, 'avail': {'mayo': False, 'junio': True, 'julio': True, 'agosto': True}},
     '427102-0001006': {'prices': {'Distribuidor': 10155.17, 'Partner': 9887.93, 'Partner Elite': 9553.88, 'Partner Elite Plus!': 9286.64, 'list_price': 13362.07}, 'avail': {'mayo': False, 'junio': True, 'julio': True, 'agosto': True}},
@@ -2237,6 +2357,448 @@ def descargar_template_global():
 
 
 
+@forecast_bp.route('/forecast/template-global-scott', methods=['GET'])
+def descargar_template_global_scott():
+    """
+    GET /forecast/template-global-scott
+    Plantilla global solo con las bicicletas Scott MY27 nuevas (52 SKUs),
+    con disponibilidad por mes según fechas de llegada.
+    """
+    if not OPENPYXL_OK:
+        return jsonify({'error': 'openpyxl no instalado en el servidor'}), 500
+
+    from datetime import datetime
+    current_year = datetime.now().year
+    periodo = f"{current_year}-{current_year + 1}"
+
+    # Todos los SKUs Scott del catálogo
+    SCOTT_SKUS_LIST = [
+        '427536-8086006','427536-8086008','427536-8086010',
+        '427539-8350006','427539-8350008','427539-8350010',
+        '427537-8532006','427537-8532008','427537-8532010',
+        '427540-8527006','427540-8527008','427540-8527010','427540-8527012',
+        '427563-8535008','427563-8535010',
+        '427590-8522002','427590-8522004','427590-8522006','427590-8522008','427590-8522010',
+        '427590-3020002','427590-3020004','427590-3020006','427590-3020008','427590-3020010',
+        '427591-8086002','427591-8086004','427591-8086006','427591-8086008','427591-8086010',
+        '427588-8575004','427588-8575006','427588-8575008','427588-8575010',
+        '427589-8350004','427589-8350006','427589-8350008','427589-8350010',
+        '427541-0002006','427541-0002008','427541-0002010','427541-0002012',
+        '427598-8575004','427598-8575006','427598-8575008',
+        '427995-8585006','427995-8585008','427995-8585010',
+        '427986-8565222','427986-8588222','427987-1494222','427987-8606222',
+        # Scott adicionales MY26
+        '286383-704','286383-706',
+        '290310-704','290310-706','290310-908',
+        '425790-3761222','425790-8269222',
+        '425791-3028222','425791-8268222',
+        '425792-2308222','425792-4173222',
+        '425793-8265222',
+        '425794-3774222',
+    ]
+
+    # Consultar Odoo para obtener nombre, marca, talla por variante
+    from utils.odoo_utils import get_odoo_models, ODOO_DB, ODOO_PASSWORD
+    uid, models_obj, err = get_odoo_models()
+    products = []
+    if uid and not err:
+        try:
+            _ODOO_CTX = {'lang': 'es_MX'}  # nombres en español (traducción activa en Odoo)
+            prods = models_obj.execute_kw(ODOO_DB, uid, ODOO_PASSWORD,
+                'product.product', 'search_read',
+                [[['default_code', 'in', SCOTT_SKUS_LIST]]],
+                {'fields': ['id', 'default_code', 'name', 'list_price',
+                            'product_tmpl_id',
+                            'product_template_attribute_value_ids'],
+                 'limit': 300, 'context': _ODOO_CTX}
+            )
+            # Obtener el nombre canónico del template en español
+            tmpl_ids = list({p['product_tmpl_id'][0] for p in prods if p.get('product_tmpl_id')})
+            tmpl_name_map = {}
+            if tmpl_ids:
+                tmpls = models_obj.execute_kw(ODOO_DB, uid, ODOO_PASSWORD,
+                    'product.template', 'search_read',
+                    [[['id', 'in', tmpl_ids]]],
+                    {'fields': ['id', 'name'], 'limit': 300, 'context': _ODOO_CTX}
+                )
+                tmpl_name_map = {t['id']: t['name'] for t in tmpls}
+
+            # Contar cuántos atributos tiene cada template (más = más completo = correcto)
+            tmpl_attr_count: dict = {}
+            for p in prods:
+                tmpl_id = (p.get('product_tmpl_id') or [None])[0]
+                if tmpl_id:
+                    tmpl_attr_count[tmpl_id] = tmpl_attr_count.get(tmpl_id, 0) + \
+                        len(p.get('product_template_attribute_value_ids', []))
+
+            # Para cada SKU, elegir el template con más atributos (producto actualizado en Odoo)
+            sku_best_tmpl: dict = {}
+            for p in prods:
+                dc = p['default_code']
+                tmpl_id = (p.get('product_tmpl_id') or [None])[0]
+                if not tmpl_id:
+                    continue
+                cnt = tmpl_attr_count.get(tmpl_id, 0)
+                cur = sku_best_tmpl.get(dc, (-1, 0))
+                if cnt > cur[0] or (cnt == cur[0] and tmpl_id > cur[1]):
+                    sku_best_tmpl[dc] = (cnt, tmpl_id)
+
+            # Sobreescribir name con el del template más completo para ese SKU
+            for p in prods:
+                dc = p['default_code']
+                best = sku_best_tmpl.get(dc)
+                if best:
+                    best_tmpl_id = best[1]
+                    if best_tmpl_id in tmpl_name_map:
+                        p['name'] = tmpl_name_map[best_tmpl_id]
+
+            # Obtener atributos (Talla_Bici / COLOR / TALLA)
+            avids = list({v for p in prods for v in p.get('product_template_attribute_value_ids', [])})
+            attr_vals = models_obj.execute_kw(ODOO_DB, uid, ODOO_PASSWORD,
+                'product.template.attribute.value', 'search_read',
+                [[['id', 'in', avids]]],
+                {'fields': ['id', 'name', 'attribute_id'], 'limit': 500}
+            ) if avids else []
+            av_map = {a['id']: a for a in attr_vals}
+            adids = list({a['attribute_id'][0] for a in attr_vals})
+            ad_map = {a['id']: a['name'] for a in models_obj.execute_kw(
+                ODOO_DB, uid, ODOO_PASSWORD, 'product.attribute', 'search_read',
+                [[['id', 'in', adids]]], {'fields': ['id', 'name'], 'limit': 50}
+            )} if adids else {}
+
+            import re as _re
+            _COLOR_WORDS = {
+                'NEGRO','NEGRA','BLANCO','BLANCA','ROJO','ROJA','AZUL','VERDE',
+                'NARANJA','AMARILLO','AMARILLA','GRIS','DORADO','DORADA',
+                'PLATEADO','PLATEADA','PETROLEO','PETRÓLEO','MORADO','MORADA',
+                'ROSA','CAFE','BEIGE','MARRON','BRONCE','ORO','PLATA','COBRE',
+                'TURQUESA','SALMON','ARENA','CREMA','LILA','CELESTE',
+                'BCO','NGO','NEGRO/BLANCO','BLANCO/NEGRO',
+            }
+
+            def _parse_scott(name):
+                name2 = _re.sub(r'^\d+\s+', '', name)
+                name2 = _re.sub(r'^BICICLETA\s+', '', name2)
+                # Quitar sufijos en paréntesis como (M), (MORADO), etc.
+                name2 = _re.sub(r'\s*\([^)]+\)\s*$', '', name2).strip()
+                parts = name2.split()
+                marca = parts[0] if parts else 'SCOTT'
+                mod, col, after_year = [], [], False
+                for w in parts[1:]:
+                    if w in ('MY27', 'MY26', 'MY25', 'MY28', 'MY24'):
+                        after_year = True
+                        continue
+                    (col if after_year else mod).append(w)
+                return marca, ' '.join(mod), ' '.join(col)
+
+            # Agrupar todos los registros por default_code (Odoo puede tener duplicados)
+            raw_prod_map: dict = {}
+            attrs_ids_by_sku: dict = {}
+            for p in prods:
+                dc = p['default_code']
+                raw_prod_map.setdefault(dc, []).append(p)
+                attrs_ids_by_sku.setdefault(dc, set()).update(
+                    p.get('product_template_attribute_value_ids', [])
+                )
+
+            # Para cada SKU preferir el registro cuyo nombre empiece con el prefijo numérico
+            prod_map = {}
+            for dc, records in raw_prod_map.items():
+                prefix = dc[:6]
+                good = [r for r in records if r.get('name', '').strip().startswith(prefix)]
+                # Entre candidatos: mayor id = registro más reciente en Odoo (nombre actualizado)
+                prod_map[dc] = max(good or records, key=lambda r: r.get('id', 0))
+
+            for sku in SCOTT_SKUS_LIST:
+                p = prod_map.get(sku)
+                if not p:
+                    continue
+                # Construir attrs combinando IDs de TODOS los registros duplicados del mismo SKU
+                attrs = {}
+                attrs_lower = {}
+                for vid in attrs_ids_by_sku.get(sku, []):
+                    av = av_map.get(vid)
+                    if av:
+                        key = ad_map.get(av['attribute_id'][0], '?')
+                        attrs[key] = av['name']
+                        attrs_lower[key.lower().replace(' ', '_').replace('/', '_')] = av['name']
+                raw_name = p.get('name', '')
+                # Quitar "(copia)" y otros sufijos en paréntesis que Odoo agrega
+                raw_name = _re.sub(r'\s*\(copia\)\s*', ' ', raw_name, flags=_re.IGNORECASE).strip()
+                raw_name = _re.sub(r'\s*\([^)]+\)\s*$', '', raw_name).strip()
+                # Normalizar prefijo numérico: siempre el correcto del SKU
+                sku_prefix = sku[:6]
+                raw_name = _re.sub(r'^\d{6}\b', sku_prefix, raw_name)
+                # Si el nombre no empieza con el número, agregarlo para consistencia entre variantes
+                if not raw_name.startswith(sku_prefix):
+                    raw_name = f"{sku_prefix} {raw_name.lstrip()}"
+                marca, modelo, color_from_name = _parse_scott(raw_name)
+                # Atributo Odoo tiene prioridad sobre abreviaturas en el nombre
+                color = attrs_lower.get('color', '') or color_from_name
+                # Si el atributo de color está definido, limpiar cualquier
+                # palabra de color que haya quedado al final del modelo
+                if color:
+                    mod_parts = modelo.split()
+                    if mod_parts and mod_parts[-1].upper() in _COLOR_WORDS:
+                        modelo = ' '.join(mod_parts[:-1])
+                # Talla: buscar TALLA / Talla_Bici / talla; si no hay → Unitalla
+                talla = (attrs_lower.get('talla_bici') or attrs_lower.get('talla') or '') or 'Unitalla'
+                products.append({
+                    'sku':     sku,
+                    'producto': raw_name,
+                    'marca':   marca,
+                    'modelo':  modelo,
+                    'color':   color,
+                    'talla':   talla,
+                })
+        except Exception as e:
+            logging.warning('[scott-template] Odoo error: %s', e)
+
+    # Fallback: stubs para SKUs no encontrados en Odoo
+    found = {p['sku'] for p in products}
+    for sku in SCOTT_SKUS_LIST:
+        if sku not in found:
+            products.append({'sku': sku, 'producto': sku, 'marca': 'SCOTT',
+                             'modelo': '', 'color': '', 'talla': ''})
+
+    # Ordenar por SKU
+    products.sort(key=lambda p: p['sku'])
+
+    # ── Índices de columnas
+    PRICE_PUB_COL   = 7
+    PRICE_DIST_COL  = 8
+    MONTH_START     = 9
+    TOTAL_COL       = 21
+    TOTAL_PRICE_COL = 22
+    TIER_COLS = {
+        'Partner Elite Plus!': 23,
+        'Partner Elite':       24,
+        'Partner':             25,
+        'Distribuidor':        26,
+    }
+    VISIBLE_COLS = TOTAL_PRICE_COL
+
+    ORANGE      = 'FFEB5E28'
+    DARK_BG     = 'FF252422'
+    HEADER_BG   = 'FF1A1918'
+    SELECTOR_BG = 'FF2C2A28'
+    PRICE_BG    = 'FF1B3A2B'
+
+    info_font       = Font(bold=True, color='FFFFFFFF', size=10)
+    price_hdr_font  = Font(bold=True, color='FF66FFB2', size=10)
+    month_hdr_font  = Font(bold=True, color='FFFFFFFF', size=10)
+    editable_font   = Font(color='FF111111', size=10)
+    price_data_font = Font(color='FF333333', size=9)
+
+    center = Alignment(horizontal='center', vertical='center', wrap_text=True)
+    left   = Alignment(horizontal='left',   vertical='center', wrap_text=True)
+    right  = Alignment(horizontal='right',  vertical='center')
+    thin   = Side(style='thin', color='FF666666')
+    border = Border(left=thin, right=thin, top=thin, bottom=thin)
+
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = 'Forecast Scott'
+
+    # Fila 1: Clave distribuidor
+    ws.row_dimensions[1].height = 28
+    ws.merge_cells('A1:C1')
+    lbl = ws['A1']
+    lbl.value = 'CLAVE / NOMBRE DISTRIBUIDOR'
+    lbl.font  = Font(bold=True, color='FFFFFFFF', size=10)
+    lbl.fill  = PatternFill('solid', fgColor=SELECTOR_BG)
+    lbl.alignment = right
+
+    ws.merge_cells('D1:F1')
+    inp = ws['D1']
+    inp.value = ''
+    inp.font  = Font(bold=True, color='FFEB5E28', size=11)
+    inp.fill  = PatternFill('solid', fgColor=SELECTOR_BG)
+    inp.alignment = center
+    inp.protection = Protection(locked=False)
+
+    ws.merge_cells('G1:H1')
+    sel = ws['G1']
+    sel.value = 'Distribuidor'
+    sel.font  = Font(bold=True, color='FFEB5E28', size=12)
+    sel.fill  = PatternFill('solid', fgColor=SELECTOR_BG)
+    sel.alignment = center
+    sel.protection = Protection(locked=False)
+
+    dv = DataValidation(type='list',
+        formula1='"Partner Elite Plus!,Partner Elite,Partner,Distribuidor"',
+        allow_blank=False, showDropDown=False)
+    ws.add_data_validation(dv)
+    dv.add(ws['G1'])
+
+    for ci in range(MONTH_START, VISIBLE_COLS + 1):
+        ws.cell(row=1, column=ci).fill = PatternFill('solid', fgColor=SELECTOR_BG)
+
+    # Fila 2: Título
+    ws.row_dimensions[2].height = 28
+    ws.merge_cells(f'A2:{get_column_letter(VISIBLE_COLS)}2')
+    tc = ws['A2']
+    tc.value = f'Plantilla de Forecast Scott — Periodo Comercial {periodo}'
+    tc.font  = Font(bold=True, color='FFEB5E28', size=12)
+    tc.fill  = PatternFill('solid', fgColor=HEADER_BG)
+    tc.alignment = center
+
+    # Fila 3: Encabezados
+    ws.row_dimensions[3].height = 22
+    ALL_HEADERS = CAMPOS_INFO + ['Precio Público', 'Precio'] + MESES_LABELS + ['TOTAL', 'Total $']
+    for ci, h in enumerate(ALL_HEADERS, start=1):
+        cell = ws.cell(row=3, column=ci, value=h)
+        cell.alignment = center
+        cell.border    = border
+        if h in CAMPOS_INFO:
+            cell.fill = PatternFill('solid', fgColor=DARK_BG); cell.font = info_font
+        elif h in ('Precio Público', 'Precio'):
+            cell.fill = PatternFill('solid', fgColor=PRICE_BG); cell.font = price_hdr_font
+        elif h in ('TOTAL', 'Total $'):
+            cell.fill = PatternFill('solid', fgColor=ORANGE)
+            cell.font = Font(bold=True, color='FF000000', size=10)
+        else:
+            cell.fill = PatternFill('solid', fgColor=ORANGE); cell.font = month_hdr_font
+
+    # Fila 4: Instrucciones
+    ws.row_dimensions[4].height = 26
+    ws.merge_cells(f'A4:{get_column_letter(VISIBLE_COLS)}4')
+    note = ws['A4']
+    note.value = (
+        f'📌 Forecast Scott MY27 — Periodo {periodo}  |  '
+        'Ingrese su CLAVE en D1 y seleccione su NIVEL en G1.  '
+        'Las celdas oscuras indican meses en que el modelo aún no está disponible.'
+    )
+    note.font      = Font(italic=True, color='FF444444', size=9)
+    note.fill      = PatternFill('solid', fgColor='FFFFF8F0')
+    note.alignment = Alignment(horizontal='left', vertical='center', wrap_text=True)
+
+    # Filas de datos
+    tier_pep_col = get_column_letter(TIER_COLS['Partner Elite Plus!'])
+    tier_pe_col  = get_column_letter(TIER_COLS['Partner Elite'])
+    tier_p_col   = get_column_letter(TIER_COLS['Partner'])
+    tier_d_col   = get_column_letter(TIER_COLS['Distribuidor'])
+    h_col        = get_column_letter(PRICE_DIST_COL)
+    u_col        = get_column_letter(TOTAL_COL)
+    first_m      = get_column_letter(MONTH_START)
+    last_m       = get_column_letter(MONTH_START + len(MESES) - 1)
+    first_data_row = 5
+
+    for row_idx, p in enumerate(products, start=5):
+        sku        = p['sku']
+        cat_entry  = SKU_CATALOG.get(sku, {})
+        pr         = cat_entry.get('prices', {})
+        cat_avail  = cat_entry.get('avail', {})
+
+        for ci, val in enumerate(
+            [sku, p['producto'], p['marca'], p['modelo'], p['color'], p['talla']], start=1
+        ):
+            c = ws.cell(row=row_idx, column=ci, value=val)
+            c.font      = editable_font
+            c.fill      = PatternFill('solid', fgColor='FFFAFAFA')
+            c.alignment = left if ci == 2 else center
+            c.border    = border
+
+        g = ws.cell(row=row_idx, column=PRICE_PUB_COL)
+        g.value         = round(pr.get('list_price', 0.0) * IVA_FACTOR, 2)
+        g.font          = price_data_font
+        g.fill          = PatternFill('solid', fgColor='FFE8F5E9')
+        g.alignment     = center; g.border = border
+        g.number_format = '"$"#,##0.00'
+
+        h = ws.cell(row=row_idx, column=PRICE_DIST_COL)
+        h.value = (
+            f'=IF($G$1="Partner Elite Plus!",{tier_pep_col}{row_idx},'
+            f'IF($G$1="Partner Elite",{tier_pe_col}{row_idx},'
+            f'IF($G$1="Partner",{tier_p_col}{row_idx},{tier_d_col}{row_idx})))'
+        )
+        h.font = price_data_font; h.fill = PatternFill('solid', fgColor='FFF3E5F5')
+        h.alignment = center; h.border = border; h.number_format = '"$"#,##0.00'
+
+        for mi in range(len(MESES)):
+            mes_name = MESES[mi]
+            is_avail = cat_avail.get(mes_name, True)
+            c = ws.cell(row=row_idx, column=MONTH_START + mi)
+            c.alignment = center; c.border = border; c.number_format = '0'
+            if is_avail:
+                c.value = 0; c.font = editable_font
+                c.fill  = PatternFill('solid', fgColor='FFFEFEFE')
+                c.protection = Protection(locked=False)
+            else:
+                c.value = None; c.font = Font(color='FF888888', size=9)
+                c.fill  = PatternFill('solid', fgColor='FF3A3A3A')
+
+        tc2 = ws.cell(row=row_idx, column=TOTAL_COL)
+        tc2.value = f'=SUM({first_m}{row_idx}:{last_m}{row_idx})'
+        tc2.font  = Font(bold=True, color='FF000000', size=10)
+        tc2.fill  = PatternFill('solid', fgColor='FFFFF0D0')
+        tc2.alignment = center; tc2.border = border; tc2.number_format = '0'
+
+        tprice = ws.cell(row=row_idx, column=TOTAL_PRICE_COL)
+        tprice.value = f'={h_col}{row_idx}*{u_col}{row_idx}'
+        tprice.font  = Font(bold=True, color='FF000000', size=10)
+        tprice.fill  = PatternFill('solid', fgColor='FFE8F0FF')
+        tprice.alignment = center; tprice.border = border
+        tprice.number_format = '"$"#,##0.00'
+
+        for tier, col_idx in TIER_COLS.items():
+            pc = ws.cell(row=row_idx, column=col_idx)
+            pc.value         = round(pr.get(tier, 0.0) * IVA_FACTOR, 2)
+            pc.number_format = '"$"#,##0.00'
+
+    # Fila TOTALES
+    last_data_row = first_data_row + len(products) - 1
+    total_row     = last_data_row + 1
+    ws.row_dimensions[total_row].height = 24
+    ws.merge_cells(f'A{total_row}:H{total_row}')
+    label = ws[f'A{total_row}']
+    label.value = 'TOTALES'; label.font = Font(bold=True, color='FFFFFFFF', size=11)
+    label.fill  = PatternFill('solid', fgColor=ORANGE)
+    label.alignment = center; label.border = border
+
+    for mi in range(len(MESES)):
+        col_letter = get_column_letter(MONTH_START + mi)
+        c = ws.cell(row=total_row, column=MONTH_START + mi)
+        c.value         = f'=SUM({col_letter}{first_data_row}:{col_letter}{last_data_row})'
+        c.font          = Font(bold=True, color='FF000000', size=10)
+        c.fill          = PatternFill('solid', fgColor=ORANGE)
+        c.alignment     = center; c.border = border; c.number_format = '0'
+
+    tu = ws.cell(row=total_row, column=TOTAL_COL)
+    tu.value = f'=SUM({u_col}{first_data_row}:{u_col}{last_data_row})'
+    tu.font  = Font(bold=True, color='FFFFFFFF', size=11)
+    tu.fill  = PatternFill('solid', fgColor=ORANGE)
+    tu.alignment = center; tu.border = border; tu.number_format = '0'
+
+    v_col = get_column_letter(TOTAL_PRICE_COL)
+    tp_total = ws.cell(row=total_row, column=TOTAL_PRICE_COL)
+    tp_total.value = f'=SUM({v_col}{first_data_row}:{v_col}{last_data_row})'
+    tp_total.font  = Font(bold=True, color='FFFFFFFF', size=11)
+    tp_total.fill  = PatternFill('solid', fgColor=ORANGE)
+    tp_total.alignment = center; tp_total.border = border
+    tp_total.number_format = '"$"#,##0.00'
+
+    # Ocultar columnas de precios por nivel (W-Z)
+    for col_idx in range(23, 27):
+        ws.column_dimensions[get_column_letter(col_idx)].hidden = True
+
+    col_widths = [18, 42, 12, 24, 22, 8, 14, 14] + [11] * 12 + [9, 18]
+    for ci, w in enumerate(col_widths, start=1):
+        ws.column_dimensions[get_column_letter(ci)].width = w
+
+    ws.freeze_panes     = 'A5'
+    ws.protection.sheet = True
+    ws.protection.password = 'masterkey'
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+
+    filename = f'Forecast_Template_Scott_{periodo}.xlsx'
+    return send_file(buf, as_attachment=True, download_name=filename,
+                     mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
+
+
 @forecast_bp.route('/forecast/template-blank', methods=['GET'])
 def descargar_template_blank():
     """
@@ -3874,37 +4436,38 @@ def buscar_producto():
         use_whitelist = cur.fetchone()['cnt'] > 0
 
         if use_whitelist:
-            # Condición AND por cada token — LIKE en todas las columnas relevantes
+            # Condición AND por cada token — incluye wl.sku para SKUs sin odoo_catalogo
             inner_conds  = []
             inner_params = []
             for tok in tokens:
                 lk = f'%{tok.upper()}%'
                 inner_conds.append(
-                    "(UPPER(oc.nombre_producto) LIKE %s "
-                    "OR UPPER(oc.referencia_interna) LIKE %s "
+                    "(UPPER(wl.sku) LIKE %s "
+                    "OR UPPER(COALESCE(oc.nombre_producto,'')) LIKE %s "
+                    "OR UPPER(COALESCE(oc.referencia_interna,'')) LIKE %s "
                     "OR UPPER(COALESCE(oc.marca,'')) LIKE %s "
                     "OR UPPER(COALESCE(oc.color,'')) LIKE %s "
                     "OR UPPER(COALESCE(oc.talla,'')) LIKE %s)"
                 )
-                inner_params.extend([lk, lk, lk, lk, lk])
+                inner_params.extend([lk, lk, lk, lk, lk, lk])
 
             inner_where = ' AND '.join(inner_conds)
 
-            # WHERE en la query INTERNA permite usar el índice FULLTEXT antes del GROUP BY
+            # LEFT JOIN: incluye SKUs en whitelist aunque no estén en odoo_catalogo
             cur.execute(f"""
                 SELECT sku, nombre_src, categoria, marca, odoo_color, odoo_talla
                 FROM (
                     SELECT
-                        oc.referencia_interna                                    AS sku,
-                        MIN(oc.nombre_producto)                                  AS nombre_src,
-                        MIN(oc.categoria)                                        AS categoria,
-                        MIN(oc.marca)                                            AS marca,
-                        COALESCE(NULLIF(TRIM(oc.color), ''), 'N/A')             AS odoo_color,
-                        COALESCE(NULLIF(TRIM(oc.talla), ''), 'N/A')             AS odoo_talla
-                    FROM odoo_catalogo oc
-                    INNER JOIN forecast_sku_whitelist wl ON wl.sku = oc.referencia_interna
+                        wl.sku                                                          AS sku,
+                        COALESCE(MIN(oc.nombre_producto), wl.sku)                       AS nombre_src,
+                        MIN(oc.categoria)                                               AS categoria,
+                        COALESCE(MIN(oc.marca), '')                                     AS marca,
+                        COALESCE(NULLIF(TRIM(oc.color), ''), 'N/A')                    AS odoo_color,
+                        COALESCE(NULLIF(TRIM(oc.talla), ''), 'N/A')                    AS odoo_talla
+                    FROM forecast_sku_whitelist wl
+                    LEFT JOIN odoo_catalogo oc ON oc.referencia_interna = wl.sku
                     WHERE {inner_where}
-                    GROUP BY oc.referencia_interna,
+                    GROUP BY wl.sku,
                              COALESCE(NULLIF(TRIM(oc.color), ''), 'N/A'),
                              COALESCE(NULLIF(TRIM(oc.talla), ''), 'N/A')
                 ) AS deduped
@@ -3917,23 +4480,60 @@ def buscar_producto():
             has_more = len(rows) > _SEARCH_PAGE_WL
             rows     = rows[:_SEARCH_PAGE_WL]
 
+            _SEARCH_COLOR_WORDS = {
+                'NEGRO','NEGRA','BLANCO','BLANCA','ROJO','ROJA','AZUL','VERDE',
+                'NARANJA','AMARILLO','AMARILLA','GRIS','DORADO','DORADA',
+                'PLATEADO','PLATEADA','PETROLEO','PETRÓLEO','MORADO','MORADA',
+                'ROSA','CAFE','BEIGE','MARRON','BRONCE','ORO','PLATA','COBRE',
+                'TURQUESA','SALMON','ARENA','CREMA','LILA','CELESTE',
+            }
+
             results = []
             for r in rows:
+                sku_r  = r['sku'] or ''
                 cat    = r.get('categoria') or ''
                 modelo = cat.split(' / ')[-1].strip().upper() if ' / ' in cat else ''
                 color  = (r.get('odoo_color') or '').strip().upper() or 'N/A'
                 talla  = _normalizar_talla(r.get('odoo_talla') or '')
-                # Normalizar whitespace interno para evitar duplicados por espacios extra
-                nombre = ' '.join((r.get('nombre_src') or '').split()).upper()
+
+                # Normalizar nombre: quitar sufijos en paréntesis y espacios extras
+                raw_n  = (r.get('nombre_src') or sku_r)
+                raw_n  = re.sub(r'\s*\([^)]+\)\s*$', '', raw_n).strip()
+                nombre = ' '.join(raw_n.split()).upper()
+
+                # Marca: si odoo_catalogo dice algo incorrecto (BICIS, etc.) pero
+                # el nombre contiene una marca conocida, usarla
+                marca_r = (r.get('marca') or '').upper()
+                if sku_r in SKU_CATALOG or 'SCOTT' in nombre:
+                    marca_r = 'SCOTT'
+                elif 'MEGAMO' in nombre:
+                    marca_r = 'MEGAMO'
+                elif 'SYNCROS' in nombre:
+                    marca_r = 'SYNCROS'
+
+                # Si el modelo está vacío, derivarlo del nombre quitando
+                # "XXXXXX BICICLETA MARCA " del inicio
+                if not modelo and nombre:
+                    m_name = re.sub(r'^\d{6}\s+', '', nombre)
+                    m_name = re.sub(r'^BICICLETA\s+', '', m_name)
+                    m_name = re.sub(r'^(SCOTT|MEGAMO|SYNCROS)\s+', '', m_name)
+                    # Quitar MY27/MY26 y lo que sigue
+                    m_name = re.sub(r'\s+MY\d{2}.*$', '', m_name).strip()
+                    # Quitar palabra de color al final
+                    m_parts = m_name.split()
+                    if m_parts and m_parts[-1] in _SEARCH_COLOR_WORDS:
+                        m_parts = m_parts[:-1]
+                    modelo = ' '.join(m_parts)
+
                 results.append({
-                    'sku':      r['sku'] or '',
+                    'sku':      sku_r,
                     'producto': nombre,
-                    'marca':    (r.get('marca') or '').upper() or 'N/A',
+                    'marca':    marca_r or 'N/A',
                     'modelo':   modelo,
                     'color':    color,
                     'talla':    talla,
                     'fuente':   'whitelist',
-                    'label':    f"{r['sku']} — {nombre}",
+                    'label':    f"{sku_r} — {nombre}",
                 })
 
             # También buscar en el catálogo Excel (apparel, etc.) aunque la whitelist esté activa

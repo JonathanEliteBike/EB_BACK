@@ -207,13 +207,9 @@ def guardar_valor():
         nombre_concepto = res_nombre[0] if res_nombre else f"Concepto {id_concepto}"
         registrar_auditoria(cursor, 'EDICION_CELDA', 'flujo_valores_unificados', id_concepto, f"Editó {nombre_concepto} a ${monto}")
 
-        # 3. CORRECCIÓN: Automatización del recálculo propagado
-        # Usamos la nueva función recalcular_formulas_flujo definida abajo
+        # 3. Propagar arrastre hacia todos los meses futuros con datos
         f_obj = datetime.strptime(fecha, "%Y-%m-%d")
-        
-        # Recalcula desde el mes editado hasta diciembre para propagar saldos iniciales
-        for m in range(f_obj.month, 13):
-            recalcular_formulas_flujo(conexion, f_obj.year, m)
+        propagar_saldos_hacia_adelante(conexion, f_obj.year, f_obj.month)
 
         conexion.commit()
         return jsonify({"mensaje": "Valor actualizado y saldos propagados correctamente"}), 200
@@ -338,9 +334,8 @@ def sincronizar_odoo():
             if se_proceso_informacion:
                 actualizar_valor_bd(cursor_update, id_concepto, fecha_inicio, total_real_concepto, 'real')
 
-        # 2. AUTOMATIZACIÓN: Propagar recálculo
-        for m in range(mes, 13):
-            recalcular_formulas_flujo(conexion, anio, m)
+        # 2. Propagar arrastre hacia todos los meses futuros con datos
+        propagar_saldos_hacia_adelante(conexion, anio, mes)
 
         conexion.commit()
         return jsonify({"mensaje": "Sincronización Multi-Código finalizada correctamente"}), 200
@@ -454,6 +449,48 @@ def actualizar_valor_bd(cursor, id_concepto, fecha, monto, tipo='real'):
         v_p = monto if tipo == 'proyectado' else 0
         sql_in = "INSERT INTO flujo_valores_unificados (id_concepto, fecha_reporte, monto_real, monto_proyectado) VALUES (%s, %s, %s, %s)"
         cursor.execute(sql_in, (id_concepto, fecha, v_r, v_p))
+
+def propagar_saldos_hacia_adelante(conexion, anio_inicio, mes_inicio):
+    """Recalcula en orden cronológico todos los meses >= anio_inicio/mes_inicio
+    que existan en flujo_valores_unificados. Así el SALDO FINAL Real de cada
+    mes terminado se arrastra como SALDO INICIAL Proy del siguiente,
+    sin importar si el siguiente es de otro año."""
+    cursor = conexion.cursor(dictionary=True)
+    fecha_corte = f"{anio_inicio}-{mes_inicio:02d}-01"
+    cursor.execute(
+        "SELECT DISTINCT fecha_reporte FROM flujo_valores_unificados "
+        "WHERE fecha_reporte >= %s ORDER BY fecha_reporte ASC",
+        (fecha_corte,)
+    )
+    meses = cursor.fetchall()
+    cursor.close()
+    for fila in meses:
+        f = fila['fecha_reporte']
+        recalcular_formulas_flujo(conexion, f.year, f.month)
+
+
+@dashboard_flujo_bp.route('/propagar-saldos', methods=['POST'])
+def propagar_saldos():
+    """Endpoint manual para forzar la propagación de saldos desde un mes dado."""
+    data = request.get_json() or {}
+    hoy = datetime.now()
+    anio = int(data.get('anio', hoy.year))
+    mes = int(data.get('mes', hoy.month))
+    conexion = None
+    try:
+        conexion = obtener_conexion()
+        propagar_saldos_hacia_adelante(conexion, anio, mes)
+        conexion.commit()
+        return jsonify({"mensaje": f"Saldos propagados desde {mes:02d}/{anio} en adelante"}), 200
+    except Exception as e:
+        if conexion:
+            conexion.rollback()
+        logging.exception("Error en propagar_saldos")
+        return jsonify({"error": str(e)}), 500
+    finally:
+        if conexion:
+            conexion.close()
+
 
 def recalcular_formulas_flujo(conexion, anio, mes):
     logging.info("Recalculando UNIFICADO para %s/%s", mes, anio)
