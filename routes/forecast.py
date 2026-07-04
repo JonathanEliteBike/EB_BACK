@@ -778,6 +778,81 @@ SKU_CATALOG: dict = {
     '427985-3831012': {'prices': {'Distribuidor': 9696.55, 'Partner': 9441.38, 'Partner Elite': 9122.41, 'Partner Elite Plus!': 8867.24, 'list_price': 12758.62}, 'avail': {'mayo': False, 'junio': True, 'julio': True, 'agosto': True}},
 }
 
+# Cache de nombres, colores y tallas Scott (cargado una vez desde Odoo con lang=es_MX)
+_SCOTT_CORRECT_NAMES: dict = {}
+_SCOTT_COLORS: dict = {}
+_SCOTT_TALLAS: dict = {}
+_SCOTT_NAMES_LOADED: bool = False
+
+def _ensure_scott_names():
+    """Carga nombre, color y talla de cada SKU Scott desde Odoo (es_MX), una sola vez."""
+    global _SCOTT_CORRECT_NAMES, _SCOTT_COLORS, _SCOTT_TALLAS, _SCOTT_NAMES_LOADED
+    if _SCOTT_NAMES_LOADED:
+        return
+    try:
+        from utils.odoo_utils import get_odoo_models, ODOO_DB, ODOO_PASSWORD
+        uid_s, models_s, err_s = get_odoo_models()
+        if err_s or not uid_s:
+            return
+        all_scott_skus = list(SKU_CATALOG.keys())
+        _ctx = {'lang': 'es_MX'}
+        odoo_prods = models_s.execute_kw(ODOO_DB, uid_s, ODOO_PASSWORD,
+            'product.product', 'search_read',
+            [[['default_code', 'in', all_scott_skus]]],
+            {'fields': ['id', 'default_code', 'name',
+                        'product_template_attribute_value_ids'],
+             'limit': 300, 'context': _ctx}
+        )
+        # Obtener atributos (color, talla)
+        all_avids = list({v for p in odoo_prods
+                          for v in p.get('product_template_attribute_value_ids', [])})
+        av_map: dict = {}
+        ad_map: dict = {}
+        if all_avids:
+            attr_vals = models_s.execute_kw(ODOO_DB, uid_s, ODOO_PASSWORD,
+                'product.template.attribute.value', 'search_read',
+                [[['id', 'in', all_avids]]],
+                {'fields': ['id', 'name', 'attribute_id'], 'limit': 1000, 'context': _ctx}
+            )
+            av_map = {a['id']: a for a in attr_vals}
+            adids = list({a['attribute_id'][0] for a in attr_vals})
+            if adids:
+                ad_map = {a['id']: a['name'] for a in models_s.execute_kw(
+                    ODOO_DB, uid_s, ODOO_PASSWORD,
+                    'product.attribute', 'search_read',
+                    [[['id', 'in', adids]]], {'fields': ['id', 'name'], 'limit': 100}
+                )}
+
+        # Para cada SKU, preferir el registro con id más alto (más reciente)
+        best: dict = {}
+        for p in odoo_prods:
+            dc = p['default_code']
+            if dc not in best or p['id'] > best[dc]['id']:
+                attrs_lower: dict = {}
+                for vid in p.get('product_template_attribute_value_ids', []):
+                    av = av_map.get(vid)
+                    if av:
+                        aname = ad_map.get(av['attribute_id'][0], '').lower()
+                        attrs_lower[aname] = av['name'].upper()
+                raw = re.sub(r'\s*\([^)]+\)\s*', '', p['name']).strip()
+                best[dc] = {
+                    'id':    p['id'],
+                    'name':  ' '.join(raw.split()).upper(),
+                    'color': attrs_lower.get('color', '') or attrs_lower.get('colour', ''),
+                    'talla': (attrs_lower.get('talla_bici', '')
+                              or attrs_lower.get('talla', '')),
+                }
+
+        for dc, data in best.items():
+            _SCOTT_CORRECT_NAMES[dc] = data['name']
+            if data['color']:
+                _SCOTT_COLORS[dc] = data['color']
+            if data['talla']:
+                _SCOTT_TALLAS[dc] = data['talla']
+        _SCOTT_NAMES_LOADED = True
+    except Exception:
+        pass
+
 # ─────────────────────────────────────────────────────
 # Helpers
 # ─────────────────────────────────────────────────────
@@ -3394,6 +3469,13 @@ def listar_forecast():
             'Partner':             'precio_partner',
             'Distribuidor':        'precio_distribuidor',
         }
+        _MEGAMO_TIER_FACTORS = {
+            'Partner Elite Plus!': 0.695,
+            'Partner Elite':       0.715,
+            'Partner':             0.740,
+            'Distribuidor':        0.760,
+        }
+
         if partner_pricelist_id and all_skus:
             raw_prices = _get_single_pricelist_prices(partner_pricelist_id, all_skus)
             for r in rows:
@@ -3404,6 +3486,10 @@ def listar_forecast():
                     raw = cat_p.get(tier, cat_p.get('Distribuidor', 0.0))
                 if not raw and r.get('fuente') == 'excel':
                     raw = float(r.get(_TIER_TO_EP_COL.get(tier, 'precio_distribuidor')) or 0)
+                if not raw and r.get('marca', '').upper() == 'MEGAMO':
+                    lp = pub_prices.get(sku, 0.0)
+                    if lp:
+                        raw = round(float(lp) * _MEGAMO_TIER_FACTORS.get(tier, 0.760), 2)
                 r['precio']       = round(float(raw) * IVA_FACTOR, 2)
                 r['nivel_precio'] = partner_pricelist_name or tier
                 if pub_prices.get(sku):
@@ -3421,6 +3507,10 @@ def listar_forecast():
                 raw   = cat_p.get(tier, cat_p.get('Distribuidor', 0.0))
                 if not raw and r.get('fuente') == 'excel':
                     raw = float(r.get(_TIER_TO_EP_COL.get(tier, 'precio_distribuidor')) or 0)
+                if not raw and r.get('marca', '').upper() == 'MEGAMO':
+                    lp = pub_prices.get(sku, 0.0)
+                    if lp:
+                        raw = round(float(lp) * _MEGAMO_TIER_FACTORS.get(tier, 0.760), 2)
                 r['precio']       = round(float(raw) * IVA_FACTOR, 2)
                 r['nivel_precio'] = tier
                 if pub_prices.get(sku):
@@ -4415,6 +4505,7 @@ def buscar_producto():
     Returns {results: [...], has_more: bool, offset: int} with up to 50 items per page.
     """
     _update_whitelist_skus()
+    _ensure_scott_names()
     q = request.args.get('q', '').strip()
     if len(q) < 2:
         return jsonify({'results': [], 'has_more': False, 'offset': 0}), 200
@@ -4500,6 +4591,21 @@ def buscar_producto():
                 raw_n  = (r.get('nombre_src') or sku_r)
                 raw_n  = re.sub(r'\s*\([^)]+\)\s*$', '', raw_n).strip()
                 nombre = ' '.join(raw_n.split()).upper()
+
+                # Usar nombre correcto (es_MX) para SKUs Scott si está en cache
+                if sku_r in _SCOTT_CORRECT_NAMES:
+                    nombre = _SCOTT_CORRECT_NAMES[sku_r]
+
+                # Usar color y talla de Odoo si odoo_catalogo no los tiene
+                if color == 'N/A' and sku_r in _SCOTT_COLORS:
+                    color = _SCOTT_COLORS[sku_r]
+                if (not talla or talla == 'N/A') and sku_r in _SCOTT_TALLAS:
+                    talla = _normalizar_talla(_SCOTT_TALLAS[sku_r])
+
+                # Asegurar que el nombre empiece con el prefijo numérico del SKU
+                sku_prefix = sku_r[:6]
+                if sku_prefix.isdigit() and not nombre.startswith(sku_prefix):
+                    nombre = f"{sku_prefix} {nombre}"
 
                 # Marca: si odoo_catalogo dice algo incorrecto (BICIS, etc.) pero
                 # el nombre contiene una marca conocida, usarla
