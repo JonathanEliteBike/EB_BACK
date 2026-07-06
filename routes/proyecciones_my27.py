@@ -51,38 +51,62 @@ def _get_costos_odoo() -> dict:
 
         skus = list(FORECAST_SKU_WHITELIST)
 
-        # Búsqueda en product.product (variantes)
+        # Búsqueda en product.product (variantes) — standard_price con list_price como fallback
         productos_pp = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD,
             'product.product', 'search_read',
             [[['default_code', 'in', skus]]],
-            {'fields': ['default_code', 'standard_price'], 'limit': 0})
+            {'fields': ['default_code', 'standard_price', 'list_price'], 'limit': 0})
 
-        # Normalizar: strip + mapear código → costo
+        # Normalizar: strip + mapear código → costo (fallback a list_price si costo=0)
         costos: dict = {}
         for p in productos_pp:
             code = (p.get('default_code') or '').strip()
-            price = float(p.get('standard_price') or 0)
-            if code and price > 0:
-                costos[code] = price
+            cost = float(p.get('standard_price') or 0)
+            lst  = float(p.get('list_price') or 0)
+            precio = cost if cost > 0 else lst
+            if code and precio > 0:
+                costos[code] = precio
 
-        # Para los SKUs sin costo, intentar product.template como fallback
+        # Para los SKUs sin precio, intentar product.template como fallback
         skus_sin_costo = [s for s in skus if s not in costos]
         if skus_sin_costo:
             productos_pt = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD,
                 'product.template', 'search_read',
                 [[['default_code', 'in', skus_sin_costo]]],
-                {'fields': ['default_code', 'standard_price'], 'limit': 0})
+                {'fields': ['default_code', 'standard_price', 'list_price'], 'limit': 0})
             for p in productos_pt:
                 code = (p.get('default_code') or '').strip()
-                price = float(p.get('standard_price') or 0)
-                if code and price > 0 and code not in costos:
-                    costos[code] = price
+                cost = float(p.get('standard_price') or 0)
+                lst  = float(p.get('list_price') or 0)
+                precio = cost if cost > 0 else lst
+                if code and precio > 0 and code not in costos:
+                    costos[code] = precio
+
+        # Fallback para SKUs Megamo sin precio: usar pricelist 13 (DISTRIBUIDOR) sin IVA
+        megamo_sin_precio = [s for s in skus if s.startswith('MH') and s not in costos]
+        if megamo_sin_precio:
+            prods_mh = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD,
+                'product.product', 'search_read',
+                [[['default_code', 'in', megamo_sin_precio]]],
+                {'fields': ['id', 'default_code'], 'limit': 0})
+            mh_id_map = {p['id']: p['default_code'] for p in prods_mh}
+            if mh_id_map:
+                pl13_items = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD,
+                    'product.pricelist.item', 'search_read',
+                    [[['pricelist_id', '=', 13], ['product_id', 'in', list(mh_id_map.keys())]]],
+                    {'fields': ['product_id', 'fixed_price'], 'limit': 0})
+                for item in pl13_items:
+                    code  = mh_id_map.get(item['product_id'][0])
+                    price = float(item.get('fixed_price') or 0)
+                    if code and price > 0:
+                        costos[code] = price
 
         _COSTOS_CACHE = {'data': costos, 'ts': now}
-        logging.info('[costos_odoo] %d/%d SKUs con costo (pp=%d, pt=%d)',
+        logging.info('[costos_odoo] %d/%d SKUs con costo (pp=%d, pt=%d, megamo_pl13=%d)',
                      len(costos), len(skus),
                      sum(1 for p in productos_pp if float(p.get('standard_price') or 0) > 0),
-                     len([s for s in skus_sin_costo if s in costos]))
+                     len([s for s in skus_sin_costo if s in costos]),
+                     len(megamo_sin_precio) - len([s for s in megamo_sin_precio if s not in costos]))
         return costos
 
     except Exception as e:
