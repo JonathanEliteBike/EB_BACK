@@ -433,11 +433,36 @@ def exportar_excel():
 
     try:
         periodo = request.args.get('periodo', '2026-2027').strip()
+        marca   = request.args.get('marca', '').strip().upper()  # ej. MEGAMO, SCOTT
         data    = _get_datos_consolidados(periodo)
-        excel   = _generar_excel(data)
 
-        nombre  = f"ProyeccionesMY27_{periodo}_{ahora_str('%Y%m%d')}.xlsx"
-        buf     = io.BytesIO(excel)
+        if marca:
+            arts = [a for a in data['articulos'] if a.get('marca', '').upper() == marca]
+            # Recalcular totales con el subconjunto filtrado
+            data['articulos'] = arts
+            data['totales_mes'] = {
+                mes: sum(a['meses'][mes]['cantidad'] for a in arts) for mes in MESES}
+            data['total_general'] = sum(data['totales_mes'].values())
+            data['total_costo_mes'] = {
+                mes: round(sum(a['costos_mes'][mes] for a in arts), 2) for mes in MESES}
+            data['total_costo_general'] = round(sum(a['costo_total'] for a in arts), 2)
+            dists_act = {d['clave_cliente'] for a in arts for d in a['desglose'] if d['total'] > 0}
+            data['kpis'].update({
+                'total_articulos':        len(arts),
+                'articulos_con_pedido':   sum(1 for a in arts if a['total_anual'] > 0),
+                'articulos_sin_pedido':   sum(1 for a in arts if a['total_anual'] == 0),
+                'total_unidades':         data['total_general'],
+                'distribuidores_activos': len(dists_act),
+                'skus_con_costo':         sum(1 for a in arts if a['costo_unitario'] > 0),
+                'inversion_total':        data['total_costo_general'],
+                'inversion_promedio':     round(data['total_costo_general'] / data['total_general'], 2)
+                                          if data['total_general'] > 0 else 0.0,
+            })
+
+        excel  = _generar_excel(data)
+        sufijo = f"_{marca}" if marca else ""
+        nombre = f"ProyeccionesMY27{sufijo}_{periodo}_{ahora_str('%Y%m%d')}.xlsx"
+        buf    = io.BytesIO(excel)
         buf.seek(0)
 
         return send_file(
