@@ -38,12 +38,12 @@ _COSTOS_TTL = 300  # 5 minutos
 _MEGAMO_PRECIOS_CACHE: dict = {'data': {}, 'ts': 0.0}
 _MEGAMO_PRECIOS_TTL  = 300
 
-# Mapeo nivel → pricelist ID en Odoo (None = no existe, usa factor sobre precio público)
+# Mapeo nivel → pricelist ID en Odoo
 _NIVEL_TO_PL_ID: dict = {
     'Distribuidor':        13,
     'Partner':             11,
-    'Partner Elite':       37,
-    'Partner Elite Plus!': None,
+    'Partner Elite':        9,
+    'Partner Elite Plus!': 37,
 }
 # Factor sobre precio público cuando no hay pricelist específico
 _NIVEL_FACTORS: dict = {
