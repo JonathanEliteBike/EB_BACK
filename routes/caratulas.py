@@ -8,6 +8,7 @@ import re
 import redis as _redis_lib
 from utils.email_utils import crear_cuerpo_email
 from utils.odoo_utils import get_odoo_models, ODOO_DB, ODOO_PASSWORD
+from utils.temporada_utils import etiqueta_temporada
 import logging
 import traceback
 
@@ -275,7 +276,16 @@ def actualizar_caratula_evac_a():
         
         conexion = obtener_conexion()
         with conexion.cursor() as cursor:
-            cursor.execute("TRUNCATE TABLE caratula_evac_a")            
+            # Snapshot: preservar el estado actual en caratula_evac_a_historico antes de
+            # truncar, para poder consultar temporadas anteriores.
+            cursor.execute("""
+                INSERT INTO caratula_evac_a_historico
+                    (temporada, fecha_snapshot, id_original, categoria, meta, acumulado_real, avance_proyectado, porcentaje)
+                SELECT %s, NOW(), id, categoria, meta, acumulado_real, avance_proyectado, porcentaje
+                FROM caratula_evac_a
+            """, (etiqueta_temporada(),))
+
+            cursor.execute("TRUNCATE TABLE caratula_evac_a")
             for i, item in enumerate(datos_array):
                 cursor.execute("""
                     INSERT INTO caratula_evac_a 
@@ -317,7 +327,16 @@ def actualizar_caratula_evac_b():
         
         conexion = obtener_conexion()
         with conexion.cursor() as cursor:
-            cursor.execute("TRUNCATE TABLE caratula_evac_b")            
+            # Snapshot: preservar el estado actual en caratula_evac_b_historico antes de
+            # truncar, para poder consultar temporadas anteriores.
+            cursor.execute("""
+                INSERT INTO caratula_evac_b_historico
+                    (temporada, fecha_snapshot, id_original, categoria, meta, acumulado_real, avance_proyectado, porcentaje)
+                SELECT %s, NOW(), id, categoria, meta, acumulado_real, avance_proyectado, porcentaje
+                FROM caratula_evac_b
+            """, (etiqueta_temporada(),))
+
+            cursor.execute("TRUNCATE TABLE caratula_evac_b")
             for i, item in enumerate(datos_array):
                 cursor.execute("""
                     INSERT INTO caratula_evac_b
@@ -425,6 +444,126 @@ def obtener_datos_previo():
             cursor.close()
         if conexion and conexion.is_connected():
             conexion.close()
+
+@caratulas_bp.route('/temporadas_disponibles', methods=['GET'])
+def temporadas_disponibles():
+    """Devuelve las temporadas (ej. '2025-2026') que tienen snapshots guardados
+    en cualquiera de las tablas de histórico, para poblar un selector en el frontend.
+    """
+    try:
+        conexion = obtener_conexion()
+        with conexion.cursor() as cursor:
+            cursor.execute("""
+                SELECT temporada FROM previo_historico
+                UNION
+                SELECT temporada FROM caratula_evac_a_historico
+                UNION
+                SELECT temporada FROM caratula_evac_b_historico
+                ORDER BY temporada DESC
+            """)
+            temporadas = [row[0] for row in cursor.fetchall()]
+        return jsonify(temporadas), 200
+    except Exception as e:
+        logging.exception("Error en temporadas_disponibles")
+        return jsonify({'error': str(e)}), 500
+    finally:
+        if 'cursor' in locals() and cursor:
+            cursor.close()
+        if 'conexion' in locals() and conexion and conexion.is_connected():
+            conexion.close()
+
+
+@caratulas_bp.route('/datos_previo_historico', methods=['GET'])
+def obtener_datos_previo_historico():
+    """Histórico de la tabla `previo`. Filtra por ?temporada=2025-2026 (opcional).
+    Si no se especifica temporada, devuelve todos los snapshots guardados.
+    """
+    temporada = request.args.get('temporada')
+    try:
+        conexion = obtener_conexion()
+        with conexion.cursor(dictionary=True) as cursor:
+            if temporada:
+                cursor.execute(
+                    "SELECT * FROM previo_historico WHERE temporada = %s ORDER BY fecha_snapshot DESC",
+                    (temporada,)
+                )
+            else:
+                cursor.execute("SELECT * FROM previo_historico ORDER BY fecha_snapshot DESC")
+            resultados = cursor.fetchall()
+            for fila in resultados:
+                for key, value in fila.items():
+                    if isinstance(value, Decimal):
+                        fila[key] = float(value)
+        return jsonify(resultados), 200
+    except Exception as e:
+        logging.exception("Error en obtener_datos_previo_historico")
+        return jsonify({'error': str(e)}), 500
+    finally:
+        if 'cursor' in locals() and cursor:
+            cursor.close()
+        if 'conexion' in locals() and conexion and conexion.is_connected():
+            conexion.close()
+
+
+@caratulas_bp.route('/datos_evac_a_historico', methods=['GET'])
+def obtener_datos_evac_a_historico():
+    """Histórico de la tabla `caratula_evac_a`. Filtra por ?temporada=2025-2026 (opcional)."""
+    temporada = request.args.get('temporada')
+    try:
+        conexion = obtener_conexion()
+        with conexion.cursor(dictionary=True) as cursor:
+            if temporada:
+                cursor.execute(
+                    "SELECT * FROM caratula_evac_a_historico WHERE temporada = %s ORDER BY fecha_snapshot DESC",
+                    (temporada,)
+                )
+            else:
+                cursor.execute("SELECT * FROM caratula_evac_a_historico ORDER BY fecha_snapshot DESC")
+            resultados = cursor.fetchall()
+            for fila in resultados:
+                for key, value in fila.items():
+                    if isinstance(value, Decimal):
+                        fila[key] = float(value)
+        return jsonify(resultados), 200
+    except Exception as e:
+        logging.exception("Error en obtener_datos_evac_a_historico")
+        return jsonify({'error': str(e)}), 500
+    finally:
+        if 'cursor' in locals() and cursor:
+            cursor.close()
+        if 'conexion' in locals() and conexion and conexion.is_connected():
+            conexion.close()
+
+
+@caratulas_bp.route('/datos_evac_b_historico', methods=['GET'])
+def obtener_datos_evac_b_historico():
+    """Histórico de la tabla `caratula_evac_b`. Filtra por ?temporada=2025-2026 (opcional)."""
+    temporada = request.args.get('temporada')
+    try:
+        conexion = obtener_conexion()
+        with conexion.cursor(dictionary=True) as cursor:
+            if temporada:
+                cursor.execute(
+                    "SELECT * FROM caratula_evac_b_historico WHERE temporada = %s ORDER BY fecha_snapshot DESC",
+                    (temporada,)
+                )
+            else:
+                cursor.execute("SELECT * FROM caratula_evac_b_historico ORDER BY fecha_snapshot DESC")
+            resultados = cursor.fetchall()
+            for fila in resultados:
+                for key, value in fila.items():
+                    if isinstance(value, Decimal):
+                        fila[key] = float(value)
+        return jsonify(resultados), 200
+    except Exception as e:
+        logging.exception("Error en obtener_datos_evac_b_historico")
+        return jsonify({'error': str(e)}), 500
+    finally:
+        if 'cursor' in locals() and cursor:
+            cursor.close()
+        if 'conexion' in locals() and conexion and conexion.is_connected():
+            conexion.close()
+
 
 @caratulas_bp.route('/debug-caratula-global-otros', methods=['GET'])
 def debug_caratula_global_otros():
