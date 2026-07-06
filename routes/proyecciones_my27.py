@@ -437,7 +437,8 @@ def exportar_excel():
         data    = _get_datos_consolidados(periodo)
 
         if marca:
-            arts = [a for a in data['articulos'] if a.get('marca', '').upper() == marca]
+            arts = [a for a in data['articulos']
+                    if a.get('marca', '').upper() == marca and a['total_anual'] > 0]
             # Recalcular totales con el subconjunto filtrado
             data['articulos'] = arts
             data['totales_mes'] = {
