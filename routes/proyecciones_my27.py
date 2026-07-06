@@ -35,6 +35,97 @@ MESES_LABEL = ['May', 'Jun', 'Jul', 'Ago', 'Sep', 'Oct', 'Nov', 'Dic', 'Ene', 'F
 _COSTOS_CACHE: dict = {'data': {}, 'ts': 0.0}
 _COSTOS_TTL = 300  # 5 minutos
 
+_MEGAMO_PRECIOS_CACHE: dict = {'data': {}, 'ts': 0.0}
+_MEGAMO_PRECIOS_TTL  = 300
+
+# Mapeo nivel → pricelist ID en Odoo (None = no existe, usa factor sobre precio público)
+_NIVEL_TO_PL_ID: dict = {
+    'Distribuidor':        13,
+    'Partner':             11,
+    'Partner Elite':       37,
+    'Partner Elite Plus!': None,
+}
+# Factor sobre precio público cuando no hay pricelist específico
+_NIVEL_FACTORS: dict = {
+    'Distribuidor':        0.760,
+    'Partner':             0.740,
+    'Partner Elite':       0.715,
+    'Partner Elite Plus!': 0.695,
+}
+
+
+def _get_megamo_precios_por_nivel() -> dict:
+    """
+    Retorna {sku: {nivel: precio_sin_iva}} para todos los SKUs Megamo.
+    Prioridad: pricelist Odoo → precio_publico × factor. Cacheado 5 min.
+    """
+    global _MEGAMO_PRECIOS_CACHE
+    now = time.time()
+    if _MEGAMO_PRECIOS_CACHE['data'] and (now - _MEGAMO_PRECIOS_CACHE['ts']) < _MEGAMO_PRECIOS_TTL:
+        return _MEGAMO_PRECIOS_CACHE['data']
+
+    try:
+        uid, models, err = get_odoo_models()
+        if not uid:
+            logging.warning('[megamo_precios] no Odoo: %s', err)
+            return _MEGAMO_PRECIOS_CACHE['data']
+
+        megamo_skus = [s for s in FORECAST_SKU_WHITELIST if s.startswith('MH')]
+
+        prods = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD,
+            'product.product', 'search_read',
+            [[['default_code', 'in', megamo_skus]]],
+            {'fields': ['id', 'default_code'], 'limit': 0})
+        prod_id_map = {p['default_code']: p['id'] for p in prods}
+        id_to_sku   = {v: k for k, v in prod_id_map.items()}
+        prod_ids    = list(prod_id_map.values())
+
+        # Precios públicos (pricelist 4) como base de fallback
+        pl4 = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD,
+            'product.pricelist.item', 'search_read',
+            [[['pricelist_id', '=', 4], ['product_id', 'in', prod_ids]]],
+            {'fields': ['product_id', 'fixed_price'], 'limit': 0})
+        pub_map = {id_to_sku[i['product_id'][0]]: float(i['fixed_price'])
+                   for i in pl4 if i['product_id'][0] in id_to_sku}
+
+        # Precios por pricelist (Distribuidor=13, Partner=11, Partner Elite=37)
+        pl_sku_prices: dict = {}
+        for nivel, pl_id in _NIVEL_TO_PL_ID.items():
+            if pl_id is None:
+                continue
+            items = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD,
+                'product.pricelist.item', 'search_read',
+                [[['pricelist_id', '=', pl_id], ['product_id', 'in', prod_ids]]],
+                {'fields': ['product_id', 'fixed_price'], 'limit': 0})
+            for item in items:
+                sku = id_to_sku.get(item['product_id'][0])
+                if sku:
+                    if pl_id not in pl_sku_prices:
+                        pl_sku_prices[pl_id] = {}
+                    pl_sku_prices[pl_id][sku] = float(item['fixed_price'])
+
+        # Construir resultado: {sku: {nivel: precio_sin_iva}}
+        result: dict = {}
+        for sku in megamo_skus:
+            result[sku] = {}
+            pub = pub_map.get(sku, 0.0)
+            for nivel, factor in _NIVEL_FACTORS.items():
+                pl_id = _NIVEL_TO_PL_ID.get(nivel)
+                if pl_id and pl_id in pl_sku_prices and sku in pl_sku_prices[pl_id]:
+                    result[sku][nivel] = pl_sku_prices[pl_id][sku]
+                elif pub > 0:
+                    result[sku][nivel] = round(pub * factor, 2)
+                else:
+                    result[sku][nivel] = 0.0
+
+        _MEGAMO_PRECIOS_CACHE = {'data': result, 'ts': now}
+        logging.info('[megamo_precios] %d SKUs con precios por nivel', len(result))
+        return result
+
+    except Exception as e:
+        logging.warning('[megamo_precios] error: %s', e)
+        return _MEGAMO_PRECIOS_CACHE['data']
+
 
 def _get_costos_odoo() -> dict:
     """Devuelve {sku: standard_price} para todos los SKUs MY27. Cacheado 5 min."""
@@ -154,15 +245,18 @@ def _get_datos_consolidados(periodo: str = '') -> dict:
                 SUM(mayo+junio+julio+agosto+septiembre+
                     octubre+noviembre+diciembre+
                     enero+febrero+marzo+abril) AS total_anual,
-                COUNT(DISTINCT clave_cliente)  AS num_distribuidores
+                COUNT(DISTINCT CASE WHEN (mayo+junio+julio+agosto+septiembre+octubre+noviembre+diciembre+enero+febrero+marzo+abril) > 0 THEN clave_cliente END) AS num_distribuidores
             FROM forecast_proyecciones
             {where}
             GROUP BY sku
         """, params)
         totales_map = {r['sku']: r for r in cur.fetchall()}
 
-        # Desglose por SKU + distribuidor (incluye nombre_cliente)
-        where_fp = "WHERE fp.periodo = %s" if periodo else ""
+        # Desglose por SKU + distribuidor — solo los que tienen al menos 1 unidad
+        _total_expr = ("(fp.mayo+fp.junio+fp.julio+fp.agosto+fp.septiembre+"
+                       "fp.octubre+fp.noviembre+fp.diciembre+"
+                       "fp.enero+fp.febrero+fp.marzo+fp.abril) > 0")
+        where_fp = f"WHERE fp.periodo = %s AND {_total_expr}" if periodo else f"WHERE {_total_expr}"
         cur.execute(f"""
             SELECT
                 fp.sku, fp.clave_cliente,
@@ -190,8 +284,23 @@ def _get_datos_consolidados(periodo: str = '') -> dict:
                 'meses':          {mes: int(fd[mes] or 0) for mes in MESES},
             })
 
+        # Nivel de cada distribuidor que tiene Megamo con unidades
+        megamo_claves = {
+            d['clave_cliente']
+            for sku, desgloses in desglose_map.items()
+            if sku.startswith('MH')
+            for d in desgloses
+        }
+        nivel_map: dict = {}
+        if megamo_claves:
+            ph = ','.join(['%s'] * len(megamo_claves))
+            cur.execute(f"SELECT clave, nivel FROM clientes WHERE clave IN ({ph})",
+                        list(megamo_claves))
+            nivel_map = {r['clave']: r['nivel'] for r in cur.fetchall()}
+
         # Costos desde Odoo (cacheados)
-        costos_map = _get_costos_odoo()
+        costos_map     = _get_costos_odoo()
+        megamo_precios = _get_megamo_precios_por_nivel()
 
         # Construir los 92 artículos
         articulos = []
@@ -201,8 +310,6 @@ def _get_datos_consolidados(periodo: str = '') -> dict:
             precios   = cat_info.get('prices', {})
             t         = totales_map.get(sku)
 
-            costo_unitario = costos_map.get(sku, 0.0)
-
             meses_data = {
                 mes: {
                     'cantidad':   int(t[mes] or 0) if t else 0,
@@ -210,9 +317,26 @@ def _get_datos_consolidados(periodo: str = '') -> dict:
                 }
                 for mes in MESES
             }
-
             total_anual = int(t['total_anual'] or 0) if t else 0
-            costos_mes  = {mes: round(meses_data[mes]['cantidad'] * costo_unitario, 2) for mes in MESES}
+
+            if sku.startswith('MH'):
+                # Megamo: costo por nivel de cada distribuidor con unidades
+                dists_con_unidades = desglose_map.get(sku, [])  # ya filtrado a total > 0
+                num_dists = len(dists_con_unidades)
+                precios_sku = megamo_precios.get(sku, {})
+                suma_precios = 0.0
+                for d in dists_con_unidades:
+                    nivel      = nivel_map.get(d['clave_cliente'], 'Distribuidor')
+                    precio_niv = precios_sku.get(nivel, precios_sku.get('Distribuidor', 0.0))
+                    suma_precios += precio_niv
+                costo_total    = round(suma_precios, 2)
+                costo_unitario = round(suma_precios / num_dists, 2) if num_dists > 0 else 0.0
+            else:
+                # Scott/otros: standard_price × unidades
+                costo_unitario = costos_map.get(sku, 0.0)
+                costo_total    = round(total_anual * costo_unitario, 2)
+
+            costos_mes = {mes: round(meses_data[mes]['cantidad'] * costo_unitario, 2) for mes in MESES}
 
             articulos.append({
                 'sku':               sku,
@@ -223,7 +347,7 @@ def _get_datos_consolidados(periodo: str = '') -> dict:
                 'talla':             (t['talla']    or '') if t else '',
                 'precio_dist':       float(precios.get('Distribuidor', 0)),
                 'costo_unitario':    round(costo_unitario, 2),
-                'costo_total':       round(total_anual * costo_unitario, 2),
+                'costo_total':       costo_total,
                 'costos_mes':        costos_mes,
                 'num_distribuidores': int(t['num_distribuidores'] or 0) if t else 0,
                 'total_anual':       total_anual,
@@ -285,7 +409,8 @@ def listar():
     try:
         periodo = request.args.get('periodo', '2026-2027').strip()
         if request.args.get('refresh'):
-            _COSTOS_CACHE['ts'] = 0.0  # invalidar caché de costos
+            _COSTOS_CACHE['ts'] = 0.0
+            _MEGAMO_PRECIOS_CACHE['ts'] = 0.0
         data    = _get_datos_consolidados(periodo)
         return jsonify(data), 200
     except Exception as e:
