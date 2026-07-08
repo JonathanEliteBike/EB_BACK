@@ -641,8 +641,9 @@ def _generar_excel(data: dict) -> bytes:
     # ── Hoja 2: Desglose por distribuidor ────────────────────────────────────
     ws2 = wb.create_sheet('Desglose Distribuidores')
 
+    # Col 7: Clave  |  Col 8: Nombre  |  Col 9-20: meses  |  Col 21: Total
     enc2 = ['SKU', 'Producto', 'Marca', 'Modelo', 'Color', 'Talla',
-            'Distribuidor'] + MESES_LABEL + ['TOTAL']
+            'Clave Dist.', 'Nombre Distribuidor'] + MESES_LABEL + ['TOTAL']
     for ci, enc in enumerate(enc2, start=1):
         c = ws2.cell(row=1, column=ci, value=enc)
         cell_style(c, bold=True, bg=AZUL_OSCURO, fg=BLANCO, size=10, center=True)
@@ -659,13 +660,13 @@ def _generar_excel(data: dict) -> bytes:
 
             vals = [art['sku'], art['producto'], art['marca'],
                     art['modelo'], art['color'], art['talla'],
-                    dist['clave_cliente']]
+                    dist['clave_cliente'], dist.get('nombre_cliente', dist['clave_cliente'])]
             for ci, v in enumerate(vals, start=1):
                 c = ws2.cell(row=ri2, column=ci, value=v)
                 cell_style(c, bg=bg, size=9)
                 c.border = thin_bdr
 
-            for ci, mes in enumerate(MESES, start=8):
+            for ci, mes in enumerate(MESES, start=9):
                 cant = dist['meses'].get(mes, 0)
                 c    = ws2.cell(row=ri2, column=ci, value=cant if cant > 0 else '')
                 if cant > 0:
@@ -674,16 +675,16 @@ def _generar_excel(data: dict) -> bytes:
                     cell_style(c, bg=bg, center=True, size=9)
                 c.border = thin_bdr
 
-            c_tot = ws2.cell(row=ri2, column=20, value=dist['total'] or '')
+            c_tot = ws2.cell(row=ri2, column=21, value=dist['total'] or '')
             cell_style(c_tot, bold=True, bg=AZUL_MED, fg=BLANCO, center=True, size=10)
             c_tot.border = thin_bdr
             ws2.row_dimensions[ri2].height = 16
             ri2 += 1
 
-    anchos2 = [18, 35, 12, 20, 15, 8, 14] + [6] * 12 + [10]
+    anchos2 = [18, 35, 12, 20, 15, 8, 14, 28] + [6] * 12 + [10]
     for ci, ancho in enumerate(anchos2, start=1):
         ws2.column_dimensions[get_column_letter(ci)].width = ancho
-    ws2.freeze_panes = 'H2'
+    ws2.freeze_panes = 'I2'
 
     buf = io.BytesIO()
     wb.save(buf)

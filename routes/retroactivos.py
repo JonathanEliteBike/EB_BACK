@@ -3097,7 +3097,9 @@ def cerrar_temporada():
         return jsonify({"error": "No autorizado"}), 401
 
     payload = verificar_token(raw_token)
-    rol = payload.get('rol') if payload else None
+    if not payload:
+        return jsonify({"error": "Sesión expirada, por favor inicia sesión de nuevo"}), 401
+    rol = payload.get('rol')
     try:
         es_admin = int(rol) == 1
     except (TypeError, ValueError):
