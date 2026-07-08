@@ -1022,10 +1022,38 @@ def _recalcular_acumulados_previo(conexion, cursor):
                compromiso_ene_feb,     compromiso_mar_abr,     compromiso_may_jun,
                compromiso_jul_ago_app, compromiso_sep_oct_app, compromiso_nov_dic_app,
                compromiso_ene_feb_app, compromiso_mar_abr_app, compromiso_may_jun_app,
-               compra_minima_inicial,  compra_minima_anual
+               compra_minima_inicial,  compra_minima_anual,
+               avance_global_scott, avance_global_apparel_syncros_vittoria,
+               acumulado_syncros, acumulado_apparel, acumulado_vittoria, acumulado_bold,
+               acumulado_anticipado,
+               avance_jul_ago, avance_sep_oct, avance_nov_dic,
+               avance_ene_feb, avance_mar_abr, avance_may_jun,
+               avance_jul_ago_app, avance_sep_oct_app, avance_nov_dic_app,
+               avance_ene_feb_app, avance_mar_abr_app, avance_may_jun_app
         FROM previo
     """)
     filas = cursor.fetchall()
+
+    # Miembro cerrado de un grupo Integral: ya no aparece en `totales` (la query de
+    # arriba excluye cerrados), pero su propio previo quedo congelado correcto al
+    # cerrarlo -> se usa esa fila en vez de contar 0.
+    previo_por_clave = {
+        str(f['clave']).strip().upper(): f for f in filas if not f['es_integral']
+    }
+    CAMPO_PREVIO_CERRADO = {
+        'scott': 'avance_global_scott',
+        'syncros': 'acumulado_syncros',
+        'apparel': 'acumulado_apparel',
+        'vittoria': 'acumulado_vittoria',
+        'bold': 'acumulado_bold',
+        'total_bruto': 'acumulado_anticipado',
+    }
+    for _p in ['jul_ago', 'sep_oct', 'nov_dic', 'ene_feb', 'mar_abr', 'may_jun']:
+        CAMPO_PREVIO_CERRADO[f'scott_{_p}'] = f'avance_{_p}'
+        # syncros/apparel/vittoria no se guardan por separado por periodo en previo;
+        # el combinado se vuelca completo en 'apparel_<periodo>' -- el total (p_app)
+        # sale igual porque es una suma, y no se muestra el desglose por marca aqui.
+        CAMPO_PREVIO_CERRADO[f'apparel_{_p}'] = f'avance_{_p}_app'
 
     PERIODS = ['jul_ago', 'sep_oct', 'nov_dic', 'ene_feb', 'mar_abr', 'may_jun']
 
@@ -1036,7 +1064,15 @@ def _recalcular_acumulados_previo(conexion, cursor):
         return int(round(avance / compromiso * 100)) if compromiso > 0 else 0
 
     def sf(claves, field):
-        return sum(flt(totales.get(c, {}).get(field, 0)) for c in claves)
+        campo_cerrado = CAMPO_PREVIO_CERRADO.get(field)
+        total = 0.0
+        for c in claves:
+            c_norm = str(c).strip().upper()
+            if c_norm in claves_cerradas and campo_cerrado:
+                total += flt((previo_por_clave.get(c_norm) or {}).get(campo_cerrado))
+            else:
+                total += flt(totales.get(c, {}).get(field, 0))
+        return total
 
     actualizados = 0
     for fila in filas:
