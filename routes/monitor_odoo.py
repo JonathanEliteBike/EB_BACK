@@ -577,6 +577,7 @@ def sync_monitor_odoo():
                 ['move_type', '=', 'out_invoice'],
                 ['state', '=', 'posted'],
                 ['invoice_date', '>=', FECHA_INICIO],
+                ['payment_state', 'not in', ['reversed', 'invoicing_legacy']],
             ]],
             {'fields': ['id', 'name', 'invoice_date', 'partner_id', 'invoice_line_ids'], 'limit': 0}
         )
