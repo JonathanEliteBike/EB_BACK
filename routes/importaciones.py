@@ -1090,18 +1090,41 @@ def actualizar(id_imp):
                 return jsonify({"error": "Sección de borrador no válida"}), 400
             if not data:
                 return jsonify({"ok": True, "borrador": True}), 200  # no-op, nothing to save
-            # JSON_MERGE_PATCH anidado: fusiona campos nuevos con borrador existente de la sección
-            # en lugar de reemplazarlo — preserva campos editados en sesiones anteriores
-            cursor.execute(
-                f"""UPDATE importaciones SET borradores = JSON_MERGE_PATCH(
-                    COALESCE(borradores, JSON_OBJECT()),
-                    JSON_OBJECT('{borrador_seccion}', JSON_MERGE_PATCH(
-                        COALESCE(JSON_EXTRACT(borradores, '$.{borrador_seccion}'), JSON_OBJECT()),
-                        CAST(%s AS JSON)
-                    ))
-                ) WHERE id = %s""",
-                (_json.dumps(data, ensure_ascii=False), id_imp),
-            )
+
+            # Separar: campos que ya tienen valor en DB → actualizar columna directamente (correcciones)
+            #          campos vacíos en DB → guardar en borradores JSON (rellenos nuevos pendientes)
+            directo = {}
+            borrador_data = {}
+            for campo, valor in data.items():
+                val_actual = existing.get(campo)
+                tiene_valor = val_actual is not None and val_actual != "" and val_actual != "__NA__"
+                if tiene_valor and valor != val_actual:
+                    directo[campo] = valor   # corrección de campo existente → columna real
+                else:
+                    borrador_data[campo] = valor  # campo vacío → borrador
+
+            if directo:
+                valid_cols = set(existing.keys())
+                set_parts = [f"`{c}` = %s" for c in directo if c in valid_cols]
+                vals_directo = [directo[c] for c in directo if c in valid_cols]
+                if set_parts:
+                    cursor.execute(
+                        f"UPDATE importaciones SET {', '.join(set_parts)} WHERE id = %s",
+                        vals_directo + [id_imp],
+                    )
+
+            if borrador_data:
+                cursor.execute(
+                    f"""UPDATE importaciones SET borradores = JSON_MERGE_PATCH(
+                        COALESCE(borradores, JSON_OBJECT()),
+                        JSON_OBJECT('{borrador_seccion}', JSON_MERGE_PATCH(
+                            COALESCE(JSON_EXTRACT(borradores, '$.{borrador_seccion}'), JSON_OBJECT()),
+                            CAST(%s AS JSON)
+                        ))
+                    ) WHERE id = %s""",
+                    (_json.dumps(borrador_data, ensure_ascii=False), id_imp),
+                )
+
             conn.commit()
             return jsonify({"ok": True, "borrador": True}), 200
 
