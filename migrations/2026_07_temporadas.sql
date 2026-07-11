@@ -20,7 +20,17 @@ VALUES ('2026-2027', '2026-07-01', '2027-06-30', 'abierta')
 ON DUPLICATE KEY UPDATE etiqueta = etiqueta;
 
 -- Add dia_inicio_temporada column to clientes table for early-starter distributors
--- Note: MySQL 8.0.43 does not support IF NOT EXISTS in ALTER TABLE, so using direct ALTER
--- Idempotency: This migration should be run only once; re-running will fail if column exists
-ALTER TABLE clientes
-    ADD COLUMN dia_inicio_temporada VARCHAR(5) NULL COMMENT 'MM-DD; NULL = usa el default 07-01';
+-- Note: MySQL's ALTER TABLE grammar does not support "ADD COLUMN IF NOT EXISTS"
+-- (that is a MariaDB-only extension, not a MySQL version limitation), so we guard
+-- the ALTER with information_schema + dynamic SQL to keep this file safe to re-run.
+SET @col_exists = (
+    SELECT COUNT(*) FROM information_schema.columns
+    WHERE table_schema = DATABASE() AND table_name = 'clientes' AND column_name = 'dia_inicio_temporada'
+);
+SET @sql = IF(@col_exists = 0,
+    'ALTER TABLE clientes ADD COLUMN dia_inicio_temporada VARCHAR(5) NULL COMMENT ''MM-DD; NULL = usa el default 07-01''',
+    'SELECT 1'
+);
+PREPARE stmt FROM @sql;
+EXECUTE stmt;
+DEALLOCATE PREPARE stmt;
