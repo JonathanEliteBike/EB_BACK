@@ -18,3 +18,9 @@ ON DUPLICATE KEY UPDATE etiqueta = etiqueta;
 INSERT INTO temporadas (etiqueta, fecha_inicio, fecha_fin, estado)
 VALUES ('2026-2027', '2026-07-01', '2027-06-30', 'abierta')
 ON DUPLICATE KEY UPDATE etiqueta = etiqueta;
+
+-- Add dia_inicio_temporada column to clientes table for early-starter distributors
+-- Note: MySQL 8.0.43 does not support IF NOT EXISTS in ALTER TABLE, so using direct ALTER
+-- Idempotency: This migration should be run only once; re-running will fail if column exists
+ALTER TABLE clientes
+    ADD COLUMN dia_inicio_temporada VARCHAR(5) NULL COMMENT 'MM-DD; NULL = usa el default 07-01';
