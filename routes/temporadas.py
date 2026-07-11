@@ -180,3 +180,80 @@ def cerrar_temporada_completa_endpoint():
     except Exception as e:
         logging.exception('Error en cerrar_temporada_completa_endpoint')
         return jsonify({'error': str(e)}), 500
+
+
+def abrir_temporada(etiqueta: str) -> int:
+    """Fija f_inicio para cada cliente segun su dia_inicio_temporada (o el
+    default 07-01), y los reabre (temporada_cerrada=0) para la temporada nueva."""
+    conexion = obtener_conexion()
+    cur_dict = conexion.cursor(dictionary=True)
+    cur = conexion.cursor()
+
+    actualizados = 0
+
+    try:
+        cur_dict.execute("SELECT fecha_inicio FROM temporadas WHERE etiqueta = %s", (etiqueta,))
+        row = cur_dict.fetchone()
+        if not row:
+            raise ValueError(f"Temporada '{etiqueta}' no registrada en la tabla temporadas")
+        anio_inicio = row['fecha_inicio'].year
+
+        cur_dict.execute("SELECT clave, dia_inicio_temporada FROM clientes WHERE clave IS NOT NULL AND clave <> ''")
+        clientes = cur_dict.fetchall()
+
+        for c in clientes:
+            dia = c['dia_inicio_temporada'] or '07-01'
+            f_inicio_nuevo = f"{anio_inicio}-{dia}"
+            cur.execute(
+                "UPDATE clientes SET f_inicio = %s, temporada_cerrada = 0, fecha_cierre_temporada = NULL, f_fin = NULL "
+                "WHERE clave = %s",
+                (f_inicio_nuevo, c['clave'])
+            )
+            actualizados += 1
+
+        conexion.commit()
+    except Exception:
+        conexion.rollback()
+        raise
+    finally:
+        cur_dict.close()
+        cur.close()
+        conexion.close()
+
+    logging.info("abrir_temporada(%s): %d clientes actualizados", etiqueta, actualizados)
+
+    return actualizados
+
+
+@temporadas_bp.route('/abrir-temporada', methods=['POST'])
+def abrir_temporada_endpoint():
+    # Admin only, bulk-reset de temporada_cerrada/f_inicio para TODOS los
+    # clientes: mismo patrón de autenticación que /cerrar-temporada-completa.
+    auth_header = request.headers.get('Authorization', '')
+    raw_token = auth_header.split(' ')[1] if ' ' in auth_header else None
+    if not raw_token:
+        return jsonify({"error": "No autorizado"}), 401
+
+    payload = verificar_token(raw_token)
+    if not payload:
+        return jsonify({"error": "Sesión expirada, por favor inicia sesión de nuevo"}), 401
+    rol = payload.get('rol')
+    try:
+        es_admin = int(rol) == 1
+    except (TypeError, ValueError):
+        es_admin = False
+    if not es_admin:
+        return jsonify({"error": "Solo administradores pueden abrir la temporada"}), 403
+
+    data = request.get_json() or {}
+    etiqueta = data.get('etiqueta')
+    if not etiqueta:
+        return jsonify({'error': 'Se requiere etiqueta (ej. "2026-2027")'}), 400
+    try:
+        n = abrir_temporada(etiqueta)
+        return jsonify({'success': True, 'clientes_actualizados': n}), 200
+    except ValueError as e:
+        return jsonify({'error': str(e)}), 400
+    except Exception as e:
+        logging.exception('Error en abrir_temporada_endpoint')
+        return jsonify({'error': str(e)}), 500

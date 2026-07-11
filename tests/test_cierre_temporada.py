@@ -1,6 +1,6 @@
 # tests/test_cierre_temporada.py
 from db_conexion import obtener_conexion
-from routes.temporadas import cerrar_temporada_completa
+from routes.temporadas import cerrar_temporada_completa, abrir_temporada
 from app import create_app
 
 
@@ -65,6 +65,60 @@ def test_endpoint_sin_token_devuelve_401():
     client = app.test_client()
 
     resp = client.post('/cerrar-temporada-completa', json={'etiqueta': '2025-2026'})
+
+    assert resp.status_code == 401
+    data = resp.get_json()
+    assert data and 'error' in data
+
+
+def test_abrir_temporada_usa_dia_inicio_personalizado():
+    """
+    abrir_temporada no acepta un filtro por cliente: por diseño opera sobre
+    TODA la tabla clientes (reabre a todos para la temporada nueva). Para
+    poder ejercitar la función real contra la BD local (sin mocks, siguiendo
+    la convención de este repo para código de BD) sin dejar corrompido el
+    estado real de los ~140 clientes, respaldamos clientes ANTES de llamar a
+    la función y restauramos ese respaldo completo en el finally, pase lo que
+    pase. La corrida real (sin restaurar) contra toda la base queda reservada
+    para el checkpoint humano de la Tarea 3.2, no para esta suite automática.
+    """
+    conn = obtener_conexion()
+    cur = conn.cursor(dictionary=True)
+    cur_w = conn.cursor()
+
+    cur.execute(
+        "SELECT clave, f_inicio, f_fin, dia_inicio_temporada, temporada_cerrada, "
+        "fecha_cierre_temporada FROM clientes WHERE clave IS NOT NULL AND clave <> ''"
+    )
+    backup = cur.fetchall()
+
+    cur_w.execute("UPDATE clientes SET dia_inicio_temporada = '06-01' WHERE clave = 'HA433'")
+    conn.commit()
+
+    try:
+        abrir_temporada('2026-2027')
+
+        cur.execute("SELECT f_inicio, temporada_cerrada FROM clientes WHERE clave = 'HA433'")
+        fila = cur.fetchone()
+        assert str(fila['f_inicio']) == '2026-06-01'
+        assert fila['temporada_cerrada'] == 0
+    finally:
+        for row in backup:
+            cur_w.execute(
+                "UPDATE clientes SET f_inicio=%s, f_fin=%s, dia_inicio_temporada=%s, "
+                "temporada_cerrada=%s, fecha_cierre_temporada=%s WHERE clave=%s",
+                (row['f_inicio'], row['f_fin'], row['dia_inicio_temporada'],
+                 row['temporada_cerrada'], row['fecha_cierre_temporada'], row['clave'])
+            )
+        conn.commit()
+        cur.close(); cur_w.close(); conn.close()
+
+
+def test_abrir_temporada_endpoint_sin_token_devuelve_401():
+    app = create_app()
+    client = app.test_client()
+
+    resp = client.post('/abrir-temporada', json={'etiqueta': '2026-2027'})
 
     assert resp.status_code == 401
     data = resp.get_json()
