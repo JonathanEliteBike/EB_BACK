@@ -8,6 +8,33 @@ from utils.jwt_utils import verificar_token
 temporadas_bp = Blueprint('temporadas', __name__, url_prefix='')
 
 
+@temporadas_bp.route('/temporadas', methods=['GET'])
+def listar_temporadas():
+    """Devuelve todas las temporadas registradas con sus fechas, para poblar
+    selectores en el frontend (p. ej. el filtro manual de fecha de Carátula EVACs).
+    Lectura pública, sin autenticación -- misma politica que /temporadas_disponibles
+    en routes/caratulas.py (no expone nada sensible, solo rangos de fecha por etiqueta).
+    """
+    conexion = obtener_conexion()
+    cur_dict = conexion.cursor(dictionary=True)
+
+    try:
+        cur_dict.execute(
+            "SELECT etiqueta, fecha_inicio, fecha_fin, estado FROM temporadas ORDER BY fecha_inicio DESC"
+        )
+        resultados = cur_dict.fetchall()
+        for fila in resultados:
+            fila['fecha_inicio'] = str(fila['fecha_inicio'])
+            fila['fecha_fin'] = str(fila['fecha_fin'])
+        return jsonify(resultados), 200
+    except Exception as e:
+        logging.exception('Error en listar_temporadas')
+        return jsonify({'error': str(e)}), 500
+    finally:
+        cur_dict.close()
+        conexion.close()
+
+
 def cerrar_temporada_completa(etiqueta: str, dry_run: bool = True) -> dict:
     """
     Cierra una temporada completa: recalcula previo para cada cliente ABIERTO
