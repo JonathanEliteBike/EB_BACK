@@ -150,6 +150,8 @@ def create_app():
     app.register_blueprint(disponibilidad_bp)
     app.register_blueprint(multimarcas_bp)
     app.register_blueprint(caratulas_bp)
+    from routes.temporadas import temporadas_bp
+    app.register_blueprint(temporadas_bp)
     app.register_blueprint(integrales_bp)
     app.register_blueprint(email_bp)
 
