@@ -1,4 +1,6 @@
 # tests/test_cierre_temporada.py
+from unittest.mock import MagicMock, patch
+
 from db_conexion import obtener_conexion
 from routes.temporadas import cerrar_temporada_completa, abrir_temporada
 from app import create_app
@@ -58,6 +60,75 @@ def test_clientes_ya_cerrados_no_se_tocan():
     assert previo_antes == previo_despues
 
     cur.close(); conn.close()
+
+
+def test_no_reejecuta_cierre_real_de_temporada_ya_cerrada():
+    """
+    Si la temporada ya tiene estado='cerrada' (p. ej. '2025-2026', cerrada al
+    abrir MY27), un cierre real (dry_run=False) debe rechazarse con
+    ValueError: abrir_temporada() resetea temporada_cerrada=0 en TODOS los
+    clientes, por lo que el chequeo de "clientes ya cerrados" (linea 74-78)
+    ya no evita un re-cierre accidental -- sin este guard, un segundo cierre
+    real insertaria un set de filas duplicado/incorrecto en previo_historico
+    (que no tiene UNIQUE en (temporada, clave)), corrompiendo el snapshot
+    congelado original.
+
+    Se mockea la conexion (en vez de reusar el patron de BD real del resto
+    de este archivo) porque este caso puntual ejercita dry_run=False: si el
+    guard tuviera un bug, correrlo contra la BD viva insertaria una fila
+    corrupta en previo_historico de produccion -- exactamente el dano que
+    esta guarda existe para evitar. Se verifica ademas que el cursor "plano"
+    (el que ejecuta el INSERT hacia previo_historico) nunca es invocado.
+    """
+    mock_cur_dict = MagicMock()
+    mock_cur_dict.fetchone.return_value = {
+        'fecha_inicio': '2025-07-01', 'fecha_fin': '2026-06-30', 'estado': 'cerrada'
+    }
+    mock_cur = MagicMock()
+    mock_conn = MagicMock()
+    mock_conn.cursor.side_effect = [mock_cur_dict, mock_cur]
+
+    with patch('routes.temporadas.obtener_conexion', return_value=mock_conn):
+        try:
+            cerrar_temporada_completa('2025-2026', dry_run=False)
+            assert False, "Se esperaba ValueError al re-cerrar una temporada ya cerrada"
+        except ValueError as e:
+            assert 'cerrada' in str(e)
+
+    for call in mock_cur.execute.call_args_list:
+        sql = call.args[0] if call.args else ''
+        assert 'INSERT INTO previo_historico' not in sql
+    mock_conn.commit.assert_not_called()
+
+
+def test_dry_run_permitido_sobre_temporada_ya_cerrada():
+    """
+    dry_run=True sigue permitido aunque la temporada este marcada como
+    'cerrada': el guard solo bloquea la ejecucion real (dry_run=False), no
+    la vista previa de solo lectura (rollback al final), util para
+    inspeccion/depuracion de un snapshot ya congelado sin riesgo de
+    persistir nada. Se mockea por la misma razon que el test anterior: no
+    queremos que una prueba automática dependa de/mute el estado real de la
+    BD local para 2025-2026.
+    """
+    mock_cur_dict = MagicMock()
+    mock_cur_dict.fetchone.side_effect = [
+        {'fecha_inicio': '2025-07-01', 'fecha_fin': '2026-06-30', 'estado': 'cerrada'},
+        {'n': 0},
+    ]
+    mock_cur_dict.fetchall.return_value = []
+    mock_cur = MagicMock()
+    mock_conn = MagicMock()
+    mock_conn.cursor.side_effect = [mock_cur_dict, mock_cur]
+
+    with patch('routes.temporadas.obtener_conexion', return_value=mock_conn):
+        resultado = cerrar_temporada_completa('2025-2026', dry_run=True)
+
+    assert resultado['clientes_procesados'] == 0
+    mock_conn.rollback.assert_called_once()
+    for call in mock_cur.execute.call_args_list:
+        sql = call.args[0] if call.args else ''
+        assert 'INSERT INTO previo_historico' not in sql
 
 
 def test_endpoint_sin_token_devuelve_401():

@@ -61,10 +61,17 @@ def cerrar_temporada_completa(etiqueta: str, dry_run: bool = True) -> dict:
     preview = []
 
     try:
-        cur_dict.execute("SELECT fecha_inicio, fecha_fin FROM temporadas WHERE etiqueta = %s", (etiqueta,))
+        cur_dict.execute("SELECT fecha_inicio, fecha_fin, estado FROM temporadas WHERE etiqueta = %s", (etiqueta,))
         temporada_row = cur_dict.fetchone()
         if not temporada_row:
             raise ValueError(f"Temporada '{etiqueta}' no registrada en la tabla temporadas")
+
+        if temporada_row['estado'] == 'cerrada' and not dry_run:
+            raise ValueError(
+                f"Temporada '{etiqueta}' ya está cerrada (estado='cerrada'). "
+                "No se puede volver a ejecutar el cierre real sobre una temporada ya cerrada "
+                "-- esto duplicaría/corrompería las filas ya congeladas en previo_historico."
+            )
 
         fecha_fin_temporada = str(temporada_row['fecha_fin'])
         fecha_inicio_default = str(temporada_row['fecha_inicio'])
