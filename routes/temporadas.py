@@ -74,12 +74,19 @@ def cerrar_temporada_completa(etiqueta: str, dry_run: bool = True) -> dict:
             )
 
         fecha_fin_temporada = str(temporada_row['fecha_fin'])
-        fecha_inicio_default = str(temporada_row['fecha_inicio'])
+        anio_inicio_temporada = int(str(temporada_row['fecha_inicio'])[:4])
 
         # Solo clientes abiertos: los ya cerrados individualmente conservan su
         # propio cierre y no deben ser reprocesados por el cierre masivo.
+        # NOTA: no se usa clientes.f_inicio aqui -- ese campo refleja el inicio
+        # de la temporada ACTUALMENTE abierta (lo mueve abrir_temporada()/otros
+        # procesos conforme avanza el tiempo) y puede ya apuntar a una temporada
+        # posterior a la que se esta cerrando. El inicio efectivo para ESTA
+        # temporada se deriva de dia_inicio_temporada (o el default 07-01) + el
+        # anio de fecha_inicio de la temporada que se esta cerrando, igual que
+        # abrir_temporada() lo calcula para la temporada que abre.
         cur_dict.execute("""
-            SELECT clave, f_inicio FROM clientes
+            SELECT clave, dia_inicio_temporada FROM clientes
             WHERE clave IS NOT NULL AND clave <> ''
               AND (temporada_cerrada IS NULL OR temporada_cerrada = 0)
         """)
@@ -93,10 +100,8 @@ def cerrar_temporada_completa(etiqueta: str, dry_run: bool = True) -> dict:
 
         for c in clientes:
             clave = c['clave'].strip().upper()
-            f_inicio_cliente = c['f_inicio']
-            if hasattr(f_inicio_cliente, 'strftime'):
-                f_inicio_cliente = f_inicio_cliente.strftime('%Y-%m-%d')
-            f_inicio_cliente = f_inicio_cliente or fecha_inicio_default
+            dia = c['dia_inicio_temporada'] or '07-01'
+            f_inicio_cliente = f"{anio_inicio_temporada}-{dia}"
 
             _recalcular_previo_clave_cierre(conexion, cur_dict, cur, clave, f_inicio_cliente, fecha_fin_temporada)
             procesados += 1

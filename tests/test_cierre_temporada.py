@@ -23,6 +23,61 @@ def test_dry_run_no_escribe_nada():
     cur.close(); conn.close()
 
 
+def test_ignora_f_inicio_ya_rodado_a_temporada_siguiente():
+    """
+    Regresion: clientes.f_inicio NO debe usarse para acotar el cierre de una
+    temporada pasada. Ese campo refleja el inicio de la temporada ACTUALMENTE
+    abierta y puede ya apuntar al futuro (p. ej. '2026-07-01' mientras se
+    cierra '2025-2026') si el rollover a la temporada siguiente ya ocurrio por
+    cualquier via antes de correr el cierre formal. Si el codigo usara
+    f_inicio tal cual, el rango de fecha_factura quedaria invertido
+    (inicio > fin) y el recalculo sumaria 0 para todos los clientes -- error
+    real detectado al correr el checkpoint 2.2 del plan contra datos locales.
+    """
+    conn = obtener_conexion()
+    cur = conn.cursor(dictionary=True)
+    cur_w = conn.cursor()
+
+    cur.execute(
+        "SELECT clave, f_inicio, dia_inicio_temporada FROM clientes "
+        "WHERE clave IS NOT NULL AND clave <> '' LIMIT 1"
+    )
+    cliente = cur.fetchone()
+    clave = cliente['clave']
+    backup_f_inicio = cliente['f_inicio']
+    backup_dia = cliente['dia_inicio_temporada']
+
+    try:
+        # Simula el rollover ya ocurrido: f_inicio apunta a MY27, no a MY26.
+        cur_w.execute(
+            "UPDATE clientes SET f_inicio = '2026-07-01', dia_inicio_temporada = NULL WHERE clave = %s",
+            (clave,)
+        )
+        conn.commit()
+
+        resultado = cerrar_temporada_completa('2025-2026', dry_run=True)
+
+        fila = next((p for p in resultado['preview'] if p['clave'] == clave), None)
+        # No aseguramos que este cliente caiga en el preview de 3; lo que
+        # importa es que el cierre completo no haya sumado 0 para todos por
+        # culpa del rango invertido.
+        assert resultado['clientes_procesados'] > 0
+        montos_no_todos_cero = any(
+            float(p['acumulado_anticipado']) != 0 for p in resultado['preview']
+        )
+        assert montos_no_todos_cero, (
+            "Todos los montos del preview dieron 0 -- probable regresion al "
+            "rango de fechas invertido causado por clientes.f_inicio ya rodado"
+        )
+    finally:
+        cur_w.execute(
+            "UPDATE clientes SET f_inicio = %s, dia_inicio_temporada = %s WHERE clave = %s",
+            (backup_f_inicio, backup_dia, clave)
+        )
+        conn.commit()
+        cur.close(); cur_w.close(); conn.close()
+
+
 def test_clientes_ya_cerrados_no_se_tocan():
     """
     Clientes con temporada_cerrada = 1 (p. ej. HA433, cerrado individualmente
