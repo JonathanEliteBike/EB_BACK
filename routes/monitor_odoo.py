@@ -14,7 +14,7 @@ import re
 from zoneinfo import ZoneInfo
 import time
 import logging
-from utils.odoo_utils import get_odoo_models, ODOO_DB, ODOO_PASSWORD
+from utils.odoo_utils import get_odoo_models, ODOO_DB, ODOO_PASSWORD, ODOO_COMPANY_ID
 
 monitor_odoo_bp = Blueprint('monitor_odoo', __name__, url_prefix='')
 
@@ -574,6 +574,7 @@ def sync_monitor_odoo():
             ODOO_DB, uid, ODOO_PASSWORD,
             'account.move', 'search_read',
             [[
+                ['company_id', '=', ODOO_COMPANY_ID],  # BLINDAJE MULTI-EMPRESA (ver utils/odoo_utils.py)
                 ['move_type', '=', 'out_invoice'],
                 ['state', '=', 'posted'],
                 ['invoice_date', '>=', FECHA_INICIO],

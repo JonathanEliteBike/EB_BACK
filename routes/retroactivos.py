@@ -2410,11 +2410,18 @@ def obtener_deducciones_odoo(claves_db, fechas_por_clave):
 # 2. FUNCIÓN DE SINCRONIZACIÓN AUTOMÁTICA
 # ==============================================================================
 
-def _recalcular_previo_clave_cierre(conexion, cursor_dict, cursor, clave, f_inicio, fecha_cierre):
+def _calcular_valores_previo_clave(cursor_dict, clave, f_inicio, fecha_cierre):
     """
-    Recalcula las columnas de avance en previo para un distribuidor individual,
-    usando fecha_cierre como tope de fecha. Se llama al cerrar la temporada
-    para asegurar que el previo no incluya compras posteriores al cierre.
+    Calcula (sin escribir nada) los valores de avance para un distribuidor
+    individual, acotados a [f_inicio, fecha_cierre]. Funcion pura de lectura:
+    no hace ningun UPDATE ni INSERT -- solo lee de `monitor` y `previo`
+    (para el contexto de compromisos) y regresa un dict con los campos
+    calculados, listo para usarse tanto para congelar `previo` en vivo
+    (cierre individual, ver _recalcular_previo_clave_cierre) como para
+    archivar en `previo_historico` (cierre masivo de temporada, ver
+    routes/temporadas.py) SIN tocar la tabla en vivo.
+    Regresa None si la clave no tiene fila en `previo` (o es un renglon
+    Integral -- esos se calculan aparte, sumando a sus miembros).
     """
     SCOTT_COND = """(
         (
@@ -2480,7 +2487,7 @@ def _recalcular_previo_clave_cierre(conexion, cursor_dict, cursor, clave, f_inic
     """, (clave,))
     previo_row = cursor_dict.fetchone()
     if not previo_row:
-        return
+        return None
 
     def flt(v): return float(v or 0)
     def pct(avance, compromiso): return int(round(avance / compromiso * 100)) if compromiso > 0 else 0
@@ -2502,6 +2509,49 @@ def _recalcular_previo_clave_cierre(conexion, cursor_dict, cursor, clave, f_inic
 
     cm_ini = flt(previo_row.get('compra_minima_inicial'))
     cm_anu = flt(previo_row.get('compra_minima_anual'))
+
+    valores = {
+        'id': previo_row['id'],
+        'acumulado_anticipado': acum_total,
+        'acumulado_syncros': syncros,
+        'acumulado_apparel': apparel,
+        'acumulado_vittoria': vittoria,
+        'acumulado_bold': bold,
+        'avance_global': acum_total,
+        'avance_global_scott': scott,
+        'avance_global_apparel_syncros_vittoria': app_global,
+        'porcentaje_global': pct(acum_total, cm_ini),
+        'porcentaje_anual': pct(acum_total, cm_anu),
+        'porcentaje_scott': pct(scott, flt(previo_row.get('compromiso_scott'))),
+        'porcentaje_apparel_syncros_vittoria': pct(app_global, flt(previo_row.get('compromiso_apparel_syncros_vittoria'))),
+    }
+    for p in PERIODS:
+        valores[f'avance_{p}'] = p_scott[p]
+        valores[f'porcentaje_{p}'] = pct(p_scott[p], flt(previo_row.get(f'compromiso_{p}')))
+        valores[f'avance_{p}_app'] = p_app[p]
+        valores[f'porcentaje_{p}_app'] = pct(p_app[p], flt(previo_row.get(f'compromiso_{p}_app')))
+
+    return valores
+
+
+def _recalcular_previo_clave_cierre(conexion, cursor_dict, cursor, clave, f_inicio, fecha_cierre):
+    """
+    Recalcula las columnas de avance en previo para un distribuidor individual,
+    usando fecha_cierre como tope de fecha, y las CONGELA escribiendolas en la
+    fila de `previo` en vivo. Se llama al cerrar la temporada de UN distribuidor
+    (endpoint individual /cerrar-temporada), donde congelar previo es el
+    comportamiento deseado.
+
+    ADVERTENCIA: esta funcion muta `previo` en vivo. Para un cierre MASIVO de
+    temporada (todos los clientes) usar en cambio _calcular_valores_previo_clave
+    directamente y archivar el resultado en `previo_historico` SIN llamar a
+    esta funcion -- de lo contrario se sobreescribe por accidente el avance en
+    vivo de la temporada actual para todos los clientes (bug ya visto dos veces
+    en routes/temporadas.py: cerrar_temporada_completa).
+    """
+    valores = _calcular_valores_previo_clave(cursor_dict, clave, f_inicio, fecha_cierre)
+    if valores is None:
+        return
 
     cursor.execute("""
         UPDATE previo SET
@@ -2531,24 +2581,24 @@ def _recalcular_previo_clave_cierre(conexion, cursor_dict, cursor, clave, f_inic
             avance_may_jun_app = %s, porcentaje_may_jun_app = %s
         WHERE id = %s
     """, (
-        acum_total, syncros, apparel, vittoria, bold,
-        acum_total, scott, app_global,
-        pct(acum_total, cm_ini), pct(acum_total, cm_anu),
-        pct(scott,      flt(previo_row.get('compromiso_scott'))),
-        pct(app_global, flt(previo_row.get('compromiso_apparel_syncros_vittoria'))),
-        p_scott['jul_ago'], pct(p_scott['jul_ago'], flt(previo_row.get('compromiso_jul_ago'))),
-        p_scott['sep_oct'], pct(p_scott['sep_oct'], flt(previo_row.get('compromiso_sep_oct'))),
-        p_scott['nov_dic'], pct(p_scott['nov_dic'], flt(previo_row.get('compromiso_nov_dic'))),
-        p_scott['ene_feb'], pct(p_scott['ene_feb'], flt(previo_row.get('compromiso_ene_feb'))),
-        p_scott['mar_abr'], pct(p_scott['mar_abr'], flt(previo_row.get('compromiso_mar_abr'))),
-        p_scott['may_jun'], pct(p_scott['may_jun'], flt(previo_row.get('compromiso_may_jun'))),
-        p_app['jul_ago'],   pct(p_app['jul_ago'],   flt(previo_row.get('compromiso_jul_ago_app'))),
-        p_app['sep_oct'],   pct(p_app['sep_oct'],   flt(previo_row.get('compromiso_sep_oct_app'))),
-        p_app['nov_dic'],   pct(p_app['nov_dic'],   flt(previo_row.get('compromiso_nov_dic_app'))),
-        p_app['ene_feb'],   pct(p_app['ene_feb'],   flt(previo_row.get('compromiso_ene_feb_app'))),
-        p_app['mar_abr'],   pct(p_app['mar_abr'],   flt(previo_row.get('compromiso_mar_abr_app'))),
-        p_app['may_jun'],   pct(p_app['may_jun'],   flt(previo_row.get('compromiso_may_jun_app'))),
-        previo_row['id']
+        valores['acumulado_anticipado'], valores['acumulado_syncros'], valores['acumulado_apparel'],
+        valores['acumulado_vittoria'], valores['acumulado_bold'],
+        valores['avance_global'], valores['avance_global_scott'], valores['avance_global_apparel_syncros_vittoria'],
+        valores['porcentaje_global'], valores['porcentaje_anual'],
+        valores['porcentaje_scott'], valores['porcentaje_apparel_syncros_vittoria'],
+        valores['avance_jul_ago'], valores['porcentaje_jul_ago'],
+        valores['avance_sep_oct'], valores['porcentaje_sep_oct'],
+        valores['avance_nov_dic'], valores['porcentaje_nov_dic'],
+        valores['avance_ene_feb'], valores['porcentaje_ene_feb'],
+        valores['avance_mar_abr'], valores['porcentaje_mar_abr'],
+        valores['avance_may_jun'], valores['porcentaje_may_jun'],
+        valores['avance_jul_ago_app'], valores['porcentaje_jul_ago_app'],
+        valores['avance_sep_oct_app'], valores['porcentaje_sep_oct_app'],
+        valores['avance_nov_dic_app'], valores['porcentaje_nov_dic_app'],
+        valores['avance_ene_feb_app'], valores['porcentaje_ene_feb_app'],
+        valores['avance_mar_abr_app'], valores['porcentaje_mar_abr_app'],
+        valores['avance_may_jun_app'], valores['porcentaje_may_jun_app'],
+        valores['id']
     ))
 
 

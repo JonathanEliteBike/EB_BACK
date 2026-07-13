@@ -23,6 +23,32 @@ def test_dry_run_no_escribe_nada():
     cur.close(); conn.close()
 
 
+def test_cerrar_temporada_completa_nunca_escribe_previo_en_vivo():
+    """
+    Regresion: cerrar_temporada_completa NUNCA debe escribir en `previo` (la
+    tabla en vivo) -- ese fue el bug real detectado dos veces en la sesion
+    de cierre de MY26: el cierre masivo sobreescribia el avance en vivo de la
+    temporada actual porque reusaba _recalcular_previo_clave_cierre (que si
+    escribe previo -- correcto solo para el cierre INDIVIDUAL via
+    /cerrar-temporada). Ahora usa _calcular_valores_previo_clave, una funcion
+    pura de solo lectura, y solo escribe en previo_historico.
+
+    Se fija este invariante a nivel de codigo fuente (en vez de mockear toda
+    la cadena de cursores) porque es la forma mas directa y confiable de
+    garantizar que no se reintroduzca ni un "UPDATE previo SET" ni una
+    llamada a _recalcular_previo_clave_cierre dentro de esta funcion.
+    """
+    import inspect
+    from routes import temporadas as temporadas_module
+
+    codigo = inspect.getsource(temporadas_module.cerrar_temporada_completa)
+    assert 'UPDATE previo SET' not in codigo
+    # Busca la SINTAXIS DE LLAMADA (con parentesis pegado), no la mencion en
+    # prosa dentro del propio docstring de la funcion (que si nombra a
+    # _recalcular_previo_clave_cierre para explicar que ya no se usa).
+    assert '_recalcular_previo_clave_cierre(' not in codigo
+
+
 def test_ignora_f_inicio_ya_rodado_a_temporada_siguiente():
     """
     Regresion: clientes.f_inicio NO debe usarse para acotar el cierre de una
@@ -160,11 +186,13 @@ def test_dry_run_permitido_sobre_temporada_ya_cerrada():
     """
     dry_run=True sigue permitido aunque la temporada este marcada como
     'cerrada': el guard solo bloquea la ejecucion real (dry_run=False), no
-    la vista previa de solo lectura (rollback al final), util para
-    inspeccion/depuracion de un snapshot ya congelado sin riesgo de
-    persistir nada. Se mockea por la misma razon que el test anterior: no
-    queremos que una prueba automática dependa de/mute el estado real de la
-    BD local para 2025-2026.
+    la vista previa de solo lectura. cerrar_temporada_completa ya no escribe
+    NADA en `previo` (ni siquiera durante dry_run=False -- ver
+    _calcular_valores_previo_clave, funcion pura de solo lectura), asi que
+    dry_run=True no necesita hacer rollback de nada: simplemente no llega al
+    bloque `if not dry_run` que archiva en previo_historico. Se mockea por la
+    misma razon que el test anterior: no queremos que una prueba automática
+    dependa de/mute el estado real de la BD local para 2025-2026.
     """
     mock_cur_dict = MagicMock()
     mock_cur_dict.fetchone.side_effect = [
@@ -180,10 +208,10 @@ def test_dry_run_permitido_sobre_temporada_ya_cerrada():
         resultado = cerrar_temporada_completa('2025-2026', dry_run=True)
 
     assert resultado['clientes_procesados'] == 0
-    mock_conn.rollback.assert_called_once()
+    mock_cur.executemany.assert_not_called()
     for call in mock_cur.execute.call_args_list:
         sql = call.args[0] if call.args else ''
-        assert 'INSERT INTO previo_historico' not in sql
+        assert 'UPDATE temporadas' not in sql
 
 
 def test_endpoint_sin_token_devuelve_401():

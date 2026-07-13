@@ -2,7 +2,7 @@ from __future__ import annotations
 from flask import Blueprint, jsonify, request
 import logging
 from db_conexion import obtener_conexion
-from routes.retroactivos import _recalcular_previo_clave_cierre
+from routes.retroactivos import _calcular_valores_previo_clave
 from utils.jwt_utils import verificar_token
 
 temporadas_bp = Blueprint('temporadas', __name__, url_prefix='')
@@ -35,22 +35,71 @@ def listar_temporadas():
         conexion.close()
 
 
+_CAMPOS_STATICOS_PREVIO = [
+    'id', 'evac', 'nombre_cliente', 'nivel', 'nivel_cierre_compra_inicial',
+    'compra_minima_anual', 'compra_minima_inicial',
+    'compromiso_scott', 'compromiso_apparel_syncros_vittoria',
+    'compromiso_jul_ago', 'compromiso_sep_oct', 'compromiso_nov_dic',
+    'compromiso_ene_feb', 'compromiso_mar_abr', 'compromiso_may_jun',
+    'compromiso_jul_ago_app', 'compromiso_sep_oct_app', 'compromiso_nov_dic_app',
+    'compromiso_ene_feb_app', 'compromiso_mar_abr_app', 'compromiso_may_jun_app',
+    'grupo_integral',
+]
+
+_CAMPOS_SUMA_INTEGRAL = [
+    'acumulado_anticipado', 'acumulado_syncros', 'acumulado_apparel', 'acumulado_vittoria', 'acumulado_bold',
+    'avance_global', 'avance_global_scott', 'avance_global_apparel_syncros_vittoria',
+    'avance_jul_ago', 'avance_sep_oct', 'avance_nov_dic', 'avance_ene_feb', 'avance_mar_abr', 'avance_may_jun',
+    'avance_jul_ago_app', 'avance_sep_oct_app', 'avance_nov_dic_app',
+    'avance_ene_feb_app', 'avance_mar_abr_app', 'avance_may_jun_app',
+]
+
+_COLUMNAS_PREVIO_HISTORICO = [
+    'id_previo', 'clave', 'evac', 'nombre_cliente', 'acumulado_anticipado', 'nivel',
+    'nivel_cierre_compra_inicial', 'compra_minima_anual', 'porcentaje_anual', 'compra_minima_inicial',
+    'avance_global', 'porcentaje_global', 'compromiso_scott', 'avance_global_scott', 'porcentaje_scott',
+    'compromiso_jul_ago', 'avance_jul_ago', 'porcentaje_jul_ago',
+    'compromiso_sep_oct', 'avance_sep_oct', 'porcentaje_sep_oct',
+    'compromiso_nov_dic', 'avance_nov_dic', 'porcentaje_nov_dic',
+    'compromiso_ene_feb', 'avance_ene_feb', 'porcentaje_ene_feb',
+    'compromiso_mar_abr', 'avance_mar_abr', 'porcentaje_mar_abr',
+    'compromiso_may_jun', 'avance_may_jun', 'porcentaje_may_jun',
+    'compromiso_apparel_syncros_vittoria', 'avance_global_apparel_syncros_vittoria', 'porcentaje_apparel_syncros_vittoria',
+    'compromiso_jul_ago_app', 'avance_jul_ago_app', 'porcentaje_jul_ago_app',
+    'compromiso_sep_oct_app', 'avance_sep_oct_app', 'porcentaje_sep_oct_app',
+    'compromiso_nov_dic_app', 'avance_nov_dic_app', 'porcentaje_nov_dic_app',
+    'compromiso_ene_feb_app', 'avance_ene_feb_app', 'porcentaje_ene_feb_app',
+    'compromiso_mar_abr_app', 'avance_mar_abr_app', 'porcentaje_mar_abr_app',
+    'compromiso_may_jun_app', 'avance_may_jun_app', 'porcentaje_may_jun_app',
+    'acumulado_syncros', 'acumulado_apparel', 'acumulado_vittoria', 'acumulado_bold',
+    'es_integral', 'grupo_integral',
+]
+
+
+def _pct(avance: float, compromiso: float) -> int:
+    return int(round(avance / compromiso * 100)) if compromiso else 0
+
+
 def cerrar_temporada_completa(etiqueta: str, dry_run: bool = True) -> dict:
     """
-    Cierra una temporada completa: recalcula previo para cada cliente ABIERTO
-    (temporada_cerrada IS NULL o 0), acotado a [f_inicio del cliente o inicio
-    de temporada, fin de temporada], y persiste el resultado en
-    previo_historico (dry_run=False).
+    Cierra una temporada completa: calcula (sin escribir en `previo`, la tabla
+    en vivo) los valores de cada cliente ABIERTO acotados a [f_inicio efectivo
+    de ese cliente para esta temporada, fin de temporada], y los archiva
+    directo en `previo_historico` (dry_run=False). Los renglones "Integral N"
+    se calculan sumando a sus miembros ya calculados, sin tocar `monitor` para
+    el grupo directamente.
+
+    IMPORTANTE: a diferencia de versiones anteriores, esta funcion NUNCA
+    escribe en `previo`. Usa _calcular_valores_previo_clave (funcion pura de
+    solo lectura) en vez de _recalcular_previo_clave_cierre (que congela
+    `previo` en vivo -- correcto para el cierre INDIVIDUAL de un cliente via
+    /cerrar-temporada, pero un bug si se usa para los 140 clientes de golpe:
+    sobreescribia el avance en vivo de la temporada actual cada vez que se
+    corria un cierre masivo).
 
     Los clientes que ya tienen temporada_cerrada = 1 (cerrados individualmente
-    via /cerrar-temporada, posiblemente con una fecha_cierre distinta a la
-    fecha_fin de la temporada, p. ej. un corte anticipado por contrato) se
-    OMITEN por completo: su previo ya está congelado y es autoritativo, no se
-    recalcula ni se toca. Este es el mismo criterio que ya usa el sync global
-    en routes/monitor_odoo.py (_recalcular_acumulados_previo): un cierre
-    individual nunca es sobrescrito por una operación masiva.
-
-    Reusa _recalcular_previo_clave_cierre (ya usado por /cerrar-temporada individual).
+    via /cerrar-temporada) se OMITEN por completo: su previo ya está congelado
+    y es autoritativo, no se recalcula ni se toca.
     """
     conexion = obtener_conexion()
     cur_dict = conexion.cursor(dictionary=True)
@@ -59,6 +108,7 @@ def cerrar_temporada_completa(etiqueta: str, dry_run: bool = True) -> dict:
     procesados = 0
     omitidos = 0
     preview = []
+    filas_historico = []
 
     try:
         cur_dict.execute("SELECT fecha_inicio, fecha_fin, estado FROM temporadas WHERE etiqueta = %s", (etiqueta,))
@@ -103,64 +153,82 @@ def cerrar_temporada_completa(etiqueta: str, dry_run: bool = True) -> dict:
             dia = c['dia_inicio_temporada'] or '07-01'
             f_inicio_cliente = f"{anio_inicio_temporada}-{dia}"
 
-            _recalcular_previo_clave_cierre(conexion, cur_dict, cur, clave, f_inicio_cliente, fecha_fin_temporada)
+            valores = _calcular_valores_previo_clave(cur_dict, clave, f_inicio_cliente, fecha_fin_temporada)
+            if valores is None:
+                continue  # sin fila en previo (o es un renglon Integral -- esos se calculan aparte abajo)
+
+            cur_dict.execute(
+                f"SELECT {', '.join(_CAMPOS_STATICOS_PREVIO)} FROM previo WHERE id = %s",
+                (valores['id'],)
+            )
+            estatico = cur_dict.fetchone()
+
+            fila = {**estatico, **valores, 'clave': clave, 'es_integral': 0, 'id_previo': valores['id']}
+            filas_historico.append(fila)
             procesados += 1
 
             if len(preview) < 3:
-                cur_dict.execute(
-                    "SELECT clave, acumulado_anticipado, avance_global_scott, "
-                    "avance_global_apparel_syncros_vittoria FROM previo WHERE clave = %s",
-                    (clave,)
-                )
-                fila_preview = cur_dict.fetchone()
-                if fila_preview:
-                    preview.append(fila_preview)
+                preview.append({
+                    'clave': clave,
+                    'acumulado_anticipado': valores['acumulado_anticipado'],
+                    'avance_global_scott': valores['avance_global_scott'],
+                    'avance_global_apparel_syncros_vittoria': valores['avance_global_apparel_syncros_vittoria'],
+                })
 
-        if dry_run:
-            conexion.rollback()
-        else:
-            cur.execute("""
-                INSERT INTO previo_historico (
-                    temporada, fecha_snapshot, id_previo, clave, evac, nombre_cliente, acumulado_anticipado, nivel,
-                    nivel_cierre_compra_inicial, compra_minima_anual, porcentaje_anual, compra_minima_inicial,
-                    avance_global, porcentaje_global, compromiso_scott, avance_global_scott, porcentaje_scott,
-                    compromiso_jul_ago, avance_jul_ago, porcentaje_jul_ago,
-                    compromiso_sep_oct, avance_sep_oct, porcentaje_sep_oct,
-                    compromiso_nov_dic, avance_nov_dic, porcentaje_nov_dic,
-                    compromiso_ene_feb, avance_ene_feb, porcentaje_ene_feb,
-                    compromiso_mar_abr, avance_mar_abr, porcentaje_mar_abr,
-                    compromiso_may_jun, avance_may_jun, porcentaje_may_jun,
-                    compromiso_apparel_syncros_vittoria, avance_global_apparel_syncros_vittoria, porcentaje_apparel_syncros_vittoria,
-                    compromiso_jul_ago_app, avance_jul_ago_app, porcentaje_jul_ago_app,
-                    compromiso_sep_oct_app, avance_sep_oct_app, porcentaje_sep_oct_app,
-                    compromiso_nov_dic_app, avance_nov_dic_app, porcentaje_nov_dic_app,
-                    compromiso_ene_feb_app, avance_ene_feb_app, porcentaje_ene_feb_app,
-                    compromiso_mar_abr_app, avance_mar_abr_app, porcentaje_mar_abr_app,
-                    compromiso_may_jun_app, avance_may_jun_app, porcentaje_may_jun_app,
-                    acumulado_syncros, acumulado_apparel, acumulado_vittoria, acumulado_bold,
-                    es_integral, grupo_integral
-                )
-                SELECT
-                    %s, NOW(), id, clave, evac, nombre_cliente, acumulado_anticipado, nivel,
-                    nivel_cierre_compra_inicial, compra_minima_anual, porcentaje_anual, compra_minima_inicial,
-                    avance_global, porcentaje_global, compromiso_scott, avance_global_scott, porcentaje_scott,
-                    compromiso_jul_ago, avance_jul_ago, porcentaje_jul_ago,
-                    compromiso_sep_oct, avance_sep_oct, porcentaje_sep_oct,
-                    compromiso_nov_dic, avance_nov_dic, porcentaje_nov_dic,
-                    compromiso_ene_feb, avance_ene_feb, porcentaje_ene_feb,
-                    compromiso_mar_abr, avance_mar_abr, porcentaje_mar_abr,
-                    compromiso_may_jun, avance_may_jun, porcentaje_may_jun,
-                    compromiso_apparel_syncros_vittoria, avance_global_apparel_syncros_vittoria, porcentaje_apparel_syncros_vittoria,
-                    compromiso_jul_ago_app, avance_jul_ago_app, porcentaje_jul_ago_app,
-                    compromiso_sep_oct_app, avance_sep_oct_app, porcentaje_sep_oct_app,
-                    compromiso_nov_dic_app, avance_nov_dic_app, porcentaje_nov_dic_app,
-                    compromiso_ene_feb_app, avance_ene_feb_app, porcentaje_ene_feb_app,
-                    compromiso_mar_abr_app, avance_mar_abr_app, porcentaje_mar_abr_app,
-                    compromiso_may_jun_app, avance_may_jun_app, porcentaje_may_jun_app,
-                    acumulado_syncros, acumulado_apparel, acumulado_vittoria, acumulado_bold,
-                    es_integral, grupo_integral
-                FROM previo
-            """, (etiqueta,))
+        # Renglones "Integral": suma de sus miembros ya calculados arriba
+        # (nunca se lee `monitor` para el grupo directamente). Reusa sus
+        # propios compromiso_* (fijos, de su propia fila en `previo`).
+        grupos: dict[int, list[dict]] = {}
+        for fila in filas_historico:
+            gid = fila.get('grupo_integral')
+            if gid:
+                grupos.setdefault(gid, []).append(fila)
+
+        if grupos:
+            cur_dict.execute(
+                f"SELECT {', '.join(_CAMPOS_STATICOS_PREVIO)} FROM previo WHERE es_integral = 1"
+            )
+            for grupo_row in cur_dict.fetchall():
+                gid = grupo_row['grupo_integral']
+                miembros = grupos.get(gid, [])
+                sumas = {c: sum(float(m.get(c) or 0) for m in miembros) for c in _CAMPOS_SUMA_INTEGRAL}
+
+                fila_grupo = {
+                    **grupo_row,
+                    **sumas,
+                    'clave': None,  # se sobreescribe abajo con la clave real de la fila Integral
+                    'es_integral': 1,
+                    'id_previo': grupo_row['id'],
+                    'porcentaje_global': _pct(sumas['avance_global'], float(grupo_row.get('compra_minima_inicial') or 0)),
+                    'porcentaje_anual': _pct(sumas['avance_global'], float(grupo_row.get('compra_minima_anual') or 0)),
+                    'porcentaje_scott': _pct(sumas['avance_global_scott'], float(grupo_row.get('compromiso_scott') or 0)),
+                    'porcentaje_apparel_syncros_vittoria': _pct(
+                        sumas['avance_global_apparel_syncros_vittoria'],
+                        float(grupo_row.get('compromiso_apparel_syncros_vittoria') or 0)
+                    ),
+                }
+                for p in ('jul_ago', 'sep_oct', 'nov_dic', 'ene_feb', 'mar_abr', 'may_jun'):
+                    fila_grupo[f'porcentaje_{p}'] = _pct(sumas[f'avance_{p}'], float(grupo_row.get(f'compromiso_{p}') or 0))
+                    fila_grupo[f'porcentaje_{p}_app'] = _pct(sumas[f'avance_{p}_app'], float(grupo_row.get(f'compromiso_{p}_app') or 0))
+
+                cur_dict.execute("SELECT clave FROM previo WHERE id = %s", (grupo_row['id'],))
+                fila_grupo['clave'] = cur_dict.fetchone()['clave']
+
+                filas_historico.append(fila_grupo)
+
+        if not dry_run:
+            filas_valores = [
+                tuple(fila.get(col) for col in _COLUMNAS_PREVIO_HISTORICO)
+                for fila in filas_historico
+            ]
+            cur.executemany(
+                f"""INSERT INTO previo_historico (
+                    temporada, fecha_snapshot, {', '.join(_COLUMNAS_PREVIO_HISTORICO)}
+                ) VALUES (
+                    %s, NOW(), {', '.join(['%s'] * len(_COLUMNAS_PREVIO_HISTORICO))}
+                )""",
+                [(etiqueta, *valores_fila) for valores_fila in filas_valores]
+            )
             cur.execute(
                 "UPDATE temporadas SET estado='cerrada', fecha_cierre=NOW() WHERE etiqueta = %s",
                 (etiqueta,)
