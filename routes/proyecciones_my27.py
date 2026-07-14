@@ -610,8 +610,9 @@ def _generar_excel(data: dict) -> bytes:
     c_ctot.border = thin_bdr
     ws.row_dimensions[3].height = 20
 
-    # ── Datos: los 92 artículos ──────────────────────────────────────────────
-    for ri, art in enumerate(data['articulos'], start=5):
+    # ── Datos: solo artículos con al menos 1 unidad pedida ──────────────────
+    arts_con_pedido = [a for a in data['articulos'] if a['total_anual'] > 0]
+    for ri, art in enumerate(arts_con_pedido, start=5):
         fila_par = (ri % 2 == 0)
         bg_fila  = GRIS_CLARO if fila_par else BLANCO
 
