@@ -13,7 +13,9 @@ from utils.tiempo import ahora_mx, ahora_str
 from flask import Blueprint, jsonify, request, send_file
 
 from db_conexion import obtener_conexion
-from routes.forecast import SKU_CATALOG, FORECAST_SKU_WHITELIST
+from routes.forecast import (SKU_CATALOG, FORECAST_SKU_WHITELIST,
+                             _SCOTT_CORRECT_NAMES, _SCOTT_COLORS, _SCOTT_TALLAS,
+                             _ensure_scott_names)
 from utils.odoo_utils import get_odoo_models, ODOO_DB, ODOO_PASSWORD
 
 try:
@@ -148,14 +150,17 @@ def _get_costos_odoo() -> dict:
             [[['default_code', 'in', skus]]],
             {'fields': ['default_code', 'standard_price', 'list_price'], 'limit': 0})
 
-        # Normalizar: strip + mapear código → costo (fallback a list_price si costo=0)
+        # Normalizar: strip + mapear código → costo.
+        # Umbral mínimo de $100 para descartar placeholders (ej. $1.00 en Odoo).
+        # Prioridad: standard_price (si ≥ 100) → list_price → 0
+        _MIN_PRECIO = 100.0
         costos: dict = {}
         for p in productos_pp:
             code = (p.get('default_code') or '').strip()
             cost = float(p.get('standard_price') or 0)
             lst  = float(p.get('list_price') or 0)
-            precio = cost if cost > 0 else lst
-            if code and precio > 0:
+            precio = cost if cost >= _MIN_PRECIO else lst
+            if code and precio >= _MIN_PRECIO:
                 costos[code] = precio
 
         # Para los SKUs sin precio, intentar product.template como fallback
@@ -169,8 +174,8 @@ def _get_costos_odoo() -> dict:
                 code = (p.get('default_code') or '').strip()
                 cost = float(p.get('standard_price') or 0)
                 lst  = float(p.get('list_price') or 0)
-                precio = cost if cost > 0 else lst
-                if code and precio > 0 and code not in costos:
+                precio = cost if cost >= _MIN_PRECIO else lst
+                if code and precio >= _MIN_PRECIO and code not in costos:
                     costos[code] = precio
 
         # Fallback para SKUs Megamo sin precio: usar pricelist 13 (DISTRIBUIDOR) sin IVA
@@ -302,6 +307,22 @@ def _get_datos_consolidados(periodo: str = '') -> dict:
         costos_map     = _get_costos_odoo()
         megamo_precios = _get_megamo_precios_por_nivel()
 
+        # Cache de nombres Scott con es_MX (color/talla incluidos)
+        _ensure_scott_names()
+
+        # Info de odoo_catalogo para SKUs sin proyecciones registradas
+        skus_sin_totales = [s for s in FORECAST_SKU_WHITELIST if s not in totales_map]
+        oc_fallback: dict = {}
+        if skus_sin_totales:
+            ph_st = ','.join(['%s'] * len(skus_sin_totales))
+            cur.execute(
+                f"SELECT referencia_interna, nombre_producto, marca, color, talla "
+                f"FROM odoo_catalogo WHERE referencia_interna IN ({ph_st})",
+                skus_sin_totales
+            )
+            for row in cur.fetchall():
+                oc_fallback[row['referencia_interna']] = row
+
         # Construir los 92 artículos
         articulos = []
         for sku in FORECAST_SKU_WHITELIST:
@@ -338,13 +359,28 @@ def _get_datos_consolidados(periodo: str = '') -> dict:
 
             costos_mes = {mes: round(meses_data[mes]['cantidad'] * costo_unitario, 2) for mes in MESES}
 
+            # Datos de producto: forecast_proyecciones → cache Scott → odoo_catalogo
+            oc = oc_fallback.get(sku, {})
+            _prod  = (t['producto'] if t else None) or _SCOTT_CORRECT_NAMES.get(sku) or oc.get('nombre_producto', '')
+            _marca = (t['marca']    if t else None) or oc.get('marca', '')
+            _modelo= (t['modelo']   if t else None) or ''
+            _color = (t['color']    if t else None) or _SCOTT_COLORS.get(sku) or oc.get('color', '')
+            _talla = (t['talla']    if t else None) or _SCOTT_TALLAS.get(sku) or oc.get('talla', '')
+            # Marca: si el nombre contiene SCOTT o MEGAMO, usarla aunque falte en odoo_catalogo
+            if not _marca:
+                nm_up = (_prod or '').upper()
+                if 'SCOTT' in nm_up:
+                    _marca = 'SCOTT'
+                elif 'MEGAMO' in nm_up:
+                    _marca = 'MEGAMO'
+
             articulos.append({
                 'sku':               sku,
-                'producto':          (t['producto'] or '') if t else '',
-                'marca':             (t['marca']    or '') if t else '',
-                'modelo':            (t['modelo']   or '') if t else '',
-                'color':             (t['color']    or '') if t else '',
-                'talla':             (t['talla']    or '') if t else '',
+                'producto':          _prod,
+                'marca':             _marca,
+                'modelo':            _modelo,
+                'color':             _color,
+                'talla':             _talla,
                 'precio_dist':       float(precios.get('Distribuidor', 0)),
                 'costo_unitario':    round(costo_unitario, 2),
                 'costo_total':       costo_total,
