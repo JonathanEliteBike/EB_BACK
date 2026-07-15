@@ -351,7 +351,7 @@ def inicializar_tablas():
                 -- PROCESO RECEPCION (4 items)
                 rec_cedula_costeo               VARCHAR(10),
                 rec_recepcion_odoo              DATE,
-                rec_folio_compra                VARCHAR(100),
+                rec_folio_compra                TEXT,
                 rec_liberacion_verificacion     DATE,
                 rec_liberacion_final            DATE,
 
@@ -474,6 +474,7 @@ def inicializar_tablas():
             "ALTER TABLE importaciones ADD COLUMN IF NOT EXISTS cos_tipo_cambio_proyectado         DECIMAL(10,4) AFTER cos_flete_proyectado_usd",
             "ALTER TABLE importaciones ADD COLUMN IF NOT EXISTS cos_maniobras_proyectado_pesos     DECIMAL(15,2) AFTER cos_tipo_cambio_proyectado",
             "ALTER TABLE importaciones ADD COLUMN IF NOT EXISTS cos_honorarios_proyectado_pesos    DECIMAL(15,2) AFTER cos_maniobras_proyectado_pesos",
+            "ALTER TABLE importaciones MODIFY COLUMN rec_folio_compra TEXT",
         ]
         for sql in migraciones:
             try:
