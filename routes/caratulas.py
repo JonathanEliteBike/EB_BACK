@@ -954,16 +954,21 @@ def detalle_compras_odoo():
             if _raw:
                 _cached = json.loads(_raw)
                 _c_resultado, _c_filas, _c_meta_base = _cached
-                _c_filas_fil = [f for f in _c_filas if f.get('estatus_out') == estado_filtro] if estado_filtro else _c_filas
-                _c_total = len(_c_filas_fil)
-                _c_pag = _c_filas_fil[offset: offset + limit] if limit is not None else _c_filas_fil[offset:]
-                _c_nombre = _c_resultado[0].get('cliente') if _c_resultado else None
-                return jsonify({
-                    'data': _c_resultado,
-                    'rows': _c_pag,
-                    'meta': {**_c_meta_base, 'total': _c_total, 'limit': limit, 'offset': offset, 'returned': len(_c_pag)},
-                    'cliente': {'nombre_cliente': _c_nombre, 'clave': cliente},
-                }), 200
+                # Si el caché es de una versión anterior sin etiquetas, descartarlo
+                if _c_filas and 'etiquetas' not in _c_filas[0]:
+                    _redis.delete(_cache_key)
+                    logging.info('Cache obsoleto (sin etiquetas), forzando reconsulta: %s', _cache_key)
+                else:
+                    _c_filas_fil = [f for f in _c_filas if f.get('estatus_out') == estado_filtro] if estado_filtro else _c_filas
+                    _c_total = len(_c_filas_fil)
+                    _c_pag = _c_filas_fil[offset: offset + limit] if limit is not None else _c_filas_fil[offset:]
+                    _c_nombre = _c_resultado[0].get('cliente') if _c_resultado else None
+                    return jsonify({
+                        'data': _c_resultado,
+                        'rows': _c_pag,
+                        'meta': {**_c_meta_base, 'total': _c_total, 'limit': limit, 'offset': offset, 'returned': len(_c_pag)},
+                        'cliente': {'nombre_cliente': _c_nombre, 'clave': cliente},
+                    }), 200
         except Exception as _ce:
             logging.warning('Redis cache hit error: %s', _ce)
 
