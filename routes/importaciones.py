@@ -157,6 +157,18 @@ _SECCIONES_VALIDAS = {
     "costos",
 }
 
+def _estado_actual(r: dict) -> str:
+    """Determina la etapa activa del embarque según los campos clave registrados."""
+    if r.get("rec_liberacion_final"):        return "Liberado"
+    if r.get("alm_envio_info_uva"):          return "Verificación"
+    if r.get("des_llegada_almacen"):         return "En Almacén"
+    if r.get("des_fecha_cruce_real"):        return "Tránsito Destino"
+    if r.get("log_eta_puerto"):              return "En Aduana"
+    if r.get("log_fecha_booking"):           return "Tránsito Mar/Aér"
+    if r.get("log_fecha_entrega"):           return "Booking"
+    return "Pendiente"
+
+
 # Campos derivados que _recalcular_campos() inyecta en data — deben persistirse
 # en INSERT y UPDATE aunque no estén en _COLS_PERMITIDAS (son cálculos, no input usuario).
 _CAMPOS_CALC = [
@@ -245,6 +257,7 @@ def inicializar_tablas():
 
                 -- PROCESO DE LOGISTICA (22 items)
                 log_fecha_notificacion          DATE,
+                log_fecha_entrega_prog          DATE,
                 log_fecha_entrega               DATE,
                 log_titulo_correo_salida        TEXT,
                 log_confirmacion_enterado       DATE,
@@ -255,6 +268,7 @@ def inicializar_tablas():
                 log_costo_flete                 VARCHAR(255),
                 log_fecha_shipping_instructions DATE,
                 log_confirmacion_booking        DATE,
+                log_fecha_booking_prog          DATE,
                 log_fecha_booking               DATE,
                 log_eta_puerto                  DATE,
                 log_buque                       VARCHAR(255),
@@ -278,6 +292,7 @@ def inicializar_tablas():
                 imp_facturas                    TEXT,
                 imp_series                      VARCHAR(10),
                 imp_solicitud_pago_forwarder    DATE,
+                imp_llegada_contenedor_prog     DATE,
                 imp_llegada_contenedor_puerto   DATE,
                 imp_fecha_limite_cruce          DATE,
                 imp_dias_libres_almacenaje      INT DEFAULT 17,
@@ -312,6 +327,7 @@ def inicializar_tablas():
                 -- PROCESO DESPACHO Y REGRESO (14 items)
                 des_solicitud_cita_cruce        DATE,
                 des_cita_cruce                  DATE,
+                des_fecha_cruce_prog            DATE,
                 des_fecha_cruce_real            DATE,
                 des_solicitud_pase_maniobras    DATE,
                 des_carta_maniobras             DATE,
@@ -350,9 +366,12 @@ def inicializar_tablas():
 
                 -- PROCESO RECEPCION (4 items)
                 rec_cedula_costeo               VARCHAR(10),
+                rec_recepcion_odoo_prog         DATE,
                 rec_recepcion_odoo              DATE,
                 rec_folio_compra                TEXT,
+                rec_liberacion_verificacion_prog DATE,
                 rec_liberacion_verificacion     DATE,
+                rec_liberacion_final_prog       DATE,
                 rec_liberacion_final            DATE,
 
                 -- CIERRE DE CUENTAS (7 items)
@@ -475,6 +494,13 @@ def inicializar_tablas():
             "ALTER TABLE importaciones ADD COLUMN IF NOT EXISTS cos_maniobras_proyectado_pesos     DECIMAL(15,2) AFTER cos_tipo_cambio_proyectado",
             "ALTER TABLE importaciones ADD COLUMN IF NOT EXISTS cos_honorarios_proyectado_pesos    DECIMAL(15,2) AFTER cos_maniobras_proyectado_pesos",
             "ALTER TABLE importaciones MODIFY COLUMN rec_folio_compra TEXT",
+            "ALTER TABLE importaciones ADD COLUMN IF NOT EXISTS log_fecha_booking_prog DATE AFTER log_confirmacion_booking",
+            "ALTER TABLE importaciones ADD COLUMN IF NOT EXISTS log_fecha_entrega_prog DATE AFTER log_fecha_notificacion",
+            "ALTER TABLE importaciones ADD COLUMN IF NOT EXISTS imp_llegada_contenedor_prog DATE AFTER imp_solicitud_pago_forwarder",
+            "ALTER TABLE importaciones ADD COLUMN IF NOT EXISTS des_fecha_cruce_prog DATE AFTER des_cita_cruce",
+            "ALTER TABLE importaciones ADD COLUMN IF NOT EXISTS rec_recepcion_odoo_prog DATE AFTER rec_cedula_costeo",
+            "ALTER TABLE importaciones ADD COLUMN IF NOT EXISTS rec_liberacion_verificacion_prog DATE AFTER rec_folio_compra",
+            "ALTER TABLE importaciones ADD COLUMN IF NOT EXISTS rec_liberacion_final_prog DATE AFTER rec_liberacion_verificacion",
         ]
         for sql in migraciones:
             try:
@@ -667,17 +693,27 @@ def dashboard():
         por_estado_list = [{"estado": k, "count": v} for k, v in por_estado.items()]
 
         # ── Latencias ─────────────────────────────────────────────────────────
+        from datetime import date as _dt, timedelta as _td
+
         def _lat_dias(row, f_ini, f_fin):
             a, b = row.get(f_ini), row.get(f_fin)
             if not a or not b:
                 return None
             try:
-                from datetime import date as _date
                 def _parse(v):
-                    return v if isinstance(v, _date) else _date.fromisoformat(str(v)[:10])
+                    return v if isinstance(v, _dt) else _dt.fromisoformat(str(v)[:10])
                 return (_parse(b) - _parse(a)).days
             except Exception:
                 return None
+
+        def _days_between(a, b):
+            if not a or not b: return None
+            try:
+                def _p(v): return v if isinstance(v, _dt) else _dt.fromisoformat(str(v)[:10])
+                return (_p(b) - _p(a)).days
+            except Exception: return None
+
+        def _fmt_d(v): return str(v)[:10] if v else None
 
         # Tránsito aéreo: booking → llegada almacén (solo AEREO con ambas fechas)
         _trans_aereo = [d for r in rows
@@ -862,6 +898,14 @@ def dashboard():
             ) if tc_proy else None
 
             nbici = r.get("cos_cantidad_bicicletas")
+            # Etiquetado: fecha proyectada de fin = inicio + días proyectados
+            _alm_ini   = r.get('alm_inicio_etiquetado')
+            _alm_dproy = r.get('alm_proyectado_dias_etiquetado')
+            _alm_pf    = None
+            if _alm_ini and _alm_dproy:
+                try: _alm_pf = str(_dt.fromisoformat(str(_alm_ini)[:10]) + _td(days=int(_alm_dproy)))
+                except: pass
+
             embarques_res.append({
                 "id":                          r["id"],
                 "referencia":                  r["referencia"],
@@ -881,6 +925,19 @@ def dashboard():
                 "costo_por_bicicleta":         round(costo_total_pesos / tc / float(nbici), 2) if nbici and costo_total_pesos and tc else None,
                 "notas":                       r.get("notas") or "",
                 "progreso":                    prog,
+                "pipeline": {
+                    "entrega":    {"proy": _fmt_d(r.get("log_fecha_entrega_prog")),          "real": _fmt_d(r.get("log_fecha_entrega")),              "delta": _days_between(r.get("log_fecha_entrega_prog"), r.get("log_fecha_entrega"))},
+                    "booking":    {"proy": _fmt_d(r.get("log_fecha_booking_prog")),          "real": _fmt_d(r.get("log_fecha_booking")),              "delta": _days_between(r.get("log_fecha_booking_prog"), r.get("log_fecha_booking"))},
+                    "transito":   {"proy": _fmt_d(r.get("imp_llegada_contenedor_prog")),     "real": _fmt_d(r.get("imp_llegada_contenedor_puerto")),  "delta": _days_between(r.get("imp_llegada_contenedor_prog"), r.get("imp_llegada_contenedor_puerto"))},
+                    "aduana":     {"proy": _fmt_d(r.get("des_fecha_cruce_prog")),            "real": _fmt_d(r.get("des_fecha_cruce_real")),           "delta": _days_between(r.get("des_fecha_cruce_prog"), r.get("des_fecha_cruce_real"))},
+                    "trans_dest": {"proy": _fmt_d(r.get("des_fecha_entrega_almacen_prog")),  "real": _fmt_d(r.get("des_llegada_almacen")),            "delta": _days_between(r.get("des_fecha_entrega_almacen_prog"), r.get("des_llegada_almacen"))},
+                    "en_almacen": {"proy": _fmt_d(r.get("rec_recepcion_odoo_prog")),         "real": _fmt_d(r.get("rec_recepcion_odoo")),             "delta": _days_between(r.get("rec_recepcion_odoo_prog"), r.get("rec_recepcion_odoo"))},
+                    "verif":      {"proy": _fmt_d(r.get("rec_liberacion_verificacion_prog")), "real": _fmt_d(r.get("rec_liberacion_verificacion")),   "delta": _days_between(r.get("rec_liberacion_verificacion_prog"), r.get("rec_liberacion_verificacion"))},
+                    "etiquetado": {"proy": _fmt_d(_alm_pf),                                 "real": _fmt_d(r.get("alm_terminacion_etiquetado")),     "delta": _days_between(_alm_pf, r.get("alm_terminacion_etiquetado"))},
+                    "liberado":   {"proy": _fmt_d(r.get("rec_liberacion_final_prog")),       "real": _fmt_d(r.get("rec_liberacion_final")),           "delta": _days_between(r.get("rec_liberacion_final_prog"), r.get("rec_liberacion_final"))},
+                },
+                "lat_total": _days_between(r.get("log_fecha_entrega"), r.get("rec_liberacion_final")),
+                "estado_actual": _estado_actual(r),
             })
 
         # ── Precio por bicicleta promedio x tipo de caja (calculado en tiempo real) ──
