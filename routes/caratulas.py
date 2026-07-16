@@ -957,10 +957,12 @@ def detalle_compras_odoo():
                 _c_filas_fil = [f for f in _c_filas if f.get('estatus_out') == estado_filtro] if estado_filtro else _c_filas
                 _c_total = len(_c_filas_fil)
                 _c_pag = _c_filas_fil[offset: offset + limit] if limit is not None else _c_filas_fil[offset:]
+                _c_nombre = _c_resultado[0].get('cliente') if _c_resultado else None
                 return jsonify({
                     'data': _c_resultado,
                     'rows': _c_pag,
                     'meta': {**_c_meta_base, 'total': _c_total, 'limit': limit, 'offset': offset, 'returned': len(_c_pag)},
+                    'cliente': {'nombre_cliente': _c_nombre, 'clave': cliente},
                 }), 200
         except Exception as _ce:
             logging.warning('Redis cache hit error: %s', _ce)
@@ -1878,6 +1880,8 @@ def detalle_compras_odoo():
         total = len(filas_fil)
         filas_pag = filas_fil[offset: offset + limit] if limit is not None else filas_fil[offset:]
 
+        _nombre_partner = partners[0]['name'] if partners else cliente
+        _clave_partner  = (partners[0].get('ref') or '').strip() if partners else cliente
         return jsonify({
             'data': resultado,
             'rows': filas_pag,
@@ -1888,7 +1892,11 @@ def detalle_compras_odoo():
                 'returned': len(filas_pag),
                 'fecha_inicio_temporada': fecha_inicio_temporada,
                 'avance_previo': avance_previo,
-            }
+            },
+            'cliente': {
+                'nombre_cliente': _nombre_partner,
+                'clave': _clave_partner,
+            },
         }), 200
 
     except Exception as e:

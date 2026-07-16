@@ -464,9 +464,9 @@ def _get_datos_consolidados(periodo: str = '') -> dict:
             precios   = cat_info.get('prices', {})
             t         = totales_map.get(sku)
 
-            # Si hay deducciones por órdenes, recalcular cantidades desde el desglose deducido
+            # Si hay datos de órdenes, recalcular cantidades desde el desglose deducido
             desgloses_sku = desglose_map.get(sku, [])
-            if ordenes_dist and desgloses_sku:
+            if ordenes_dist:
                 meses_data = {
                     mes: {
                         'cantidad':   sum(d['meses'].get(mes, 0) for d in desgloses_sku),
