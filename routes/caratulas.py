@@ -1174,7 +1174,7 @@ def detalle_compras_odoo():
                 [[['partner_id', 'in', partner_ids],
                   ['date_order', '>=', fecha_inicio_temporada],
                   ['state', '!=', 'draft']]],
-                {'fields': ['id', 'name', 'date_order', 'partner_id', 'order_line', 'amount_total', 'state'],
+                {'fields': ['id', 'name', 'date_order', 'partner_id', 'order_line', 'amount_total', 'state', 'tag_ids'],
                  'order': 'date_order desc', 'limit': 0}
             )
         except Exception as ex:
@@ -1182,6 +1182,27 @@ def detalle_compras_odoo():
 
         if not orders:
             return jsonify({'data': [], 'rows': [], 'meta': {'total': 0}}), 200
+
+        # ── 2.5) Batch-leer nombres de etiquetas ─────────────────────────────────
+        all_tag_ids = set()
+        for o in orders:
+            for tid in (o.get('tag_ids') or []):
+                all_tag_ids.add(tid)
+
+        tags_map: dict = {}
+        if all_tag_ids:
+            for _tag_model in ('crm.tag', 'sale.order.tag'):
+                try:
+                    _tag_rows = models.execute_kw(
+                        ODOO_DB, uid, ODOO_PASSWORD,
+                        _tag_model, 'read',
+                        [list(all_tag_ids)],
+                        {'fields': ['id', 'name']}
+                    )
+                    tags_map = {t['id']: t['name'] for t in _tag_rows}
+                    break
+                except Exception:
+                    continue
 
         # ── 3) Leer líneas en batch ───────────────────────────────────────────────
         all_line_ids = []
@@ -1675,6 +1696,7 @@ def detalle_compras_odoo():
             estado_orden_raw = o.get('state') or ''
             estado_orden = SALE_STATE_LABELS.get(estado_orden_raw, estado_orden_raw)
 
+            _etiquetas = [tags_map[tid] for tid in (o.get('tag_ids') or []) if tid in tags_map]
             order_obj = {
                 'orden': o.get('name'),
                 'fecha': o.get('date_order'),
@@ -1682,6 +1704,7 @@ def detalle_compras_odoo():
                 'monto_total': float(o.get('amount_total') or 0),
                 'estado_orden': estado_orden,
                 'estado_orden_raw': estado_orden_raw,
+                'etiquetas': _etiquetas,
                 'lineas': [],
                 'pickings': []
             }
@@ -1830,6 +1853,7 @@ def detalle_compras_odoo():
                     'fecha_esperada': fecha_esp_final,
                     'po_name': po_name_final,
                     'de_proyeccion': _norm_fc(lin.get('clave_producto')) in _forecast_skus,
+                    'etiquetas': order_obj['etiquetas'],
                 })
 
             resultado.append(order_obj)
