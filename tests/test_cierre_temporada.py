@@ -114,7 +114,17 @@ def test_clientes_ya_cerrados_no_se_tocan():
     conn = obtener_conexion()
     cur = conn.cursor(dictionary=True)
 
-    cur.execute("SELECT COUNT(*) AS n FROM clientes WHERE temporada_cerrada = 1")
+    # Solo cuentan los cerrados que tienen una fila real en `previo` que
+    # preservar -- un cliente cerrado sin fila en previo no tiene nada que
+    # congelar y correctamente no se cuenta como "omitido" (ver
+    # cerrar_temporada_completa en routes/temporadas.py).
+    cur.execute("""
+        SELECT COUNT(*) AS n FROM clientes c
+        WHERE c.temporada_cerrada = 1
+          AND EXISTS (
+              SELECT 1 FROM previo p WHERE UPPER(TRIM(p.clave)) = UPPER(TRIM(c.clave))
+          )
+    """)
     n_cerrados = cur.fetchone()['n']
     assert n_cerrados > 0, "Se esperaba al menos un cliente ya cerrado en la BD local para esta prueba"
 
