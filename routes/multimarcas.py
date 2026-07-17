@@ -1,8 +1,36 @@
 from flask import Blueprint, jsonify, request
 from db_conexion import obtener_conexion
 from decimal import Decimal
+import logging
+import calendar
+from datetime import date
+from utils.jwt_utils import verificar_token
 
 multimarcas_bp = Blueprint('multimarcas', __name__, url_prefix='')
+
+_NOMBRES_MESES_TEMPORADA = [
+    'julio', 'agosto', 'septiembre', 'octubre', 'noviembre', 'diciembre',
+    'enero', 'febrero', 'marzo', 'abril', 'mayo', 'junio'
+]
+
+
+def _rangos_meses_temporada(fecha_inicio_str: str) -> list:
+    """A partir del inicio de una temporada (ej '2025-07-01'), regresa 12
+    tuplas (nombre_mes, primer_dia, ultimo_dia) para julio..junio de ESA
+    temporada -- el año se calcula dinamicamente a partir de fecha_inicio,
+    nunca hardcodeado, para que sirva para cualquier temporada (MY26, MY27...)."""
+    inicio = date.fromisoformat(str(fecha_inicio_str)[:10])
+    anio, mes = inicio.year, inicio.month
+    rangos = []
+    for nombre in _NOMBRES_MESES_TEMPORADA:
+        primer_dia = date(anio, mes, 1)
+        ultimo_dia = date(anio, mes, calendar.monthrange(anio, mes)[1])
+        rangos.append((nombre, primer_dia.isoformat(), ultimo_dia.isoformat()))
+        mes += 1
+        if mes > 12:
+            mes = 1
+            anio += 1
+    return rangos
 
 @multimarcas_bp.route('/actualizar_multimarcas', methods=['POST'])
 def actualizar_multimarcas():
@@ -251,6 +279,245 @@ def eliminar_cliente(id):
     except Exception as e:
         if conexion:
             conexion.rollback()
+        return jsonify({'error': str(e)}), 500
+    finally:
+        if cursor:
+            cursor.close()
+        if conexion and conexion.is_connected():
+            conexion.close()
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# HISTÓRICO POR TEMPORADA
+# ══════════════════════════════════════════════════════════════════════════
+# Igual que en routes/temporadas.py: funcion pura de solo lectura (nunca
+# escribe en `multimarcas`, la tabla en vivo). Replica el mismo
+# emparejamiento de dos pasos que usa multimarcas.component.ts para cada
+# factura: primero por clave (monitor.contacto_referencia), y si no hay
+# match, por nombre (monitor.contacto_nombre vs clientes_multimarcas.
+# cliente_razon_social, exacto salvo mayusculas/espacios). Se calculan TODOS
+# los clientes en una sola pasada sobre `monitor` (mas eficiente que
+# reconsultar por cada uno, y necesario para que el fallback por nombre
+# pueda comparar contra el nombre de CUALQUIER cliente del roster).
+
+_CAMPOS_MULTIMARCAS_ACUMULABLES = [
+    'avance_global_scott', 'avance_global_syncros', 'avance_global_apparel',
+    'avance_global_vittoria', 'avance_global_bold',
+] + [f'total_facturas_{n}' for n in _NOMBRES_MESES_TEMPORADA]
+
+
+def _calcular_valores_multimarcas_todos(cursor, clientes: list, f_inicio: str, fecha_cierre: str) -> dict:
+    """Calcula (sin escribir nada) los avances de Multimarcas para TODOS los
+    clientes de `clientes_multimarcas` a la vez, acotados a
+    [f_inicio, fecha_cierre]. Regresa {id_cliente: {campo: valor}}."""
+    rangos = _rangos_meses_temporada(f_inicio)
+    rangos_fecha = [(nombre, date.fromisoformat(ini), date.fromisoformat(fin)) for nombre, ini, fin in rangos]
+
+    resultados = {
+        c['id']: {campo: 0.0 for campo in _CAMPOS_MULTIMARCAS_ACUMULABLES}
+        for c in clientes
+    }
+
+    por_clave = {c['clave']: c['id'] for c in clientes if c['clave']}
+    por_nombre = {
+        c['cliente_razon_social'].strip().lower(): c['id']
+        for c in clientes if c.get('cliente_razon_social')
+    }
+
+    cursor.execute("""
+        SELECT contacto_referencia, contacto_nombre, marca, apparel, venta_total, fecha_factura
+        FROM monitor
+        WHERE fecha_factura >= %s AND fecha_factura <= %s
+    """, (f_inicio, fecha_cierre))
+
+    for f in cursor.fetchall():
+        clave_f = (f['contacto_referencia'] or '').strip()
+        id_cliente = por_clave.get(clave_f)
+        if id_cliente is None:
+            nombre_f = (f['contacto_nombre'] or '').strip().lower()
+            id_cliente = por_nombre.get(nombre_f)
+        if id_cliente is None:
+            continue
+
+        monto = float(f['venta_total'] or 0)
+        marca = (f['marca'] or '').strip().upper()
+        apparel = (f['apparel'] or '').strip().upper()
+        r = resultados[id_cliente]
+
+        if marca == 'SCOTT' and apparel == 'NO':
+            r['avance_global_scott'] += monto
+        elif marca == 'SYNCROS':
+            r['avance_global_syncros'] += monto
+        elif marca == 'SCOTT' and apparel == 'SI':
+            r['avance_global_apparel'] += monto
+        elif marca == 'VITTORIA':
+            r['avance_global_vittoria'] += monto
+        elif marca == 'BOLD':
+            r['avance_global_bold'] += monto
+
+        fecha_f = f['fecha_factura']
+        for nombre_mes, ini, fin in rangos_fecha:
+            if ini <= fecha_f <= fin:
+                r[f'total_facturas_{nombre_mes}'] += monto
+                break
+
+    for r in resultados.values():
+        for campo in r:
+            r[campo] = round(r[campo], 2)
+        r['avance_global'] = round(
+            r['avance_global_scott'] + r['avance_global_syncros'] + r['avance_global_apparel']
+            + r['avance_global_vittoria'] + r['avance_global_bold'],
+            2
+        )
+
+    return resultados
+
+
+def cerrar_multimarcas_temporada(etiqueta: str, dry_run: bool = True) -> dict:
+    """Cierra Multimarcas para una temporada: calcula cada cliente de
+    `clientes_multimarcas` acotado a [fecha_inicio, fecha_fin] de esa
+    temporada, y archiva en `multimarcas_historico` (dry_run=False). NUNCA
+    escribe en `multimarcas` (la tabla en vivo) -- mismo cuidado que
+    cerrar_temporada_completa en routes/temporadas.py."""
+    conexion = obtener_conexion()
+    cur_dict = conexion.cursor(dictionary=True)
+    cur = conexion.cursor()
+
+    procesados = 0
+    preview = []
+
+    try:
+        cur_dict.execute("SELECT fecha_inicio, fecha_fin FROM temporadas WHERE etiqueta = %s", (etiqueta,))
+        temporada_row = cur_dict.fetchone()
+        if not temporada_row:
+            raise ValueError(f"Temporada '{etiqueta}' no registrada en la tabla temporadas")
+
+        if not dry_run:
+            cur_dict.execute("SELECT COUNT(*) AS n FROM multimarcas_historico WHERE temporada = %s", (etiqueta,))
+            if cur_dict.fetchone()['n'] > 0:
+                raise ValueError(
+                    f"Multimarcas de la temporada '{etiqueta}' ya fue archivada anteriormente. "
+                    "No se puede volver a ejecutar el cierre real -- duplicaria las filas."
+                )
+
+        f_inicio = str(temporada_row['fecha_inicio'])
+        f_fin = str(temporada_row['fecha_fin'])
+
+        cur_dict.execute("SELECT id, clave, evac, cliente_razon_social FROM clientes_multimarcas")
+        clientes = cur_dict.fetchall()
+
+        valores_por_id = _calcular_valores_multimarcas_todos(cur_dict, clientes, f_inicio, f_fin)
+
+        filas = []
+        for c in clientes:
+            valores = valores_por_id[c['id']]
+            filas.append({**c, **valores})
+            procesados += 1
+            if len(preview) < 3:
+                preview.append({'clave': c['clave'], 'avance_global': valores['avance_global']})
+
+        if not dry_run:
+            columnas_mes = [f'total_facturas_{n}' for n in _NOMBRES_MESES_TEMPORADA]
+            columnas_fijas = [
+                'temporada', 'id_multimarca', 'clave', 'evac', 'cliente_razon_social',
+                'avance_global', 'avance_global_scott', 'avance_global_syncros',
+                'avance_global_apparel', 'avance_global_vittoria', 'avance_global_bold',
+            ]
+            todas_columnas = columnas_fijas + columnas_mes
+
+            cur.executemany(f"""
+                INSERT INTO multimarcas_historico ({', '.join(todas_columnas)})
+                VALUES ({', '.join(['%s'] * len(todas_columnas))})
+            """, [
+                (
+                    etiqueta, f['id'], f['clave'], f['evac'], f['cliente_razon_social'],
+                    f['avance_global'], f['avance_global_scott'], f['avance_global_syncros'],
+                    f['avance_global_apparel'], f['avance_global_vittoria'], f['avance_global_bold'],
+                    *(f[c] for c in columnas_mes)
+                )
+                for f in filas
+            ])
+            conexion.commit()
+    except Exception:
+        conexion.rollback()
+        raise
+    finally:
+        cur_dict.close()
+        cur.close()
+        conexion.close()
+
+    return {"clientes_procesados": procesados, "preview": preview}
+
+
+def _requiere_admin_multimarcas(request) -> tuple:
+    """Devuelve (payload, None) si el token es de admin, o (None, (body, status))
+    con la respuesta de error a devolver si no."""
+    auth_header = request.headers.get('Authorization', '')
+    raw_token = auth_header.split(' ')[1] if ' ' in auth_header else None
+    if not raw_token:
+        return None, ({"error": "No autorizado"}, 401)
+
+    payload = verificar_token(raw_token)
+    if not payload:
+        return None, ({"error": "Sesión expirada, por favor inicia sesión de nuevo"}, 401)
+
+    rol = payload.get('rol')
+    try:
+        es_admin = int(rol) == 1
+    except (TypeError, ValueError):
+        es_admin = False
+    if not es_admin:
+        return None, ({"error": "Solo administradores pueden cerrar la temporada"}, 403)
+
+    return payload, None
+
+
+@multimarcas_bp.route('/cerrar-multimarcas-temporada', methods=['POST'])
+def cerrar_multimarcas_temporada_endpoint():
+    _payload, error = _requiere_admin_multimarcas(request)
+    if error:
+        body, status = error
+        return jsonify(body), status
+
+    data = request.get_json() or {}
+    etiqueta = data.get('etiqueta')
+    dry_run = data.get('dry_run', True)
+    if not etiqueta:
+        return jsonify({'error': 'Se requiere etiqueta (ej. "2025-2026")'}), 400
+    try:
+        resultado = cerrar_multimarcas_temporada(etiqueta, dry_run=dry_run)
+        return jsonify(resultado), 200
+    except ValueError as e:
+        return jsonify({'error': str(e)}), 400
+    except Exception as e:
+        logging.exception('Error en cerrar_multimarcas_temporada_endpoint')
+        return jsonify({'error': str(e)}), 500
+
+
+@multimarcas_bp.route('/datos_multimarcas_historico', methods=['GET'])
+def obtener_datos_multimarcas_historico():
+    """Histórico de Multimarcas. Filtra por ?temporada=2025-2026 (opcional)."""
+    temporada = request.args.get('temporada')
+    conexion = None
+    cursor = None
+    try:
+        conexion = obtener_conexion()
+        cursor = conexion.cursor(dictionary=True)
+        if temporada:
+            cursor.execute(
+                "SELECT * FROM multimarcas_historico WHERE temporada = %s ORDER BY fecha_snapshot DESC",
+                (temporada,)
+            )
+        else:
+            cursor.execute("SELECT * FROM multimarcas_historico ORDER BY fecha_snapshot DESC")
+        resultados = cursor.fetchall()
+        for fila in resultados:
+            for key, value in fila.items():
+                if isinstance(value, Decimal):
+                    fila[key] = float(value)
+        return jsonify(resultados), 200
+    except Exception as e:
+        logging.exception("Error en obtener_datos_multimarcas_historico")
         return jsonify({'error': str(e)}), 500
     finally:
         if cursor:
