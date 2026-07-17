@@ -15,18 +15,51 @@ from zoneinfo import ZoneInfo
 import time
 import logging
 from utils.odoo_utils import get_odoo_models, ODOO_DB, ODOO_PASSWORD, ODOO_COMPANY_ID
+from utils.temporada_utils import rangos_bimestres_temporada
 
 monitor_odoo_bp = Blueprint('monitor_odoo', __name__, url_prefix='')
 
 @monitor_odoo_bp.route('/monitor_odoo', methods=['GET'])
 def obtener_monitor():
+    """Sin ?temporada: comportamiento histórico, sin filtrar (usado por las
+    pantallas que hacen su propio filtrado por cliente/fecha en el front,
+    ej. previo, caratula-evac-a/b, multimarcas).
+
+    Con ?temporada=2025-2026: filtra por el rango fecha_inicio/fecha_fin de
+    esa temporada (tabla `temporadas`) -- usado por Monitor de Facturas para
+    poder ver también la temporada pasada, ya que a diferencia de previo/
+    multimarcas, `monitor` nunca se sobreescribe al cerrar temporada, solo
+    hay que acotar por fecha.
+    """
     conexion = None
     cursor = None
     try:
         conexion = obtener_conexion()
         cursor = conexion.cursor(dictionary=True)
+
+        temporada = request.args.get('temporada')
+        rango = None
+        fecha_desde = None
+        if temporada:
+            cursor.execute(
+                "SELECT fecha_inicio, fecha_fin FROM temporadas WHERE etiqueta = %s",
+                (temporada,)
+            )
+            rango = cursor.fetchone()
+            if rango:
+                # Si es la temporada más antigua registrada, no acotamos por abajo:
+                # facturas previas a fecha_inicio (rezagos de antes de que
+                # existiera el registro de temporadas, ej. clientes que
+                # adelantaron temporada) también caen aquí en vez de perderse.
+                cursor.execute(
+                    "SELECT MAX(fecha_fin) AS anterior FROM temporadas WHERE fecha_fin < %s",
+                    (rango['fecha_inicio'],)
+                )
+                hay_temporada_anterior = cursor.fetchone()['anterior'] is not None
+                fecha_desde = rango['fecha_inicio'] if hay_temporada_anterior else None
+
         consulta = """
-        SELECT 
+        SELECT
             id,
             numero_factura,
             referencia_interna,
@@ -46,7 +79,16 @@ def obtener_monitor():
             estado_factura
         FROM monitor
         """
-        cursor.execute(consulta)
+        params = ()
+        if rango:
+            if fecha_desde:
+                consulta += " WHERE fecha_factura BETWEEN %s AND %s"
+                params = (fecha_desde, rango['fecha_fin'])
+            else:
+                consulta += " WHERE fecha_factura <= %s"
+                params = (rango['fecha_fin'],)
+
+        cursor.execute(consulta, params)
         resultados = cursor.fetchall()
         return jsonify(resultados)
     except Exception as e:
@@ -875,8 +917,26 @@ def _recalcular_acumulados_previo(conexion, cursor):
     Para filas integrales suma los miembros del grupo.
     Retorna el número de filas actualizadas.
     """
-    DEFAULT_INICIO = '2025-07-01'
-    FECHA_CORTE    = '2026-06-30'   # cierre temporada MY26
+    # Fechas de la temporada ABIERTA -- nunca hardcodeadas. Antes esta funcion
+    # tenia '2025-07-01'/'2026-06-30' (MY26) fijos, incluyendo los cortes de
+    # cada bimestre; al abrir MY27 el rango quedaba invertido
+    # (f_inicio=2026-07-01 > FECHA_CORTE=2026-06-30) y dejaba todo `previo` en 0.
+    cursor.execute("SELECT fecha_inicio, fecha_fin FROM temporadas WHERE estado = 'abierta'")
+    _temporada_abierta = cursor.fetchone()
+    if _temporada_abierta:
+        DEFAULT_INICIO = str(_temporada_abierta['fecha_inicio'])
+        FECHA_CORTE    = str(_temporada_abierta['fecha_fin'])
+    else:
+        DEFAULT_INICIO = '2025-07-01'
+        FECHA_CORTE    = '2026-06-30'
+
+    _rangos = {nombre: (ini, fin) for nombre, ini, fin in rangos_bimestres_temporada(DEFAULT_INICIO)}
+    R_JUL_AGO_FIN               = _rangos['jul_ago'][1]
+    R_SEP_OCT_INI, R_SEP_OCT_FIN = _rangos['sep_oct']
+    R_NOV_DIC_INI, R_NOV_DIC_FIN = _rangos['nov_dic']
+    R_ENE_FEB_INI, R_ENE_FEB_FIN = _rangos['ene_feb']
+    R_MAR_ABR_INI, R_MAR_ABR_FIN = _rangos['mar_abr']
+    R_MAY_JUN_INI, R_MAY_JUN_FIN = _rangos['may_jun']
 
     SCOTT_COND = """
         (
@@ -936,62 +996,62 @@ def _recalcular_acumulados_previo(conexion, cursor):
             ) AS avance_marcas_validas,
             -- SCOTT bicicletas: total y por periodo
             SUM(CASE WHEN {SCOTT_COND} THEN m.venta_total ELSE 0 END)                  AS scott,
-            SUM(CASE WHEN m.fecha_factura <= '2025-08-31'
+            SUM(CASE WHEN m.fecha_factura <= '{R_JUL_AGO_FIN}'
                           AND {SCOTT_COND} THEN m.venta_total ELSE 0 END)              AS scott_jul_ago,
-            SUM(CASE WHEN m.fecha_factura BETWEEN '2025-09-01' AND '2025-10-31'
+            SUM(CASE WHEN m.fecha_factura BETWEEN '{R_SEP_OCT_INI}' AND '{R_SEP_OCT_FIN}'
                           AND {SCOTT_COND} THEN m.venta_total ELSE 0 END)              AS scott_sep_oct,
-            SUM(CASE WHEN m.fecha_factura BETWEEN '2025-11-01' AND '2025-12-31'
+            SUM(CASE WHEN m.fecha_factura BETWEEN '{R_NOV_DIC_INI}' AND '{R_NOV_DIC_FIN}'
                           AND {SCOTT_COND} THEN m.venta_total ELSE 0 END)              AS scott_nov_dic,
-            SUM(CASE WHEN m.fecha_factura BETWEEN '2026-01-01' AND '2026-02-28'
+            SUM(CASE WHEN m.fecha_factura BETWEEN '{R_ENE_FEB_INI}' AND '{R_ENE_FEB_FIN}'
                           AND {SCOTT_COND} THEN m.venta_total ELSE 0 END)              AS scott_ene_feb,
-            SUM(CASE WHEN m.fecha_factura BETWEEN '2026-03-01' AND '2026-04-30'
+            SUM(CASE WHEN m.fecha_factura BETWEEN '{R_MAR_ABR_INI}' AND '{R_MAR_ABR_FIN}'
                           AND {SCOTT_COND} THEN m.venta_total ELSE 0 END)              AS scott_mar_abr,
-            SUM(CASE WHEN m.fecha_factura BETWEEN '2026-05-01' AND '2026-06-30'
+            SUM(CASE WHEN m.fecha_factura BETWEEN '{R_MAY_JUN_INI}' AND '{R_MAY_JUN_FIN}'
                           AND {SCOTT_COND} THEN m.venta_total ELSE 0 END)              AS scott_may_jun,
             -- SYNCROS por periodo
-            SUM(CASE WHEN m.fecha_factura <= '2025-08-31'
+            SUM(CASE WHEN m.fecha_factura <= '{R_JUL_AGO_FIN}'
                           AND m.marca = 'SYNCROS' THEN m.venta_total ELSE 0 END)       AS syncros_jul_ago,
-            SUM(CASE WHEN m.fecha_factura BETWEEN '2025-09-01' AND '2025-10-31'
+            SUM(CASE WHEN m.fecha_factura BETWEEN '{R_SEP_OCT_INI}' AND '{R_SEP_OCT_FIN}'
                           AND m.marca = 'SYNCROS' THEN m.venta_total ELSE 0 END)       AS syncros_sep_oct,
-            SUM(CASE WHEN m.fecha_factura BETWEEN '2025-11-01' AND '2025-12-31'
+            SUM(CASE WHEN m.fecha_factura BETWEEN '{R_NOV_DIC_INI}' AND '{R_NOV_DIC_FIN}'
                           AND m.marca = 'SYNCROS' THEN m.venta_total ELSE 0 END)       AS syncros_nov_dic,
-            SUM(CASE WHEN m.fecha_factura BETWEEN '2026-01-01' AND '2026-02-28'
+            SUM(CASE WHEN m.fecha_factura BETWEEN '{R_ENE_FEB_INI}' AND '{R_ENE_FEB_FIN}'
                           AND m.marca = 'SYNCROS' THEN m.venta_total ELSE 0 END)       AS syncros_ene_feb,
-            SUM(CASE WHEN m.fecha_factura BETWEEN '2026-03-01' AND '2026-04-30'
+            SUM(CASE WHEN m.fecha_factura BETWEEN '{R_MAR_ABR_INI}' AND '{R_MAR_ABR_FIN}'
                           AND m.marca = 'SYNCROS' THEN m.venta_total ELSE 0 END)       AS syncros_mar_abr,
-            SUM(CASE WHEN m.fecha_factura BETWEEN '2026-05-01' AND '2026-06-30'
+            SUM(CASE WHEN m.fecha_factura BETWEEN '{R_MAY_JUN_INI}' AND '{R_MAY_JUN_FIN}'
                           AND m.marca = 'SYNCROS' THEN m.venta_total ELSE 0 END)       AS syncros_may_jun,
             -- APPAREL (apparel=SI + BOLD no-bicicleta) por periodo
-            SUM(CASE WHEN m.fecha_factura <= '2025-08-31'
+            SUM(CASE WHEN m.fecha_factura <= '{R_JUL_AGO_FIN}'
                           AND (m.apparel = 'SI' OR (m.marca = 'BOLD' AND UPPER(TRIM(COALESCE(m.subcategoria,''))) != 'BICICLETA'))
                      THEN m.venta_total ELSE 0 END)                                     AS apparel_jul_ago,
-            SUM(CASE WHEN m.fecha_factura BETWEEN '2025-09-01' AND '2025-10-31'
+            SUM(CASE WHEN m.fecha_factura BETWEEN '{R_SEP_OCT_INI}' AND '{R_SEP_OCT_FIN}'
                           AND (m.apparel = 'SI' OR (m.marca = 'BOLD' AND UPPER(TRIM(COALESCE(m.subcategoria,''))) != 'BICICLETA'))
                      THEN m.venta_total ELSE 0 END)                                     AS apparel_sep_oct,
-            SUM(CASE WHEN m.fecha_factura BETWEEN '2025-11-01' AND '2025-12-31'
+            SUM(CASE WHEN m.fecha_factura BETWEEN '{R_NOV_DIC_INI}' AND '{R_NOV_DIC_FIN}'
                           AND (m.apparel = 'SI' OR (m.marca = 'BOLD' AND UPPER(TRIM(COALESCE(m.subcategoria,''))) != 'BICICLETA'))
                      THEN m.venta_total ELSE 0 END)                                     AS apparel_nov_dic,
-            SUM(CASE WHEN m.fecha_factura BETWEEN '2026-01-01' AND '2026-02-28'
+            SUM(CASE WHEN m.fecha_factura BETWEEN '{R_ENE_FEB_INI}' AND '{R_ENE_FEB_FIN}'
                           AND (m.apparel = 'SI' OR (m.marca = 'BOLD' AND UPPER(TRIM(COALESCE(m.subcategoria,''))) != 'BICICLETA'))
                      THEN m.venta_total ELSE 0 END)                                     AS apparel_ene_feb,
-            SUM(CASE WHEN m.fecha_factura BETWEEN '2026-03-01' AND '2026-04-30'
+            SUM(CASE WHEN m.fecha_factura BETWEEN '{R_MAR_ABR_INI}' AND '{R_MAR_ABR_FIN}'
                           AND (m.apparel = 'SI' OR (m.marca = 'BOLD' AND UPPER(TRIM(COALESCE(m.subcategoria,''))) != 'BICICLETA'))
                      THEN m.venta_total ELSE 0 END)                                     AS apparel_mar_abr,
-            SUM(CASE WHEN m.fecha_factura BETWEEN '2026-05-01' AND '2026-06-30'
+            SUM(CASE WHEN m.fecha_factura BETWEEN '{R_MAY_JUN_INI}' AND '{R_MAY_JUN_FIN}'
                           AND (m.apparel = 'SI' OR (m.marca = 'BOLD' AND UPPER(TRIM(COALESCE(m.subcategoria,''))) != 'BICICLETA'))
                      THEN m.venta_total ELSE 0 END)                                     AS apparel_may_jun,
             -- VITTORIA por periodo
-            SUM(CASE WHEN m.fecha_factura <= '2025-08-31'
+            SUM(CASE WHEN m.fecha_factura <= '{R_JUL_AGO_FIN}'
                           AND m.marca = 'VITTORIA' THEN m.venta_total ELSE 0 END)      AS vittoria_jul_ago,
-            SUM(CASE WHEN m.fecha_factura BETWEEN '2025-09-01' AND '2025-10-31'
+            SUM(CASE WHEN m.fecha_factura BETWEEN '{R_SEP_OCT_INI}' AND '{R_SEP_OCT_FIN}'
                           AND m.marca = 'VITTORIA' THEN m.venta_total ELSE 0 END)      AS vittoria_sep_oct,
-            SUM(CASE WHEN m.fecha_factura BETWEEN '2025-11-01' AND '2025-12-31'
+            SUM(CASE WHEN m.fecha_factura BETWEEN '{R_NOV_DIC_INI}' AND '{R_NOV_DIC_FIN}'
                           AND m.marca = 'VITTORIA' THEN m.venta_total ELSE 0 END)      AS vittoria_nov_dic,
-            SUM(CASE WHEN m.fecha_factura BETWEEN '2026-01-01' AND '2026-02-28'
+            SUM(CASE WHEN m.fecha_factura BETWEEN '{R_ENE_FEB_INI}' AND '{R_ENE_FEB_FIN}'
                           AND m.marca = 'VITTORIA' THEN m.venta_total ELSE 0 END)      AS vittoria_ene_feb,
-            SUM(CASE WHEN m.fecha_factura BETWEEN '2026-03-01' AND '2026-04-30'
+            SUM(CASE WHEN m.fecha_factura BETWEEN '{R_MAR_ABR_INI}' AND '{R_MAR_ABR_FIN}'
                           AND m.marca = 'VITTORIA' THEN m.venta_total ELSE 0 END)      AS vittoria_mar_abr,
-            SUM(CASE WHEN m.fecha_factura BETWEEN '2026-05-01' AND '2026-06-30'
+            SUM(CASE WHEN m.fecha_factura BETWEEN '{R_MAY_JUN_INI}' AND '{R_MAY_JUN_FIN}'
                           AND m.marca = 'VITTORIA' THEN m.venta_total ELSE 0 END)      AS vittoria_may_jun
         FROM monitor m
         LEFT JOIN clientes c ON m.contacto_referencia = c.clave
