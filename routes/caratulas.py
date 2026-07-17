@@ -954,14 +954,21 @@ def detalle_compras_odoo():
             if _raw:
                 _cached = json.loads(_raw)
                 _c_resultado, _c_filas, _c_meta_base = _cached
-                _c_filas_fil = [f for f in _c_filas if f.get('estatus_out') == estado_filtro] if estado_filtro else _c_filas
-                _c_total = len(_c_filas_fil)
-                _c_pag = _c_filas_fil[offset: offset + limit] if limit is not None else _c_filas_fil[offset:]
-                return jsonify({
-                    'data': _c_resultado,
-                    'rows': _c_pag,
-                    'meta': {**_c_meta_base, 'total': _c_total, 'limit': limit, 'offset': offset, 'returned': len(_c_pag)},
-                }), 200
+                # Si el caché es de una versión anterior sin etiquetas, descartarlo
+                if _c_filas and 'etiquetas' not in _c_filas[0]:
+                    _redis.delete(_cache_key)
+                    logging.info('Cache obsoleto (sin etiquetas), forzando reconsulta: %s', _cache_key)
+                else:
+                    _c_filas_fil = [f for f in _c_filas if f.get('estatus_out') == estado_filtro] if estado_filtro else _c_filas
+                    _c_total = len(_c_filas_fil)
+                    _c_pag = _c_filas_fil[offset: offset + limit] if limit is not None else _c_filas_fil[offset:]
+                    _c_nombre = _c_resultado[0].get('cliente') if _c_resultado else None
+                    return jsonify({
+                        'data': _c_resultado,
+                        'rows': _c_pag,
+                        'meta': {**_c_meta_base, 'total': _c_total, 'limit': limit, 'offset': offset, 'returned': len(_c_pag)},
+                        'cliente': {'nombre_cliente': _c_nombre, 'clave': cliente},
+                    }), 200
         except Exception as _ce:
             logging.warning('Redis cache hit error: %s', _ce)
 
@@ -1172,7 +1179,7 @@ def detalle_compras_odoo():
                 [[['partner_id', 'in', partner_ids],
                   ['date_order', '>=', fecha_inicio_temporada],
                   ['state', '!=', 'draft']]],
-                {'fields': ['id', 'name', 'date_order', 'partner_id', 'order_line', 'amount_total', 'state'],
+                {'fields': ['id', 'name', 'date_order', 'partner_id', 'order_line', 'amount_total', 'state', 'tag_ids'],
                  'order': 'date_order desc', 'limit': 0}
             )
         except Exception as ex:
@@ -1180,6 +1187,33 @@ def detalle_compras_odoo():
 
         if not orders:
             return jsonify({'data': [], 'rows': [], 'meta': {'total': 0}}), 200
+
+        # ── 2.5) Batch-leer nombres de etiquetas ─────────────────────────────────
+        all_tag_ids = set()
+        for o in orders:
+            for tid in (o.get('tag_ids') or []):
+                all_tag_ids.add(tid)
+
+        # DEBUG TEMPORAL
+        _sample_tags = [(o.get('name'), o.get('tag_ids')) for o in orders[:5]]
+        logging.warning('DEBUG tags all_tag_ids=%s sample=%s', all_tag_ids, _sample_tags)
+
+        tags_map: dict = {}
+        if all_tag_ids:
+            for _tag_model in ('crm.tag', 'sale.order.tag'):
+                try:
+                    _tag_rows = models.execute_kw(
+                        ODOO_DB, uid, ODOO_PASSWORD,
+                        _tag_model, 'read',
+                        [list(all_tag_ids)],
+                        {'fields': ['id', 'name']}
+                    )
+                    tags_map = {t['id']: t['name'] for t in _tag_rows}
+                    logging.warning('DEBUG tags model=%s tags_map=%s', _tag_model, tags_map)
+                    break
+                except Exception as _tag_ex:
+                    logging.warning('DEBUG tags model=%s FAILED: %s', _tag_model, _tag_ex)
+                    continue
 
         # ── 3) Leer líneas en batch ───────────────────────────────────────────────
         all_line_ids = []
@@ -1673,6 +1707,7 @@ def detalle_compras_odoo():
             estado_orden_raw = o.get('state') or ''
             estado_orden = SALE_STATE_LABELS.get(estado_orden_raw, estado_orden_raw)
 
+            _etiquetas = [tags_map[tid] for tid in (o.get('tag_ids') or []) if tid in tags_map]
             order_obj = {
                 'orden': o.get('name'),
                 'fecha': o.get('date_order'),
@@ -1680,6 +1715,7 @@ def detalle_compras_odoo():
                 'monto_total': float(o.get('amount_total') or 0),
                 'estado_orden': estado_orden,
                 'estado_orden_raw': estado_orden_raw,
+                'etiquetas': _etiquetas,
                 'lineas': [],
                 'pickings': []
             }
@@ -1828,6 +1864,7 @@ def detalle_compras_odoo():
                     'fecha_esperada': fecha_esp_final,
                     'po_name': po_name_final,
                     'de_proyeccion': _norm_fc(lin.get('clave_producto')) in _forecast_skus,
+                    'etiquetas': order_obj['etiquetas'],
                 })
 
             resultado.append(order_obj)
@@ -1878,6 +1915,8 @@ def detalle_compras_odoo():
         total = len(filas_fil)
         filas_pag = filas_fil[offset: offset + limit] if limit is not None else filas_fil[offset:]
 
+        _nombre_partner = partners[0]['name'] if partners else cliente
+        _clave_partner  = (partners[0].get('ref') or '').strip() if partners else cliente
         return jsonify({
             'data': resultado,
             'rows': filas_pag,
@@ -1888,7 +1927,11 @@ def detalle_compras_odoo():
                 'returned': len(filas_pag),
                 'fecha_inicio_temporada': fecha_inicio_temporada,
                 'avance_previo': avance_previo,
-            }
+            },
+            'cliente': {
+                'nombre_cliente': _nombre_partner,
+                'clave': _clave_partner,
+            },
         }), 200
 
     except Exception as e:
