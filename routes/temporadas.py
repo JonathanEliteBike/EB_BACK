@@ -98,8 +98,9 @@ def cerrar_temporada_completa(etiqueta: str, dry_run: bool = True) -> dict:
     corria un cierre masivo).
 
     Los clientes que ya tienen temporada_cerrada = 1 (cerrados individualmente
-    via /cerrar-temporada) se OMITEN por completo: su previo ya está congelado
-    y es autoritativo, no se recalcula ni se toca.
+    via /cerrar-temporada) NO se recalculan -- su previo ya está congelado y es
+    autoritativo -- pero SÍ se copian tal cual a previo_historico, para que
+    aparezcan al consultar esta temporada desde el selector histórico.
     """
     conexion = obtener_conexion()
     cur_dict = conexion.cursor(dictionary=True)
@@ -142,11 +143,33 @@ def cerrar_temporada_completa(etiqueta: str, dry_run: bool = True) -> dict:
         """)
         clientes = cur_dict.fetchall()
 
-        cur_dict.execute("""
-            SELECT COUNT(*) AS n FROM clientes
-            WHERE clave IS NOT NULL AND clave <> '' AND temporada_cerrada = 1
+        # Clientes ya cerrados individualmente: su `previo` ya está congelado
+        # y es autoritativo -- se copian tal cual a previo_historico (sin
+        # recalcular nada) para que SÍ aparezcan al consultar esta temporada
+        # desde el selector histórico, en vez de quedar fuera por completo.
+        _campos_previo_directo = [c for c in _COLUMNAS_PREVIO_HISTORICO if c not in ('id_previo', 'clave')]
+        cur_dict.execute(f"""
+            SELECT id, clave, {', '.join(_campos_previo_directo)}
+            FROM previo
+            WHERE UPPER(TRIM(clave)) IN (
+                SELECT UPPER(TRIM(clave)) FROM clientes
+                WHERE clave IS NOT NULL AND clave <> '' AND temporada_cerrada = 1
+            )
         """)
-        omitidos = cur_dict.fetchone()['n']
+        cerrados_previo = cur_dict.fetchall()
+        omitidos = len(cerrados_previo)
+
+        for fila_cerrada in cerrados_previo:
+            fila_cerrada['id_previo'] = fila_cerrada['id']
+            filas_historico.append(fila_cerrada)
+            if len(preview) < 3:
+                preview.append({
+                    'clave': fila_cerrada['clave'],
+                    'acumulado_anticipado': fila_cerrada['acumulado_anticipado'],
+                    'avance_global_scott': fila_cerrada['avance_global_scott'],
+                    'avance_global_apparel_syncros_vittoria': fila_cerrada['avance_global_apparel_syncros_vittoria'],
+                    'cerrado_individualmente': True,
+                })
 
         for c in clientes:
             clave = c['clave'].strip().upper()
