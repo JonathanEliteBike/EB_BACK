@@ -11,8 +11,14 @@ CREATE TABLE IF NOT EXISTS temporadas (
     UNIQUE KEY uq_etiqueta (etiqueta)
 ) ENGINE=InnoDB DEFAULT CHARSET=latin1;
 
-INSERT INTO temporadas (etiqueta, fecha_inicio, fecha_fin, estado, fecha_cierre)
-VALUES ('2025-2026', '2025-07-01', '2026-06-30', 'cerrada', NOW())
+-- IMPORTANTE: '2025-2026' se inserta como 'abierta', no 'cerrada'. Solo
+-- representa el rango de fechas de esa temporada; el cierre GLOBAL real se
+-- marca aparte, cuando cerrar_temporada_completa() se ejecute de verdad
+-- (via cerrar_temporada_masiva_pendientes, no como parte de esta migracion).
+-- No confundir con clientes.temporada_cerrada, que es el cierre INDIVIDUAL
+-- por cliente y ya existe independientemente de esta tabla.
+INSERT INTO temporadas (etiqueta, fecha_inicio, fecha_fin, estado)
+VALUES ('2025-2026', '2025-07-01', '2026-06-30', 'abierta')
 ON DUPLICATE KEY UPDATE etiqueta = etiqueta;
 
 INSERT INTO temporadas (etiqueta, fecha_inicio, fecha_fin, estado)
