@@ -6,6 +6,7 @@ sumando todas las proyecciones de todos los distribuidores.
 
 import io
 import logging
+import re
 import time
 from datetime import datetime
 from utils.tiempo import ahora_mx, ahora_str
@@ -13,7 +14,9 @@ from utils.tiempo import ahora_mx, ahora_str
 from flask import Blueprint, jsonify, request, send_file
 
 from db_conexion import obtener_conexion
-from routes.forecast import SKU_CATALOG, FORECAST_SKU_WHITELIST
+from routes.forecast import (SKU_CATALOG, FORECAST_SKU_WHITELIST,
+                             _SCOTT_CORRECT_NAMES, _SCOTT_COLORS, _SCOTT_TALLAS,
+                             _ensure_scott_names)
 from utils.odoo_utils import get_odoo_models, ODOO_DB, ODOO_PASSWORD
 
 try:
@@ -37,6 +40,9 @@ _COSTOS_TTL = 300  # 5 minutos
 
 _MEGAMO_PRECIOS_CACHE: dict = {'data': {}, 'ts': 0.0}
 _MEGAMO_PRECIOS_TTL  = 300
+
+_ORDENES_CACHE: dict = {'data': {}, 'periodo': '', 'ts': 0.0}
+_ORDENES_TTL = 180  # 3 minutos
 
 # Mapeo nivel → pricelist ID en Odoo
 _NIVEL_TO_PL_ID: dict = {
@@ -148,14 +154,17 @@ def _get_costos_odoo() -> dict:
             [[['default_code', 'in', skus]]],
             {'fields': ['default_code', 'standard_price', 'list_price'], 'limit': 0})
 
-        # Normalizar: strip + mapear código → costo (fallback a list_price si costo=0)
+        # Normalizar: strip + mapear código → costo.
+        # Umbral mínimo de $100 para descartar placeholders (ej. $1.00 en Odoo).
+        # Prioridad: standard_price (si ≥ 100) → list_price → 0
+        _MIN_PRECIO = 100.0
         costos: dict = {}
         for p in productos_pp:
             code = (p.get('default_code') or '').strip()
             cost = float(p.get('standard_price') or 0)
             lst  = float(p.get('list_price') or 0)
-            precio = cost if cost > 0 else lst
-            if code and precio > 0:
+            precio = cost if cost >= _MIN_PRECIO else lst
+            if code and precio >= _MIN_PRECIO:
                 costos[code] = precio
 
         # Para los SKUs sin precio, intentar product.template como fallback
@@ -169,8 +178,8 @@ def _get_costos_odoo() -> dict:
                 code = (p.get('default_code') or '').strip()
                 cost = float(p.get('standard_price') or 0)
                 lst  = float(p.get('list_price') or 0)
-                precio = cost if cost > 0 else lst
-                if code and precio > 0 and code not in costos:
+                precio = cost if cost >= _MIN_PRECIO else lst
+                if code and precio >= _MIN_PRECIO and code not in costos:
                     costos[code] = precio
 
         # Fallback para SKUs Megamo sin precio: usar pricelist 13 (DISTRIBUIDOR) sin IVA
@@ -203,6 +212,114 @@ def _get_costos_odoo() -> dict:
     except Exception as e:
         logging.warning('[costos_odoo] error: %s', e)
         return _COSTOS_CACHE['data']
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Helper: órdenes confirmadas en Odoo por distribuidor
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _norm_sku(s: str) -> str:
+    return re.sub(r'[\-\s]', '', str(s or '')).upper()
+
+
+def _get_ordenes_my27(periodo: str) -> dict:
+    """
+    Retorna {clave_cliente: {sku_norm: total_pedido}} con las unidades ya
+    confirmadas en Odoo (sale.order state=sale/done) para el periodo MY27.
+    Caché de 3 minutos para no saturar Odoo en cada recarga.
+    """
+    global _ORDENES_CACHE
+    now = time.time()
+    if (now - _ORDENES_CACHE['ts'] < _ORDENES_TTL and
+            _ORDENES_CACHE['periodo'] == periodo):
+        return _ORDENES_CACHE['data']
+
+    try:
+        m = re.match(r'^(\d{4})-(\d{4})$', periodo)
+        if not m:
+            return {}
+        year1, year2 = int(m.group(1)), int(m.group(2))
+        fecha_inicio = f'{year1 - 1}-07-01'
+        fecha_fin    = f'{year2}-04-30'
+
+        uid, models, err = get_odoo_models()
+        if err or not uid:
+            return _ORDENES_CACHE['data']
+
+        # 1. Todas las órdenes confirmadas del periodo
+        orders = models.execute_kw(
+            ODOO_DB, uid, ODOO_PASSWORD,
+            'sale.order', 'search_read',
+            [[['state', 'in', ['sale', 'done']],
+              ['date_order', '>=', fecha_inicio],
+              ['date_order', '<=', fecha_fin + ' 23:59:59']]],
+            {'fields': ['id', 'partner_id'], 'limit': 0}
+        )
+        if not orders:
+            _ORDENES_CACHE = {'data': {}, 'periodo': periodo, 'ts': now}
+            return {}
+
+        # 2. Refs de los partners
+        partner_ids = list({o['partner_id'][0] for o in orders if o.get('partner_id')})
+        partners = models.execute_kw(
+            ODOO_DB, uid, ODOO_PASSWORD,
+            'res.partner', 'search_read',
+            [[['id', 'in', partner_ids], ['ref', '!=', False]]],
+            {'fields': ['id', 'ref'], 'limit': 0}
+        )
+        ref_map = {p['id']: (p.get('ref') or '').strip() for p in partners}
+
+        # 3. order_id → clave_cliente
+        order_clave = {
+            o['id']: ref_map[o['partner_id'][0]]
+            for o in orders
+            if o.get('partner_id') and ref_map.get(o['partner_id'][0])
+        }
+
+        # 4. Líneas de venta
+        sol = models.execute_kw(
+            ODOO_DB, uid, ODOO_PASSWORD,
+            'sale.order.line', 'search_read',
+            [[['order_id', 'in', list(order_clave.keys())],
+              ['state', 'not in', ['cancel']]]],
+            {'fields': ['order_id', 'product_id', 'product_uom_qty'], 'limit': 0}
+        )
+
+        # 5. Códigos de producto
+        prod_ids = list({l['product_id'][0] for l in sol if l.get('product_id')})
+        prods = models.execute_kw(
+            ODOO_DB, uid, ODOO_PASSWORD,
+            'product.product', 'search_read',
+            [[['id', 'in', prod_ids]]],
+            {'fields': ['id', 'default_code'], 'limit': 0}
+        )
+        prod_code = {p['id']: (p.get('default_code') or '').strip() for p in prods}
+
+        # 6. Agregar por clave + sku_norm
+        result: dict = {}
+        for l in sol:
+            oid = l['order_id'][0] if isinstance(l.get('order_id'), list) else l.get('order_id')
+            clave = order_clave.get(oid, '')
+            if not clave:
+                continue
+            pid = l['product_id'][0] if l.get('product_id') else None
+            if not pid:
+                continue
+            sn = _norm_sku(prod_code.get(pid, ''))
+            if not sn:
+                continue
+            qty = int(l.get('product_uom_qty') or 0)
+            if clave not in result:
+                result[clave] = {}
+            result[clave][sn] = result[clave].get(sn, 0) + qty
+
+        _ORDENES_CACHE = {'data': result, 'periodo': periodo, 'ts': now}
+        logging.info('[ordenes_my27] %d clientes con pedidos en %s', len(result), periodo)
+        return result
+
+    except Exception as e:
+        logging.exception('[ordenes_my27] error: %s', e)
+        return _ORDENES_CACHE['data']
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -284,6 +401,27 @@ def _get_datos_consolidados(periodo: str = '') -> dict:
                 'meses':          {mes: int(fd[mes] or 0) for mes in MESES},
             })
 
+        # Descontar unidades ya pedidas en Odoo (FIFO por mes) de cada desglose
+        ordenes_dist = _get_ordenes_my27(periodo) if periodo else {}
+        if ordenes_dist:
+            for sku, desgloses in desglose_map.items():
+                sn = _norm_sku(sku)
+                for d in desgloses:
+                    total_pedido = ordenes_dist.get(d['clave_cliente'], {}).get(sn, 0)
+                    if total_pedido <= 0:
+                        continue
+                    restante = total_pedido
+                    for mes in MESES:
+                        qty = d['meses'].get(mes, 0)
+                        deducido = min(restante, qty)
+                        d['meses'][mes] = qty - deducido
+                        restante -= deducido
+                        if restante <= 0:
+                            break
+                    d['total'] = sum(d['meses'][m] for m in MESES)
+                # Eliminar distribuidores cuyo total quedó en 0 tras descontar
+                desglose_map[sku] = [d for d in desgloses if d['total'] > 0]
+
         # Nivel de cada distribuidor que tiene Megamo con unidades
         megamo_claves = {
             d['clave_cliente']
@@ -302,6 +440,22 @@ def _get_datos_consolidados(periodo: str = '') -> dict:
         costos_map     = _get_costos_odoo()
         megamo_precios = _get_megamo_precios_por_nivel()
 
+        # Cache de nombres Scott con es_MX (color/talla incluidos)
+        _ensure_scott_names()
+
+        # Info de odoo_catalogo para SKUs sin proyecciones registradas
+        skus_sin_totales = [s for s in FORECAST_SKU_WHITELIST if s not in totales_map]
+        oc_fallback: dict = {}
+        if skus_sin_totales:
+            ph_st = ','.join(['%s'] * len(skus_sin_totales))
+            cur.execute(
+                f"SELECT referencia_interna, nombre_producto, marca, color, talla "
+                f"FROM odoo_catalogo WHERE referencia_interna IN ({ph_st})",
+                skus_sin_totales
+            )
+            for row in cur.fetchall():
+                oc_fallback[row['referencia_interna']] = row
+
         # Construir los 92 artículos
         articulos = []
         for sku in FORECAST_SKU_WHITELIST:
@@ -310,14 +464,26 @@ def _get_datos_consolidados(periodo: str = '') -> dict:
             precios   = cat_info.get('prices', {})
             t         = totales_map.get(sku)
 
-            meses_data = {
-                mes: {
-                    'cantidad':   int(t[mes] or 0) if t else 0,
-                    'disponible': avail_map.get(mes, True),
+            # Si hay datos de órdenes, recalcular cantidades desde el desglose deducido
+            desgloses_sku = desglose_map.get(sku, [])
+            if ordenes_dist:
+                meses_data = {
+                    mes: {
+                        'cantidad':   sum(d['meses'].get(mes, 0) for d in desgloses_sku),
+                        'disponible': avail_map.get(mes, True),
+                    }
+                    for mes in MESES
                 }
-                for mes in MESES
-            }
-            total_anual = int(t['total_anual'] or 0) if t else 0
+                total_anual = sum(meses_data[mes]['cantidad'] for mes in MESES)
+            else:
+                meses_data = {
+                    mes: {
+                        'cantidad':   int(t[mes] or 0) if t else 0,
+                        'disponible': avail_map.get(mes, True),
+                    }
+                    for mes in MESES
+                }
+                total_anual = int(t['total_anual'] or 0) if t else 0
 
             if sku.startswith('MH'):
                 # Megamo: costo por nivel de cada distribuidor con unidades
@@ -338,13 +504,28 @@ def _get_datos_consolidados(periodo: str = '') -> dict:
 
             costos_mes = {mes: round(meses_data[mes]['cantidad'] * costo_unitario, 2) for mes in MESES}
 
+            # Datos de producto: forecast_proyecciones → cache Scott → odoo_catalogo
+            oc = oc_fallback.get(sku, {})
+            _prod  = (t['producto'] if t else None) or _SCOTT_CORRECT_NAMES.get(sku) or oc.get('nombre_producto', '')
+            _marca = (t['marca']    if t else None) or oc.get('marca', '')
+            _modelo= (t['modelo']   if t else None) or ''
+            _color = (t['color']    if t else None) or _SCOTT_COLORS.get(sku) or oc.get('color', '')
+            _talla = (t['talla']    if t else None) or _SCOTT_TALLAS.get(sku) or oc.get('talla', '')
+            # Marca: si el nombre contiene SCOTT o MEGAMO, usarla aunque falte en odoo_catalogo
+            if not _marca:
+                nm_up = (_prod or '').upper()
+                if 'SCOTT' in nm_up:
+                    _marca = 'SCOTT'
+                elif 'MEGAMO' in nm_up:
+                    _marca = 'MEGAMO'
+
             articulos.append({
                 'sku':               sku,
-                'producto':          (t['producto'] or '') if t else '',
-                'marca':             (t['marca']    or '') if t else '',
-                'modelo':            (t['modelo']   or '') if t else '',
-                'color':             (t['color']    or '') if t else '',
-                'talla':             (t['talla']    or '') if t else '',
+                'producto':          _prod,
+                'marca':             _marca,
+                'modelo':            _modelo,
+                'color':             _color,
+                'talla':             _talla,
                 'precio_dist':       float(precios.get('Distribuidor', 0)),
                 'costo_unitario':    round(costo_unitario, 2),
                 'costo_total':       costo_total,
@@ -411,6 +592,7 @@ def listar():
         if request.args.get('refresh'):
             _COSTOS_CACHE['ts'] = 0.0
             _MEGAMO_PRECIOS_CACHE['ts'] = 0.0
+            _ORDENES_CACHE['ts'] = 0.0
         data    = _get_datos_consolidados(periodo)
         return jsonify(data), 200
     except Exception as e:
@@ -574,8 +756,9 @@ def _generar_excel(data: dict) -> bytes:
     c_ctot.border = thin_bdr
     ws.row_dimensions[3].height = 20
 
-    # ── Datos: los 92 artículos ──────────────────────────────────────────────
-    for ri, art in enumerate(data['articulos'], start=5):
+    # ── Datos: solo artículos con al menos 1 unidad pedida ──────────────────
+    arts_con_pedido = [a for a in data['articulos'] if a['total_anual'] > 0]
+    for ri, art in enumerate(arts_con_pedido, start=5):
         fila_par = (ri % 2 == 0)
         bg_fila  = GRIS_CLARO if fila_par else BLANCO
 

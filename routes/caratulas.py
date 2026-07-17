@@ -1194,10 +1194,6 @@ def detalle_compras_odoo():
             for tid in (o.get('tag_ids') or []):
                 all_tag_ids.add(tid)
 
-        # DEBUG TEMPORAL
-        _sample_tags = [(o.get('name'), o.get('tag_ids')) for o in orders[:5]]
-        logging.warning('DEBUG tags all_tag_ids=%s sample=%s', all_tag_ids, _sample_tags)
-
         tags_map: dict = {}
         if all_tag_ids:
             for _tag_model in ('crm.tag', 'sale.order.tag'):
@@ -1209,10 +1205,8 @@ def detalle_compras_odoo():
                         {'fields': ['id', 'name']}
                     )
                     tags_map = {t['id']: t['name'] for t in _tag_rows}
-                    logging.warning('DEBUG tags model=%s tags_map=%s', _tag_model, tags_map)
                     break
-                except Exception as _tag_ex:
-                    logging.warning('DEBUG tags model=%s FAILED: %s', _tag_model, _tag_ex)
+                except Exception:
                     continue
 
         # ── 3) Leer líneas en batch ───────────────────────────────────────────────
