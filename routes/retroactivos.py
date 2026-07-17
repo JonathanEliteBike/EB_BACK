@@ -1,17 +1,35 @@
 import unicodedata
 import os
 import re
+import logging
 from flask import Blueprint, jsonify, request
 from db_conexion import obtener_conexion
 import decimal
 import traceback
 from datetime import date, datetime
 from utils.odoo_utils import get_odoo_models, ODOO_DB, ODOO_PASSWORD
+from utils.temporada_utils import rangos_bimestres_temporada
 import openpyxl
 
 retroactivos_bp = Blueprint('retroactivos', __name__, url_prefix='')
 
 from utils.jwt_utils import verificar_token
+
+
+def _fecha_corte_temporada_abierta():
+    """Fin de la temporada actualmente abierta -- reemplaza el FECHA_CORTE
+    fijo a MY26 que capaba (para siempre) el rango de retroactivos a esa
+    temporada, incluso ya abierta MY27. Cae de regreso a FECHA_CORTE si por
+    algun motivo no hay temporada abierta registrada."""
+    conexion = obtener_conexion()
+    try:
+        cur = conexion.cursor(dictionary=True)
+        cur.execute("SELECT fecha_fin FROM temporadas WHERE estado = 'abierta'")
+        row = cur.fetchone()
+        cur.close()
+        return str(row['fecha_fin']) if row else FECHA_CORTE
+    finally:
+        conexion.close()
 
 
 # ==============================================================================
@@ -2434,6 +2452,17 @@ def _calcular_valores_previo_clave(cursor_dict, clave, f_inicio, fecha_cierre):
 
     APP_COND = "(m.apparel = 'SI' OR (m.marca = 'BOLD' AND UPPER(TRIM(COALESCE(m.subcategoria,''))) != 'BICICLETA'))"
 
+    # Cortes de bimestre relativos a f_inicio -- nunca hardcodeados a MY26,
+    # para que sirva tanto para la temporada abierta como para archivar
+    # cualquier temporada cerrada con sus propias fechas.
+    _rangos = {nombre: (ini, fin) for nombre, ini, fin in rangos_bimestres_temporada(f_inicio)}
+    R_JUL_AGO_FIN                = _rangos['jul_ago'][1]
+    R_SEP_OCT_INI, R_SEP_OCT_FIN = _rangos['sep_oct']
+    R_NOV_DIC_INI, R_NOV_DIC_FIN = _rangos['nov_dic']
+    R_ENE_FEB_INI, R_ENE_FEB_FIN = _rangos['ene_feb']
+    R_MAR_ABR_INI, R_MAR_ABR_FIN = _rangos['mar_abr']
+    R_MAY_JUN_INI, R_MAY_JUN_FIN = _rangos['may_jun']
+
     cursor_dict.execute(f"""
         SELECT
             COALESCE(SUM(m.venta_total), 0) AS total_bruto,
@@ -2442,30 +2471,30 @@ def _calcular_valores_previo_clave(cursor_dict, clave, f_inicio, fecha_cierre):
             COALESCE(SUM(CASE WHEN m.marca = 'VITTORIA' THEN m.venta_total ELSE 0 END), 0) AS vittoria,
             COALESCE(SUM(CASE WHEN UPPER(TRIM(m.marca)) = 'BOLD' AND UPPER(TRIM(m.subcategoria)) = 'BICICLETA' THEN m.venta_total ELSE 0 END), 0) AS bold,
             COALESCE(SUM(CASE WHEN {SCOTT_COND} THEN m.venta_total ELSE 0 END), 0) AS scott,
-            COALESCE(SUM(CASE WHEN m.fecha_factura <= '2025-08-31' AND {SCOTT_COND} THEN m.venta_total ELSE 0 END), 0) AS scott_jul_ago,
-            COALESCE(SUM(CASE WHEN m.fecha_factura BETWEEN '2025-09-01' AND '2025-10-31' AND {SCOTT_COND} THEN m.venta_total ELSE 0 END), 0) AS scott_sep_oct,
-            COALESCE(SUM(CASE WHEN m.fecha_factura BETWEEN '2025-11-01' AND '2025-12-31' AND {SCOTT_COND} THEN m.venta_total ELSE 0 END), 0) AS scott_nov_dic,
-            COALESCE(SUM(CASE WHEN m.fecha_factura BETWEEN '2026-01-01' AND '2026-02-28' AND {SCOTT_COND} THEN m.venta_total ELSE 0 END), 0) AS scott_ene_feb,
-            COALESCE(SUM(CASE WHEN m.fecha_factura BETWEEN '2026-03-01' AND '2026-04-30' AND {SCOTT_COND} THEN m.venta_total ELSE 0 END), 0) AS scott_mar_abr,
-            COALESCE(SUM(CASE WHEN m.fecha_factura BETWEEN '2026-05-01' AND '2026-06-30' AND {SCOTT_COND} THEN m.venta_total ELSE 0 END), 0) AS scott_may_jun,
-            COALESCE(SUM(CASE WHEN m.fecha_factura <= '2025-08-31' AND m.marca = 'SYNCROS' THEN m.venta_total ELSE 0 END), 0) AS syncros_jul_ago,
-            COALESCE(SUM(CASE WHEN m.fecha_factura BETWEEN '2025-09-01' AND '2025-10-31' AND m.marca = 'SYNCROS' THEN m.venta_total ELSE 0 END), 0) AS syncros_sep_oct,
-            COALESCE(SUM(CASE WHEN m.fecha_factura BETWEEN '2025-11-01' AND '2025-12-31' AND m.marca = 'SYNCROS' THEN m.venta_total ELSE 0 END), 0) AS syncros_nov_dic,
-            COALESCE(SUM(CASE WHEN m.fecha_factura BETWEEN '2026-01-01' AND '2026-02-28' AND m.marca = 'SYNCROS' THEN m.venta_total ELSE 0 END), 0) AS syncros_ene_feb,
-            COALESCE(SUM(CASE WHEN m.fecha_factura BETWEEN '2026-03-01' AND '2026-04-30' AND m.marca = 'SYNCROS' THEN m.venta_total ELSE 0 END), 0) AS syncros_mar_abr,
-            COALESCE(SUM(CASE WHEN m.fecha_factura BETWEEN '2026-05-01' AND '2026-06-30' AND m.marca = 'SYNCROS' THEN m.venta_total ELSE 0 END), 0) AS syncros_may_jun,
-            COALESCE(SUM(CASE WHEN m.fecha_factura <= '2025-08-31' AND {APP_COND} THEN m.venta_total ELSE 0 END), 0) AS apparel_jul_ago,
-            COALESCE(SUM(CASE WHEN m.fecha_factura BETWEEN '2025-09-01' AND '2025-10-31' AND {APP_COND} THEN m.venta_total ELSE 0 END), 0) AS apparel_sep_oct,
-            COALESCE(SUM(CASE WHEN m.fecha_factura BETWEEN '2025-11-01' AND '2025-12-31' AND {APP_COND} THEN m.venta_total ELSE 0 END), 0) AS apparel_nov_dic,
-            COALESCE(SUM(CASE WHEN m.fecha_factura BETWEEN '2026-01-01' AND '2026-02-28' AND {APP_COND} THEN m.venta_total ELSE 0 END), 0) AS apparel_ene_feb,
-            COALESCE(SUM(CASE WHEN m.fecha_factura BETWEEN '2026-03-01' AND '2026-04-30' AND {APP_COND} THEN m.venta_total ELSE 0 END), 0) AS apparel_mar_abr,
-            COALESCE(SUM(CASE WHEN m.fecha_factura BETWEEN '2026-05-01' AND '2026-06-30' AND {APP_COND} THEN m.venta_total ELSE 0 END), 0) AS apparel_may_jun,
-            COALESCE(SUM(CASE WHEN m.fecha_factura <= '2025-08-31' AND m.marca = 'VITTORIA' THEN m.venta_total ELSE 0 END), 0) AS vittoria_jul_ago,
-            COALESCE(SUM(CASE WHEN m.fecha_factura BETWEEN '2025-09-01' AND '2025-10-31' AND m.marca = 'VITTORIA' THEN m.venta_total ELSE 0 END), 0) AS vittoria_sep_oct,
-            COALESCE(SUM(CASE WHEN m.fecha_factura BETWEEN '2025-11-01' AND '2025-12-31' AND m.marca = 'VITTORIA' THEN m.venta_total ELSE 0 END), 0) AS vittoria_nov_dic,
-            COALESCE(SUM(CASE WHEN m.fecha_factura BETWEEN '2026-01-01' AND '2026-02-28' AND m.marca = 'VITTORIA' THEN m.venta_total ELSE 0 END), 0) AS vittoria_ene_feb,
-            COALESCE(SUM(CASE WHEN m.fecha_factura BETWEEN '2026-03-01' AND '2026-04-30' AND m.marca = 'VITTORIA' THEN m.venta_total ELSE 0 END), 0) AS vittoria_mar_abr,
-            COALESCE(SUM(CASE WHEN m.fecha_factura BETWEEN '2026-05-01' AND '2026-06-30' AND m.marca = 'VITTORIA' THEN m.venta_total ELSE 0 END), 0) AS vittoria_may_jun
+            COALESCE(SUM(CASE WHEN m.fecha_factura <= '{R_JUL_AGO_FIN}' AND {SCOTT_COND} THEN m.venta_total ELSE 0 END), 0) AS scott_jul_ago,
+            COALESCE(SUM(CASE WHEN m.fecha_factura BETWEEN '{R_SEP_OCT_INI}' AND '{R_SEP_OCT_FIN}' AND {SCOTT_COND} THEN m.venta_total ELSE 0 END), 0) AS scott_sep_oct,
+            COALESCE(SUM(CASE WHEN m.fecha_factura BETWEEN '{R_NOV_DIC_INI}' AND '{R_NOV_DIC_FIN}' AND {SCOTT_COND} THEN m.venta_total ELSE 0 END), 0) AS scott_nov_dic,
+            COALESCE(SUM(CASE WHEN m.fecha_factura BETWEEN '{R_ENE_FEB_INI}' AND '{R_ENE_FEB_FIN}' AND {SCOTT_COND} THEN m.venta_total ELSE 0 END), 0) AS scott_ene_feb,
+            COALESCE(SUM(CASE WHEN m.fecha_factura BETWEEN '{R_MAR_ABR_INI}' AND '{R_MAR_ABR_FIN}' AND {SCOTT_COND} THEN m.venta_total ELSE 0 END), 0) AS scott_mar_abr,
+            COALESCE(SUM(CASE WHEN m.fecha_factura BETWEEN '{R_MAY_JUN_INI}' AND '{R_MAY_JUN_FIN}' AND {SCOTT_COND} THEN m.venta_total ELSE 0 END), 0) AS scott_may_jun,
+            COALESCE(SUM(CASE WHEN m.fecha_factura <= '{R_JUL_AGO_FIN}' AND m.marca = 'SYNCROS' THEN m.venta_total ELSE 0 END), 0) AS syncros_jul_ago,
+            COALESCE(SUM(CASE WHEN m.fecha_factura BETWEEN '{R_SEP_OCT_INI}' AND '{R_SEP_OCT_FIN}' AND m.marca = 'SYNCROS' THEN m.venta_total ELSE 0 END), 0) AS syncros_sep_oct,
+            COALESCE(SUM(CASE WHEN m.fecha_factura BETWEEN '{R_NOV_DIC_INI}' AND '{R_NOV_DIC_FIN}' AND m.marca = 'SYNCROS' THEN m.venta_total ELSE 0 END), 0) AS syncros_nov_dic,
+            COALESCE(SUM(CASE WHEN m.fecha_factura BETWEEN '{R_ENE_FEB_INI}' AND '{R_ENE_FEB_FIN}' AND m.marca = 'SYNCROS' THEN m.venta_total ELSE 0 END), 0) AS syncros_ene_feb,
+            COALESCE(SUM(CASE WHEN m.fecha_factura BETWEEN '{R_MAR_ABR_INI}' AND '{R_MAR_ABR_FIN}' AND m.marca = 'SYNCROS' THEN m.venta_total ELSE 0 END), 0) AS syncros_mar_abr,
+            COALESCE(SUM(CASE WHEN m.fecha_factura BETWEEN '{R_MAY_JUN_INI}' AND '{R_MAY_JUN_FIN}' AND m.marca = 'SYNCROS' THEN m.venta_total ELSE 0 END), 0) AS syncros_may_jun,
+            COALESCE(SUM(CASE WHEN m.fecha_factura <= '{R_JUL_AGO_FIN}' AND {APP_COND} THEN m.venta_total ELSE 0 END), 0) AS apparel_jul_ago,
+            COALESCE(SUM(CASE WHEN m.fecha_factura BETWEEN '{R_SEP_OCT_INI}' AND '{R_SEP_OCT_FIN}' AND {APP_COND} THEN m.venta_total ELSE 0 END), 0) AS apparel_sep_oct,
+            COALESCE(SUM(CASE WHEN m.fecha_factura BETWEEN '{R_NOV_DIC_INI}' AND '{R_NOV_DIC_FIN}' AND {APP_COND} THEN m.venta_total ELSE 0 END), 0) AS apparel_nov_dic,
+            COALESCE(SUM(CASE WHEN m.fecha_factura BETWEEN '{R_ENE_FEB_INI}' AND '{R_ENE_FEB_FIN}' AND {APP_COND} THEN m.venta_total ELSE 0 END), 0) AS apparel_ene_feb,
+            COALESCE(SUM(CASE WHEN m.fecha_factura BETWEEN '{R_MAR_ABR_INI}' AND '{R_MAR_ABR_FIN}' AND {APP_COND} THEN m.venta_total ELSE 0 END), 0) AS apparel_mar_abr,
+            COALESCE(SUM(CASE WHEN m.fecha_factura BETWEEN '{R_MAY_JUN_INI}' AND '{R_MAY_JUN_FIN}' AND {APP_COND} THEN m.venta_total ELSE 0 END), 0) AS apparel_may_jun,
+            COALESCE(SUM(CASE WHEN m.fecha_factura <= '{R_JUL_AGO_FIN}' AND m.marca = 'VITTORIA' THEN m.venta_total ELSE 0 END), 0) AS vittoria_jul_ago,
+            COALESCE(SUM(CASE WHEN m.fecha_factura BETWEEN '{R_SEP_OCT_INI}' AND '{R_SEP_OCT_FIN}' AND m.marca = 'VITTORIA' THEN m.venta_total ELSE 0 END), 0) AS vittoria_sep_oct,
+            COALESCE(SUM(CASE WHEN m.fecha_factura BETWEEN '{R_NOV_DIC_INI}' AND '{R_NOV_DIC_FIN}' AND m.marca = 'VITTORIA' THEN m.venta_total ELSE 0 END), 0) AS vittoria_nov_dic,
+            COALESCE(SUM(CASE WHEN m.fecha_factura BETWEEN '{R_ENE_FEB_INI}' AND '{R_ENE_FEB_FIN}' AND m.marca = 'VITTORIA' THEN m.venta_total ELSE 0 END), 0) AS vittoria_ene_feb,
+            COALESCE(SUM(CASE WHEN m.fecha_factura BETWEEN '{R_MAR_ABR_INI}' AND '{R_MAR_ABR_FIN}' AND m.marca = 'VITTORIA' THEN m.venta_total ELSE 0 END), 0) AS vittoria_mar_abr,
+            COALESCE(SUM(CASE WHEN m.fecha_factura BETWEEN '{R_MAY_JUN_INI}' AND '{R_MAY_JUN_FIN}' AND m.marca = 'VITTORIA' THEN m.venta_total ELSE 0 END), 0) AS vittoria_may_jun
         FROM monitor m
         WHERE m.contacto_referencia = %s
           AND m.fecha_factura >= %s
@@ -2677,6 +2706,7 @@ def ejecutar_sincronizacion_y_calculos():
         claves_db = []
         fechas_por_clave = {}
         nivel_por_clave = {}
+        fecha_corte_actual = _fecha_corte_temporada_abierta()
 
         for row in resultados_db:
             clave = str(row['CLAVE']).strip().upper()
@@ -2691,12 +2721,12 @@ def ejecutar_sincronizacion_y_calculos():
             fin = (
                 row['f_fin'].strftime('%Y-%m-%d')
                 if isinstance(row['f_fin'], (date, datetime))
-                else (row['f_fin'] or '2026-06-30')
+                else (row['f_fin'] or fecha_corte_actual)
             )
 
             fechas_por_clave[clave] = {
                 'inicio': ini,
-                'fin': min(fin, FECHA_CORTE)
+                'fin': min(fin, fecha_corte_actual)
             }
             nivel_por_clave[clave] = str(row.get('CATEGORIA') or '')
 
@@ -2889,8 +2919,8 @@ def ejecutar_sincronizacion_y_calculos():
                 u = umbrales_por_tiendas[num_tiendas]
 
                 caso = f"""
-                    WHEN CLAVE = '{clave_integral}' 
-                         AND CATEGORIA IN ('Partner Elite', 'Partner Elite Plus') 
+                    WHEN CLAVE = '{clave_integral}'
+                         AND CATEGORIA IN ('Partner Elite', 'Partner Elite Plus')
                     THEN
                         CASE
                             WHEN compra_adicional >= {u[0][0]} THEN {u[0][1]}
@@ -2902,7 +2932,31 @@ def ejecutar_sincronizacion_y_calculos():
 
                 casos_integrales.append(caso)
 
-        casos_sql = " ".join(casos_integrales)
+        # Clientes individuales (no Integral) con más de 1 sucursal registrada
+        # en previo.numero_sucursales -- mismo umbral por cantidad de tiendas
+        # que ya aplicaba solo a grupos Integral.
+        cursor_dict.execute("""
+            SELECT clave, numero_sucursales FROM previo
+            WHERE COALESCE(es_integral, 0) = 0 AND numero_sucursales > 1
+        """)
+        casos_individuales = []
+        for row in cursor_dict.fetchall():
+            num_tiendas = row['numero_sucursales']
+            if num_tiendas in umbrales_por_tiendas:
+                u = umbrales_por_tiendas[num_tiendas]
+                casos_individuales.append(f"""
+                    WHEN CLAVE = '{row['clave']}'
+                         AND CATEGORIA IN ('Partner Elite', 'Partner Elite Plus')
+                    THEN
+                        CASE
+                            WHEN compra_adicional >= {u[0][0]} THEN {u[0][1]}
+                            WHEN compra_adicional >= {u[1][0]} THEN {u[1][1]}
+                            WHEN compra_adicional >= {u[2][0]} THEN {u[2][1]}
+                            ELSE 0.00
+                        END
+                """)
+
+        casos_sql = " ".join(casos_integrales + casos_individuales)
 
         query_porcentajes = f"""
             UPDATE tabla_retroactivos
@@ -3094,6 +3148,184 @@ def obtener_retroactivos():
         if conexion:
             conexion.close()
 
+
+# ==============================================================================
+# HISTÓRICO DE TABLA_RETROACTIVOS POR TEMPORADA
+# ==============================================================================
+# A diferencia de previo/multimarcas, tabla_retroactivos SIEMPRE fue una tabla
+# en vivo que se sobreescribe en cada sincronizacion -- nunca se archivo por
+# temporada. Esto solo permite archivar HACIA ADELANTE (a partir de que la
+# temporada actualmente abierta se cierre); no reconstruye retroactivo a
+# temporadas ya cerradas antes de esta migracion (ej. MY26), porque el
+# calculo de importe/retroactivo_total depende de un pipeline complejo
+# (Odoo + Excel de campañas + umbrales por Integral) que no es seguro
+# re-derivar para fechas pasadas sin validacion contable explicita.
+
+def _requiere_admin_retroactivos(request):
+    auth_header = request.headers.get('Authorization', '')
+    raw_token = auth_header.split(' ')[1] if ' ' in auth_header else None
+    if not raw_token:
+        return False
+    payload = verificar_token(raw_token)
+    if not payload:
+        return False
+    try:
+        return int(payload.get('rol')) == 1
+    except (TypeError, ValueError):
+        return False
+
+
+def cerrar_retroactivos_temporada(etiqueta: str, dry_run: bool = True) -> dict:
+    """Archiva un snapshot de la tabla_retroactivos EN VIVO bajo `etiqueta`.
+    Copia directa (no recalcula nada) -- asume que tabla_retroactivos ya
+    esta actualizada para la temporada abierta (correr /sincronizar_notas
+    antes si hace falta). NUNCA escribe en tabla_retroactivos, solo en
+    tabla_retroactivos_historico.
+
+    Incluye temporada_cerrada/fecha_cierre_temporada/fecha_cierre_apparel
+    tomados de `clientes` en este momento -- hay que archivar ANTES de
+    llamar abrir_temporada() para la temporada siguiente, porque esa
+    funcion resetea esos campos a 0/NULL para todos los clientes.
+    """
+    conexion = obtener_conexion()
+    cur_dict = conexion.cursor(dictionary=True)
+    cur = conexion.cursor()
+
+    try:
+        cur.execute(
+            "SELECT COUNT(*) FROM tabla_retroactivos_historico WHERE temporada = %s",
+            (etiqueta,)
+        )
+        if cur.fetchone()[0] > 0:
+            return {'error': f'La temporada {etiqueta} ya tiene un snapshot de retroactivos archivado'}
+
+        cur_dict.execute("""
+            SELECT tr.*,
+                   COALESCE(c.temporada_cerrada, 0) AS cierre_temporada_cerrada,
+                   c.fecha_cierre_temporada AS cierre_fecha_cierre_temporada,
+                   c.fecha_cierre_apparel AS cierre_fecha_cierre_apparel
+            FROM tabla_retroactivos tr
+            LEFT JOIN clientes c ON UPPER(TRIM(tr.CLAVE)) = UPPER(TRIM(c.clave))
+        """)
+        filas = cur_dict.fetchall()
+
+        if not filas:
+            return {'error': 'tabla_retroactivos está vacía, nada que archivar'}
+
+        _campos_cierre = {
+            'cierre_temporada_cerrada': 'temporada_cerrada',
+            'cierre_fecha_cierre_temporada': 'fecha_cierre_temporada',
+            'cierre_fecha_cierre_apparel': 'fecha_cierre_apparel',
+        }
+        columnas_copiar = [
+            c for c in filas[0].keys() if c != 'id' and c not in _campos_cierre
+        ]
+        preview = filas[:5]
+
+        if dry_run:
+            return {
+                'dry_run': True,
+                'temporada': etiqueta,
+                'filas_a_archivar': len(filas),
+                'preview': preview,
+            }
+
+        campos = ['temporada', 'id_original'] + columnas_copiar + list(_campos_cierre.values())
+        placeholders = ', '.join(['%s'] * len(campos))
+        sql = f"INSERT INTO tabla_retroactivos_historico ({', '.join(campos)}) VALUES ({placeholders})"
+
+        valores = [
+            (etiqueta, fila['id'])
+            + tuple(fila[c] for c in columnas_copiar)
+            + tuple(fila[c] for c in _campos_cierre)
+            for fila in filas
+        ]
+        cur.executemany(sql, valores)
+        conexion.commit()
+
+        return {
+            'dry_run': False,
+            'temporada': etiqueta,
+            'filas_archivadas': len(filas),
+        }
+    finally:
+        cur_dict.close()
+        cur.close()
+        conexion.close()
+
+
+@retroactivos_bp.route('/cerrar-retroactivos-temporada', methods=['POST'])
+def cerrar_retroactivos_temporada_endpoint():
+    if not _requiere_admin_retroactivos(request):
+        return jsonify({'error': 'Solo administradores pueden cerrar retroactivos'}), 403
+
+    data = request.get_json(silent=True) or {}
+    etiqueta = (data.get('etiqueta') or '').strip()
+    dry_run = data.get('dry_run', True)
+
+    if not etiqueta:
+        return jsonify({'error': 'Se requiere etiqueta de temporada'}), 400
+
+    try:
+        resultado = cerrar_retroactivos_temporada(etiqueta, dry_run=dry_run)
+        if 'error' in resultado:
+            return jsonify(resultado), 409
+        return jsonify(resultado), 200
+    except Exception as e:
+        logging.exception('Error en cerrar_retroactivos_temporada_endpoint')
+        return jsonify({'error': str(e)}), 500
+
+
+@retroactivos_bp.route('/retroactivos_temporadas_disponibles', methods=['GET'])
+def retroactivos_temporadas_disponibles():
+    """Temporadas REALMENTE CERRADAS que además tienen snapshot en
+    tabla_retroactivos_historico -- mismo criterio que /temporadas_disponibles
+    en routes/caratulas.py."""
+    conexion = obtener_conexion()
+    try:
+        cursor = conexion.cursor()
+        cursor.execute("SELECT DISTINCT temporada FROM tabla_retroactivos_historico")
+        con_snapshot = {row[0] for row in cursor.fetchall()}
+
+        cursor.execute("SELECT etiqueta FROM temporadas WHERE estado = 'cerrada'")
+        realmente_cerradas = {row[0] for row in cursor.fetchall()}
+
+        temporadas = sorted(con_snapshot & realmente_cerradas, reverse=True)
+        cursor.close()
+        return jsonify(temporadas), 200
+    except Exception as e:
+        logging.exception('Error en retroactivos_temporadas_disponibles')
+        return jsonify({'error': str(e)}), 500
+    finally:
+        conexion.close()
+
+
+@retroactivos_bp.route('/retroactivos_historico', methods=['GET'])
+def retroactivos_historico():
+    temporada = request.args.get('temporada')
+    if not temporada:
+        return jsonify({'error': 'Se requiere ?temporada='}), 400
+
+    conexion = obtener_conexion()
+    try:
+        cursor = conexion.cursor(dictionary=True)
+        cursor.execute(
+            "SELECT * FROM tabla_retroactivos_historico WHERE temporada = %s ORDER BY CLAVE",
+            (temporada,)
+        )
+        resultados = cursor.fetchall()
+        for fila in resultados:
+            for clave, valor in fila.items():
+                fila[clave] = convertir_decimal_y_fecha(valor)
+        cursor.close()
+        return jsonify(resultados), 200
+    except Exception as e:
+        logging.exception('Error en retroactivos_historico')
+        return jsonify({'error': str(e)}), 500
+    finally:
+        conexion.close()
+
+
 # ==============================================================================
 # 4. ENDPOINT POST MANUAL
 # ==============================================================================
@@ -3284,6 +3516,113 @@ def cerrar_temporada():
         "clave":   claves_cerradas[0],
         "fecha_cierre": fecha_cierre
     }), 200
+
+
+# ==============================================================================
+# 5b. CIERRE MASIVO DE PENDIENTES (todos los que faltan, misma fecha)
+# ==============================================================================
+# Hace exactamente lo mismo que /cerrar-temporada pero para TODOS los
+# distribuidores que aún no se han cerrado individualmente, en un solo
+# request -- para cuando ya se cerraron algunos "a mano" antes de fin de
+# temporada y solo falta cerrar el resto con la fecha de fin de temporada
+# normal. Reutiliza _recalcular_previo_clave_cierre (misma función que usa
+# el cierre individual) -- SÍ escribe en `previo` en vivo, a propósito,
+# igual que el botón de cierre individual: está pensado para correrse
+# cuando la temporada que se cierra sigue siendo la temporada en curso
+# (antes de abrir la siguiente), no después.
+def cerrar_temporada_masiva_pendientes(fecha_cierre: str, dry_run: bool = True) -> dict:
+    conexion = obtener_conexion()
+    cursor = conexion.cursor()
+    cursor_dict = conexion.cursor(dictionary=True)
+
+    try:
+        cursor_dict.execute("""
+            SELECT clave, f_inicio, nombre_cliente
+            FROM clientes
+            WHERE COALESCE(temporada_cerrada, 0) = 0
+            ORDER BY clave
+        """)
+        pendientes = cursor_dict.fetchall()
+
+        if dry_run:
+            return {
+                'dry_run': True,
+                'fecha_cierre': fecha_cierre,
+                'total_pendientes': len(pendientes),
+                'preview': [p['clave'] for p in pendientes[:20]],
+            }
+
+        cerrados = []
+        for cliente in pendientes:
+            clave = cliente['clave'].strip().upper()
+            f_inicio = cliente.get('f_inicio')
+            if hasattr(f_inicio, 'strftime'):
+                f_inicio = f_inicio.strftime('%Y-%m-%d')
+            f_inicio = f_inicio or '2025-07-01'
+
+            _recalcular_previo_clave_cierre(
+                conexion, cursor_dict, cursor, clave, f_inicio, fecha_cierre
+            )
+
+            cursor.execute("""
+                UPDATE clientes
+                SET temporada_cerrada      = 1,
+                    fecha_cierre_temporada = %s,
+                    f_fin                  = %s
+                WHERE UPPER(TRIM(clave)) = %s
+            """, (fecha_cierre, fecha_cierre, clave))
+
+            cerrados.append(clave)
+
+        conexion.commit()
+    except Exception:
+        conexion.rollback()
+        raise
+    finally:
+        cursor_dict.close()
+        cursor.close()
+        conexion.close()
+
+    ejecutar_sincronizacion_y_calculos()
+
+    return {
+        'dry_run': False,
+        'fecha_cierre': fecha_cierre,
+        'total_cerrados': len(cerrados),
+        'claves': cerrados,
+    }
+
+
+@retroactivos_bp.route('/cerrar-temporada-masiva-pendientes', methods=['POST'])
+def cerrar_temporada_masiva_pendientes_endpoint():
+    auth_header = request.headers.get('Authorization', '')
+    raw_token = auth_header.split(' ')[1] if ' ' in auth_header else None
+    payload = verificar_token(raw_token) if raw_token else None
+    rol = payload.get('rol') if payload else None
+    try:
+        es_admin = int(rol) == 1
+    except (TypeError, ValueError):
+        es_admin = False
+    if not es_admin:
+        return jsonify({"error": "Solo administradores pueden cerrar la temporada"}), 403
+
+    data = request.get_json(silent=True) or {}
+    fecha_cierre = (data.get('fecha_cierre') or '').strip()
+    dry_run = data.get('dry_run', True)
+
+    if not fecha_cierre:
+        return jsonify({"error": "Se requiere fecha_cierre"}), 400
+    try:
+        datetime.strptime(fecha_cierre, '%Y-%m-%d')
+    except ValueError:
+        return jsonify({"error": "Formato de fecha inválido. Use YYYY-MM-DD"}), 400
+
+    try:
+        resultado = cerrar_temporada_masiva_pendientes(fecha_cierre, dry_run=dry_run)
+        return jsonify(resultado), 200
+    except Exception as e:
+        logging.exception('Error en cerrar_temporada_masiva_pendientes_endpoint')
+        return jsonify({"error": str(e)}), 500
 
 
 # ==============================================================================
@@ -3669,6 +4008,7 @@ def debug_productos_ofertados_detalle(clave_param=None):
         """)
 
         clientes_db = cursor.fetchall()
+        fecha_corte_actual = _fecha_corte_temporada_abierta()
 
         for c in clientes_db:
             clave_db = str(c.get('clave') or '').strip().upper()
@@ -3688,7 +4028,7 @@ def debug_productos_ofertados_detalle(clave_param=None):
             fechas_por_clave[clave_db] = {
                 "nombre_cliente": c.get('nombre_cliente'),
                 "inicio": f_inicio or fecha_inicio,
-                "fin": min(f_fin or fecha_fin, FECHA_CORTE)
+                "fin": min(f_fin or fecha_fin, fecha_corte_actual)
             }
 
         partner_ids = list({
@@ -4172,6 +4512,7 @@ def debug_nc_garantias():
         claves_db = []
         fechas_por_clave = {}
         cliente_por_clave = {}
+        fecha_corte_actual = _fecha_corte_temporada_abierta()
 
         for c in clientes_db:
             clave = str(c.get('clave') or '').strip().upper()
@@ -4195,7 +4536,7 @@ def debug_nc_garantias():
 
             fechas_por_clave[clave] = {
                 'inicio': f_inicio or fecha_inicio,
-                'fin': min(f_fin or fecha_fin, FECHA_CORTE)
+                'fin': min(f_fin or fecha_fin, fecha_corte_actual)
             }
 
             cliente_por_clave[clave] = c.get('nombre_cliente') or ''
