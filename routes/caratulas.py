@@ -449,6 +449,12 @@ def obtener_datos_previo():
 def temporadas_disponibles():
     """Devuelve las temporadas (ej. '2025-2026') que tienen snapshots guardados
     en cualquiera de las tablas de histórico, para poblar un selector en el frontend.
+
+    Excluye la etiqueta de la temporada actual (por calendario): previo/evac se
+    auto-archivan en cada guardado usando etiqueta_temporada(), que solo mira la
+    fecha de hoy -- sin importar si la temporada realmente cerro. Eso deja
+    snapshots intermedios "ruidosos" bajo la etiqueta vigente que no representan
+    un cierre real y confunden en el selector de "temporadas cerradas".
     """
     try:
         conexion = obtener_conexion()
@@ -461,7 +467,8 @@ def temporadas_disponibles():
                 SELECT temporada FROM caratula_evac_b_historico
                 ORDER BY temporada DESC
             """)
-            temporadas = [row[0] for row in cursor.fetchall()]
+            temporada_actual = etiqueta_temporada()
+            temporadas = [row[0] for row in cursor.fetchall() if row[0] != temporada_actual]
         return jsonify(temporadas), 200
     except Exception as e:
         logging.exception("Error en temporadas_disponibles")

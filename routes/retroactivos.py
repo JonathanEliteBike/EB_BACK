@@ -3278,19 +3278,19 @@ def cerrar_retroactivos_temporada_endpoint():
 
 @retroactivos_bp.route('/retroactivos_temporadas_disponibles', methods=['GET'])
 def retroactivos_temporadas_disponibles():
-    """Temporadas REALMENTE CERRADAS que además tienen snapshot en
-    tabla_retroactivos_historico -- mismo criterio que /temporadas_disponibles
-    en routes/caratulas.py."""
+    """Temporadas con snapshot en tabla_retroactivos_historico.
+
+    No se filtra por temporadas.estado='cerrada': tabla_retroactivos_historico
+    se puebla tanto por un cierre GLOBAL de temporada (cerrar_retroactivos_temporada)
+    como por el archivo de clientes cerrados INDIVIDUALMENTE mientras la temporada
+    sigue abierta -- exigir estado='cerrada' aqui ocultaba esos cierres
+    individuales del selector antes de que la temporada cerrara globalmente,
+    que es exactamente el caso de uso que se querian mostrar."""
     conexion = obtener_conexion()
     try:
         cursor = conexion.cursor()
-        cursor.execute("SELECT DISTINCT temporada FROM tabla_retroactivos_historico")
-        con_snapshot = {row[0] for row in cursor.fetchall()}
-
-        cursor.execute("SELECT etiqueta FROM temporadas WHERE estado = 'cerrada'")
-        realmente_cerradas = {row[0] for row in cursor.fetchall()}
-
-        temporadas = sorted(con_snapshot & realmente_cerradas, reverse=True)
+        cursor.execute("SELECT DISTINCT temporada FROM tabla_retroactivos_historico ORDER BY temporada DESC")
+        temporadas = [row[0] for row in cursor.fetchall()]
         cursor.close()
         return jsonify(temporadas), 200
     except Exception as e:
