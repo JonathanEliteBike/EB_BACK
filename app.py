@@ -30,7 +30,7 @@ from routes.ventas import ventas_bp
 from routes.garantias import garantias_bp
 from routes.proyecciones_my27 import proyecciones_my27_bp
 from routes.importaciones import importaciones_bp
-
+from routes.inventario import inventario_bp
 # Importamos la instancia de Celery desde celery_worker
 from celery_worker import celery_app as celery
 
@@ -146,6 +146,7 @@ def create_app():
     app.register_blueprint(garantias_bp)
     app.register_blueprint(proyecciones_my27_bp)
     app.register_blueprint(importaciones_bp)
+    app.register_blueprint(inventario_bp)
     return app
 
 app = create_app()
