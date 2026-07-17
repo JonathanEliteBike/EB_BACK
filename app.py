@@ -31,6 +31,8 @@ from routes.garantias import garantias_bp
 from routes.proyecciones_my27 import proyecciones_my27_bp
 from routes.importaciones import importaciones_bp
 from routes.inventario import inventario_bp
+from routes.colaboradores import colaboradores_bp
+from routes.asignaciones import asignaciones_bp
 # Importamos la instancia de Celery desde celery_worker
 from celery_worker import celery_app as celery
 
@@ -84,7 +86,7 @@ def create_app():
             if origin in allowed_origins or origin.startswith('http://localhost:') or origin.startswith('http://127.0.0.1:'):
                 response = make_response('', 200)
                 response.headers['Access-Control-Allow-Origin'] = origin
-                response.headers['Access-Control-Allow-Methods'] = 'GET,POST,PUT,DELETE,OPTIONS'
+                response.headers['Access-Control-Allow-Methods'] = 'GET,POST,PUT,PATCH,DELETE,OPTIONS'
                 response.headers['Access-Control-Allow-Headers'] = 'Authorization, Content-Type'
                 response.headers['Access-Control-Allow-Credentials'] = 'true'
                 return response
@@ -102,7 +104,7 @@ def create_app():
             response.headers['Access-Control-Allow-Credentials'] = 'true'
             response.headers['Access-Control-Expose-Headers'] = 'Content-Disposition, Content-Type'
             response.headers['Access-Control-Allow-Headers'] = 'Authorization, Content-Type'
-            response.headers['Access-Control-Allow-Methods'] = 'GET,POST,PUT,DELETE,OPTIONS'
+            response.headers['Access-Control-Allow-Methods'] = 'GET,POST,PUT,PATCH,DELETE,OPTIONS'
 
         return response
 
@@ -147,6 +149,8 @@ def create_app():
     app.register_blueprint(proyecciones_my27_bp)
     app.register_blueprint(importaciones_bp)
     app.register_blueprint(inventario_bp)
+    app.register_blueprint(colaboradores_bp)
+    app.register_blueprint(asignaciones_bp)
     return app
 
 app = create_app()
