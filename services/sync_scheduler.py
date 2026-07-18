@@ -13,7 +13,7 @@ _scheduler = None
 
 def _run_sync_diario():
     """
-    Paso 1: sync-monitor-odoo  →  actualiza tabla monitor desde Odoo
+    Paso 1: sync-monitor-odoo (recalcular_previo=true)  →  actualiza monitor y recalcula previo
     Paso 2: sincronizar_notas  →  recalcula tabla_retroactivos
     """
     port = os.environ.get('FLASK_PORT', '5000')
@@ -22,7 +22,7 @@ def _run_sync_diario():
     try:
         logger.info('[SCHEDULER] === Sync diario iniciado ===')
 
-        r1 = requests.post(f'{base}/sync-monitor-odoo', timeout=300)
+        r1 = requests.post(f'{base}/sync-monitor-odoo', json={'recalcular_previo': True}, timeout=300)
         data1 = r1.json() if r1.headers.get('Content-Type', '').startswith('application/json') else {}
         logger.info('[SCHEDULER] sync-monitor-odoo → %s | registros: %s',
                     r1.status_code, data1.get('count', '?'))
