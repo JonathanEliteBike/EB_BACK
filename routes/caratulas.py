@@ -938,6 +938,10 @@ def detalle_compras_odoo():
     # (usado en "Mis Pedidos" de usuarios integrales para evitar matches parciales)
     ref_exacta    = request.args.get('ref_exacta') in ('1', 'true', 'True')
     force_refresh = request.args.get('force_refresh') in ('1', 'true', 'True')
+    # temporada: etiqueta histórica opcional (ej. "2025-2026"). Cuando se manda,
+    # se acotan las órdenes al rango fijo de esa temporada en vez del f_inicio
+    # actual del cliente (que ya se reseteó a la temporada abierta).
+    temporada_param = request.args.get('temporada')
     try:
         _limit_raw = request.args.get('limit')
         limit = int(_limit_raw) if _limit_raw is not None else None
@@ -956,7 +960,7 @@ def detalle_compras_odoo():
     # ── Caché Redis (5 min TTL) ───────────────────────────────────────────────
     # La clave NO incluye limit/offset/estado: esos parámetros se aplican
     # en caliente sobre los datos cacheados, evitando entradas duplicadas por página.
-    _cache_key = f"monitor_pedidos:{cliente or ''}:{int(bool(ref_exacta))}:{grupo_odoo or ''}"
+    _cache_key = f"monitor_pedidos:{cliente or ''}:{int(bool(ref_exacta))}:{grupo_odoo or ''}:{temporada_param or ''}"
     if _redis and force_refresh:
         try:
             _redis.delete(_cache_key)
@@ -992,10 +996,23 @@ def detalle_compras_odoo():
     # lo que permite incluir pedidos de clientes con temporada anticipada.
     FECHA_INICIO_DEFAULT = '2025-07-01'
     fecha_inicio_temporada = FECHA_INICIO_DEFAULT
+    fecha_fin_temporada = None  # solo se acota cuando se pide una temporada histórica
     try:
         _conn_fi = obtener_conexion()
         _cur_fi = _conn_fi.cursor(dictionary=True)
-        if grupo_odoo:
+        if temporada_param:
+            # Temporada histórica: usar el rango fijo de esa temporada, sin
+            # importar el f_inicio individual actual del cliente (ya reseteado
+            # a la temporada abierta).
+            _cur_fi.execute(
+                "SELECT fecha_inicio, fecha_fin FROM temporadas WHERE etiqueta = %s",
+                (temporada_param,)
+            )
+            _row_temp = _cur_fi.fetchone()
+            if _row_temp:
+                fecha_inicio_temporada = str(_row_temp['fecha_inicio'])
+                fecha_fin_temporada = str(_row_temp['fecha_fin'])
+        elif grupo_odoo:
             _cur_fi.execute(
                 "SELECT MIN(f_inicio) AS fi FROM clientes "
                 "WHERE id_grupo = %s AND f_inicio IS NOT NULL",
@@ -1188,12 +1205,15 @@ def detalle_compras_odoo():
         # sido confirmadas y no deben aparecer en el monitor.
         # Las órdenes canceladas (state='cancel') SÍ se muestran con estatus "Cancelado".
         try:
+            _domain_orders = [['partner_id', 'in', partner_ids],
+                               ['date_order', '>=', fecha_inicio_temporada],
+                               ['state', '!=', 'draft']]
+            if fecha_fin_temporada:
+                _domain_orders.append(['date_order', '<=', fecha_fin_temporada])
             orders = models.execute_kw(
                 ODOO_DB, uid, ODOO_PASSWORD,
                 'sale.order', 'search_read',
-                [[['partner_id', 'in', partner_ids],
-                  ['date_order', '>=', fecha_inicio_temporada],
-                  ['state', '!=', 'draft']]],
+                [_domain_orders],
                 {'fields': ['id', 'name', 'date_order', 'partner_id', 'order_line', 'amount_total', 'state', 'tag_ids'],
                  'order': 'date_order desc', 'limit': 0}
             )
@@ -1886,18 +1906,27 @@ def detalle_compras_odoo():
         try:
             _conn_ap = obtener_conexion()
             _cur_ap = _conn_ap.cursor(dictionary=True)
-            if grupo_odoo:
+            _clave_ap = f"Integral {grupo_odoo}" if grupo_odoo else cliente
+            if temporada_param:
+                # Temporada histórica: leer el snapshot archivado, no el previo en vivo
+                _cur_ap.execute(
+                    "SELECT acumulado_anticipado AS total FROM previo_historico "
+                    "WHERE clave = %s AND temporada = %s "
+                    "ORDER BY fecha_snapshot DESC LIMIT 1",
+                    (_clave_ap, temporada_param)
+                )
+            elif grupo_odoo:
                 # La fila resumen del integral tiene clave = "Integral {id}"
                 _cur_ap.execute(
                     "SELECT acumulado_anticipado AS total FROM previo "
                     "WHERE clave = %s LIMIT 1",
-                    (f"Integral {grupo_odoo}",)
+                    (_clave_ap,)
                 )
             else:
                 _cur_ap.execute(
                     "SELECT acumulado_anticipado AS total FROM previo "
                     "WHERE clave = %s AND (es_integral = 0 OR es_integral IS NULL) LIMIT 1",
-                    (cliente,)
+                    (_clave_ap,)
                 )
             _row_ap = _cur_ap.fetchone()
             if _row_ap and _row_ap.get('total') is not None:
@@ -1912,6 +1941,7 @@ def detalle_compras_odoo():
         _meta_base = {
             'fecha_inicio_temporada': fecha_inicio_temporada,
             'avance_previo': avance_previo,
+            'temporada': temporada_param,
         }
         if _redis:
             try:
@@ -1936,6 +1966,7 @@ def detalle_compras_odoo():
                 'returned': len(filas_pag),
                 'fecha_inicio_temporada': fecha_inicio_temporada,
                 'avance_previo': avance_previo,
+                'temporada': temporada_param,
             },
             'cliente': {
                 'nombre_cliente': _nombre_partner,
