@@ -110,47 +110,71 @@ def test_clientes_ya_cerrados_no_se_tocan():
     con un corte anticipado distinto al fin de temporada estándar) deben
     quedar completamente fuera del cierre masivo: no se recalcula su previo
     y no cuentan como 'procesados'.
+
+    Crea su propia fixture (cierra HA433 temporalmente) en vez de depender de
+    que ya existan clientes cerrados en la BD local -- ese estado ambiental
+    cambia legítimamente con el ciclo de temporadas (p. ej. tras abrir una
+    temporada nueva, temporada_cerrada vuelve a 0 para todos).
     """
     conn = obtener_conexion()
     cur = conn.cursor(dictionary=True)
+    cur_w = conn.cursor()
 
-    # Solo cuentan los cerrados que tienen una fila real en `previo` que
-    # preservar -- un cliente cerrado sin fila en previo no tiene nada que
-    # congelar y correctamente no se cuenta como "omitido" (ver
-    # cerrar_temporada_completa en routes/temporadas.py).
-    cur.execute("""
-        SELECT COUNT(*) AS n FROM clientes c
-        WHERE c.temporada_cerrada = 1
-          AND EXISTS (
-              SELECT 1 FROM previo p WHERE UPPER(TRIM(p.clave)) = UPPER(TRIM(c.clave))
-          )
-    """)
-    n_cerrados = cur.fetchone()['n']
-    assert n_cerrados > 0, "Se esperaba al menos un cliente ya cerrado en la BD local para esta prueba"
+    cur.execute("SELECT temporada_cerrada, fecha_cierre_temporada FROM clientes WHERE clave = 'HA433'")
+    backup_cierre = cur.fetchone()
 
-    cur.execute("""
-        SELECT clave, acumulado_anticipado, avance_global_scott,
-               avance_global_apparel_syncros_vittoria
-        FROM previo WHERE clave = 'HA433'
-    """)
-    previo_antes = cur.fetchone()
+    try:
+        cur_w.execute(
+            "UPDATE clientes SET temporada_cerrada = 1, fecha_cierre_temporada = '2026-05-31' WHERE clave = 'HA433'"
+        )
+        conn.commit()
 
-    resultado = cerrar_temporada_completa('2025-2026', dry_run=True)
+        # Solo cuentan los cerrados que tienen una fila real en `previo` que
+        # preservar -- un cliente cerrado sin fila en previo no tiene nada que
+        # congelar y correctamente no se cuenta como "omitido" (ver
+        # cerrar_temporada_completa en routes/temporadas.py).
+        cur.execute("""
+            SELECT COUNT(*) AS n FROM clientes c
+            WHERE c.temporada_cerrada = 1
+              AND EXISTS (
+                  SELECT 1 FROM previo p WHERE UPPER(TRIM(p.clave)) = UPPER(TRIM(c.clave))
+              )
+        """)
+        n_cerrados = cur.fetchone()['n']
+        assert n_cerrados > 0, "Se esperaba al menos un cliente ya cerrado en la BD local para esta prueba"
 
-    cur.execute("""
-        SELECT clave, acumulado_anticipado, avance_global_scott,
-               avance_global_apparel_syncros_vittoria
-        FROM previo WHERE clave = 'HA433'
-    """)
-    previo_despues = cur.fetchone()
+        cur.execute("""
+            SELECT clave, acumulado_anticipado, avance_global_scott,
+                   avance_global_apparel_syncros_vittoria
+            FROM previo WHERE clave = 'HA433'
+        """)
+        previo_antes = cur.fetchone()
 
-    assert resultado['clientes_omitidos_ya_cerrados'] == n_cerrados
-    # HA433 nunca debe aparecer en el preview de clientes procesados
-    assert all(fila['clave'] != 'HA433' for fila in resultado['preview'])
-    # Su previo debe permanecer exactamente igual (no fue recalculado)
-    assert previo_antes == previo_despues
+        resultado = cerrar_temporada_completa('2025-2026', dry_run=True)
 
-    cur.close(); conn.close()
+        cur.execute("""
+            SELECT clave, acumulado_anticipado, avance_global_scott,
+                   avance_global_apparel_syncros_vittoria
+            FROM previo WHERE clave = 'HA433'
+        """)
+        previo_despues = cur.fetchone()
+
+        assert resultado['clientes_omitidos_ya_cerrados'] == n_cerrados
+        # El preview mezcla cerrados y recalculados (marcados con
+        # 'cerrado_individualmente'); si HA433 aparece, debe venir marcado
+        # como cerrado -- nunca como recalculado.
+        fila_ha433 = next((f for f in resultado['preview'] if f['clave'] == 'HA433'), None)
+        if fila_ha433 is not None:
+            assert fila_ha433.get('cerrado_individualmente') is True
+        # Su previo debe permanecer exactamente igual (no fue recalculado)
+        assert previo_antes == previo_despues
+    finally:
+        cur_w.execute(
+            "UPDATE clientes SET temporada_cerrada = %s, fecha_cierre_temporada = %s WHERE clave = 'HA433'",
+            (backup_cierre['temporada_cerrada'], backup_cierre['fecha_cierre_temporada'])
+        )
+        conn.commit()
+        cur.close(); cur_w.close(); conn.close()
 
 
 def test_no_reejecuta_cierre_real_de_temporada_ya_cerrada():
