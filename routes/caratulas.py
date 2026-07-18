@@ -435,6 +435,8 @@ def obtener_datos_previo():
                 for key, value in fila.items():
                     if isinstance(value, Decimal):
                         fila[key] = float(value)
+                    elif hasattr(value, 'strftime'):
+                        fila[key] = value.strftime('%Y-%m-%d')
                         
         return jsonify(resultados), 200
     except Exception as e:
@@ -501,6 +503,8 @@ def obtener_datos_previo_historico():
                 for key, value in fila.items():
                     if isinstance(value, Decimal):
                         fila[key] = float(value)
+                    elif hasattr(value, 'strftime'):
+                        fila[key] = value.strftime('%Y-%m-%d')
         return jsonify(resultados), 200
     except Exception as e:
         logging.exception("Error en obtener_datos_previo_historico")
@@ -531,6 +535,8 @@ def obtener_datos_evac_a_historico():
                 for key, value in fila.items():
                     if isinstance(value, Decimal):
                         fila[key] = float(value)
+                    elif hasattr(value, 'strftime'):
+                        fila[key] = value.strftime('%Y-%m-%d')
         return jsonify(resultados), 200
     except Exception as e:
         logging.exception("Error en obtener_datos_evac_a_historico")
@@ -561,6 +567,8 @@ def obtener_datos_evac_b_historico():
                 for key, value in fila.items():
                     if isinstance(value, Decimal):
                         fila[key] = float(value)
+                    elif hasattr(value, 'strftime'):
+                        fila[key] = value.strftime('%Y-%m-%d')
         return jsonify(resultados), 200
     except Exception as e:
         logging.exception("Error en obtener_datos_evac_b_historico")
