@@ -1939,3 +1939,70 @@ def detalle_compras_odoo():
         tb = traceback.format_exc()
         logging.exception('detalle_compras_odoo: excepción inesperada')
         return jsonify({'error': str(e), 'trace': tb}), 500
+
+
+@caratulas_bp.route('/ventas_no_registradas', methods=['GET'])
+def ventas_no_registradas():
+    """Total de ventas en `monitor` que no corresponden a ningun cliente
+    registrado -- ni por clave en `clientes`/`clientes_multimarcas`, ni por
+    nombre en `clientes_multimarcas.cliente_razon_social` -- pero que SI
+    forman parte del acumulado general de la comercializadora (Caratula
+    Global). Acepta ?fecha_desde=&fecha_hasta= opcionales (YYYY-MM-DD).
+    """
+    conexion = None
+    cursor = None
+    try:
+        fecha_desde = request.args.get('fecha_desde')
+        fecha_hasta = request.args.get('fecha_hasta')
+
+        conexion = obtener_conexion()
+        cursor = conexion.cursor(dictionary=True)
+
+        # NOT EXISTS correlacionado en vez de NOT IN (SELECT ...): con los
+        # indices en monitor.contacto_referencia/contacto_nombre y
+        # clientes_multimarcas.clave/cliente_razon_social, MariaDB resuelve
+        # esto con lookups indexados por fila en vez de escanear las
+        # subconsultas repetidamente -- bajo de ~2.7s a milisegundos.
+        params = []
+        filtro_fecha = ""
+        if fecha_desde:
+            filtro_fecha += " AND m.fecha_factura >= %s"
+            params.append(fecha_desde)
+        if fecha_hasta:
+            filtro_fecha += " AND m.fecha_factura <= %s"
+            params.append(fecha_hasta)
+
+        query = f"""
+            SELECT COALESCE(SUM(m.venta_total), 0) AS total, COUNT(*) AS filas
+            FROM monitor m
+            WHERE NOT EXISTS (
+                SELECT 1 FROM clientes c
+                WHERE UPPER(TRIM(c.clave)) = UPPER(TRIM(m.contacto_referencia)) AND c.clave <> ''
+            )
+            AND NOT EXISTS (
+                SELECT 1 FROM clientes_multimarcas cm
+                WHERE UPPER(TRIM(cm.clave)) = UPPER(TRIM(m.contacto_referencia)) AND cm.clave <> ''
+            )
+            AND NOT EXISTS (
+                SELECT 1 FROM clientes_multimarcas cm2
+                WHERE UPPER(TRIM(cm2.cliente_razon_social)) = UPPER(TRIM(m.contacto_nombre))
+                  AND cm2.cliente_razon_social <> ''
+            )
+            {filtro_fecha}
+        """
+        cursor.execute(query, tuple(params))
+        fila = cursor.fetchone()
+
+        return jsonify({
+            'total': float(fila['total'] or 0),
+            'filas': fila['filas'],
+        }), 200
+
+    except Exception as e:
+        logging.exception('ventas_no_registradas: error')
+        return jsonify({'error': str(e)}), 500
+    finally:
+        if cursor:
+            cursor.close()
+        if conexion and conexion.is_connected():
+            conexion.close()

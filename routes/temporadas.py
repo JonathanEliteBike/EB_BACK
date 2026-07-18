@@ -149,18 +149,19 @@ def cerrar_temporada_completa(etiqueta: str, dry_run: bool = True) -> dict:
         # desde el selector histórico, en vez de quedar fuera por completo.
         _campos_previo_directo = [c for c in _COLUMNAS_PREVIO_HISTORICO if c not in ('id_previo', 'clave')]
         cur_dict.execute(f"""
-            SELECT id, clave, {', '.join(_campos_previo_directo)}
-            FROM previo
-            WHERE UPPER(TRIM(clave)) IN (
-                SELECT UPPER(TRIM(clave)) FROM clientes
-                WHERE clave IS NOT NULL AND clave <> '' AND temporada_cerrada = 1
-            )
+            SELECT p.id, p.clave, {', '.join(f'p.{c}' for c in _campos_previo_directo)},
+                   c.fecha_cierre_temporada, c.fecha_cierre_apparel
+            FROM previo p
+            JOIN clientes c ON UPPER(TRIM(c.clave)) = UPPER(TRIM(p.clave))
+            WHERE c.clave IS NOT NULL AND c.clave <> '' AND c.temporada_cerrada = 1
         """)
         cerrados_previo = cur_dict.fetchall()
         omitidos = len(cerrados_previo)
 
         for fila_cerrada in cerrados_previo:
             fila_cerrada['id_previo'] = fila_cerrada['id']
+            fila_cerrada['temporada_cerrada'] = 1
+            # fecha_cierre_temporada/fecha_cierre_apparel ya vienen del JOIN con clientes
             filas_historico.append(fila_cerrada)
             if len(preview) < 3:
                 preview.append({
@@ -186,7 +187,10 @@ def cerrar_temporada_completa(etiqueta: str, dry_run: bool = True) -> dict:
             )
             estatico = cur_dict.fetchone()
 
-            fila = {**estatico, **valores, 'clave': clave, 'es_integral': 0, 'id_previo': valores['id']}
+            fila = {
+                **estatico, **valores, 'clave': clave, 'es_integral': 0, 'id_previo': valores['id'],
+                'temporada_cerrada': 1, 'fecha_cierre_temporada': fecha_fin_temporada, 'fecha_cierre_apparel': None,
+            }
             filas_historico.append(fila)
             procesados += 1
 
@@ -222,6 +226,9 @@ def cerrar_temporada_completa(etiqueta: str, dry_run: bool = True) -> dict:
                     'clave': None,  # se sobreescribe abajo con la clave real de la fila Integral
                     'es_integral': 1,
                     'id_previo': grupo_row['id'],
+                    'temporada_cerrada': 1,
+                    'fecha_cierre_temporada': fecha_fin_temporada,
+                    'fecha_cierre_apparel': None,
                     'porcentaje_global': _pct(sumas['avance_global'], float(grupo_row.get('compra_minima_inicial') or 0)),
                     'porcentaje_anual': _pct(sumas['avance_global'], float(grupo_row.get('compra_minima_anual') or 0)),
                     'porcentaje_scott': _pct(sumas['avance_global_scott'], float(grupo_row.get('compromiso_scott') or 0)),
@@ -240,15 +247,17 @@ def cerrar_temporada_completa(etiqueta: str, dry_run: bool = True) -> dict:
                 filas_historico.append(fila_grupo)
 
         if not dry_run:
+            _campos_cierre = ['temporada_cerrada', 'fecha_cierre_temporada', 'fecha_cierre_apparel']
+            _columnas_insert = _COLUMNAS_PREVIO_HISTORICO + _campos_cierre
             filas_valores = [
-                tuple(fila.get(col) for col in _COLUMNAS_PREVIO_HISTORICO)
+                tuple(fila.get(col) for col in _columnas_insert)
                 for fila in filas_historico
             ]
             cur.executemany(
                 f"""INSERT INTO previo_historico (
-                    temporada, fecha_snapshot, {', '.join(_COLUMNAS_PREVIO_HISTORICO)}
+                    temporada, fecha_snapshot, {', '.join(_columnas_insert)}
                 ) VALUES (
-                    %s, NOW(), {', '.join(['%s'] * len(_COLUMNAS_PREVIO_HISTORICO))}
+                    %s, NOW(), {', '.join(['%s'] * len(_columnas_insert))}
                 )""",
                 [(etiqueta, *valores_fila) for valores_fila in filas_valores]
             )
@@ -335,7 +344,8 @@ def abrir_temporada(etiqueta: str) -> int:
             dia = c['dia_inicio_temporada'] or '07-01'
             f_inicio_nuevo = f"{anio_inicio}-{dia}"
             cur.execute(
-                "UPDATE clientes SET f_inicio = %s, temporada_cerrada = 0, fecha_cierre_temporada = NULL, f_fin = NULL "
+                "UPDATE clientes SET f_inicio = %s, temporada_cerrada = 0, fecha_cierre_temporada = NULL, "
+                "fecha_cierre_apparel = NULL, f_fin = NULL "
                 "WHERE clave = %s",
                 (f_inicio_nuevo, c['clave'])
             )

@@ -3087,8 +3087,8 @@ def obtener_retroactivos():
                 porcentaje_retroactivo, porcentaje_retroactivo_apparel,
                 retroactivo_total, importe, estatus, fecha_aplicacion, NC, FACT
             FROM tabla_retroactivos
-            WHERE COALESCE(CATEGORIA, '') != 'Distribuidor'
-            ORDER BY 
+            WHERE CATEGORIA IS NOT NULL AND CATEGORIA != 'Distribuidor'
+            ORDER BY
                 CASE 
                     WHEN ZONA = 'A' THEN 1 
                     WHEN ZONA = 'B' THEN 2 
