@@ -1707,7 +1707,15 @@ def detalle_compras_odoo():
         resultado = []
         filas_planas = []
 
-        # Pre-cargar SKUs del forecast para marcar líneas con de_proyeccion
+        # Periodo activo (MY27 = 2026-2027): deriva del mes actual
+        from datetime import date as _date
+        _hoy = _date.today()
+        _py1 = _hoy.year if _hoy.month >= 7 else _hoy.year - 1
+        _periodo_activo = f'{_py1}-{_py1 + 1}'
+        _periodo_start  = f'{_py1}-07-01'   # inicio MY27: 2026-07-01
+        _periodo_end    = f'{_py1 + 1}-06-30'  # fin MY27: 2027-06-30
+
+        # Pre-cargar SKUs del forecast (solo periodo activo) para marcar líneas con de_proyeccion
         def _norm_fc(s): return re.sub(r'[\-\s]', '', str(s or '')).upper()
         _forecast_skus: set = set()
         try:
@@ -1716,15 +1724,15 @@ def detalle_compras_odoo():
             if grupo_odoo:
                 _cur_fc.execute(
                     "SELECT sku FROM forecast_proyecciones "
-                    "WHERE clave_cliente IN "
+                    "WHERE periodo = %s AND clave_cliente IN "
                     "  (SELECT clave FROM clientes WHERE id_grupo = %s)",
-                    (grupo_odoo,)
+                    (_periodo_activo, grupo_odoo)
                 )
             else:
                 _cur_fc.execute(
                     "SELECT sku FROM forecast_proyecciones "
-                    "WHERE clave_cliente = %s",
-                    (cliente,)
+                    "WHERE periodo = %s AND clave_cliente = %s",
+                    (_periodo_activo, cliente)
                 )
             _forecast_skus = {_norm_fc(r['sku']) for r in _cur_fc.fetchall()}
             _cur_fc.close()
@@ -1892,7 +1900,10 @@ def detalle_compras_odoo():
                     'estatus_out': estatus_out_lin,
                     'fecha_esperada': fecha_esp_final,
                     'po_name': po_name_final,
-                    'de_proyeccion': _norm_fc(lin.get('clave_producto')) in _forecast_skus,
+                    'de_proyeccion': (
+                        _norm_fc(lin.get('clave_producto')) in _forecast_skus
+                        and _periodo_start <= (o.get('date_order') or '')[:10] <= _periodo_end
+                    ),
                     'etiquetas': order_obj['etiquetas'],
                 })
 

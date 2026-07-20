@@ -3230,15 +3230,22 @@ def listar_forecast():
                 f.sku,
                 COALESCE(p.nombre_producto, ep.nombre, f.producto, f.sku) AS producto,
                 CASE
-                    WHEN COALESCE(p.marca, ep.marca) IS NOT NULL AND COALESCE(p.marca, ep.marca) != 'N/A'
+                    WHEN COALESCE(p.marca, ep.marca) IS NOT NULL AND COALESCE(p.marca, ep.marca) NOT IN ('N/A', 'BICIS', 'BICICLETAS')
                          THEN COALESCE(p.marca, ep.marca)
-                    WHEN f.marca IS NOT NULL AND f.marca != 'N/A' THEN f.marca
+                    WHEN f.marca IS NOT NULL AND f.marca NOT IN ('N/A', 'BICIS', 'BICICLETAS') THEN f.marca
                     WHEN UPPER(COALESCE(p.nombre_producto, ep.nombre, f.producto, '')) LIKE '%SCOTT%'   THEN 'SCOTT'
                     WHEN UPPER(COALESCE(p.nombre_producto, ep.nombre, f.producto, '')) LIKE '%MEGAMO%'  THEN 'MEGAMO'
                     WHEN UPPER(COALESCE(p.nombre_producto, ep.nombre, f.producto, '')) LIKE '%SYNCROS%' THEN 'SYNCROS'
                     ELSE COALESCE(p.marca, ep.marca, f.marca, 'N/A')
                 END AS marca,
-                COALESCE(p.categoria,       ep.modelo, f.modelo)          AS modelo,
+                CASE
+                    WHEN COALESCE(p.categoria, '') LIKE '% / %'
+                         THEN TRIM(SUBSTRING_INDEX(p.categoria, ' / ', -1))
+                    WHEN COALESCE(p.categoria, '') NOT IN ('', 'N/A', 'BICIS', 'BICICLETAS')
+                         THEN p.categoria
+                    ELSE COALESCE(f.modelo, ep.modelo, '')
+                END AS modelo,
+                p.categoria AS categ_path,
                 COALESCE(p.color,           ep.color,  f.color)           AS color,
                 COALESCE(p.talla,           ep.talla,  f.talla)           AS talla,
                 COALESCE(f.mayo, 0) AS mayo,
@@ -3647,11 +3654,9 @@ def avance_forecast():
 
     m = re.match(r'^(\d{4})-(\d{4})$', periodo)
     year1, year2 = int(m.group(1)), int(m.group(2))
-    # Empezamos desde Jul del año anterior al periodo (igual que detalle_compras_odoo),
-    # para capturar órdenes pre-temporada que el cliente coloca antes del 1 de mayo.
-    # Ejemplo: periodo 2026-2027 → buscar órdenes desde 2025-07-01 hasta 2027-04-30.
-    fecha_inicio = f'{year1 - 1}-07-01'
-    fecha_fin    = f'{year2}-04-30'
+    # MY27 = 1 Jul year1 → 30 Jun year2 (el periodo completo de la temporada)
+    fecha_inicio = f'{year1}-07-01'
+    fecha_fin    = f'{year2}-06-30'
 
     def _norm(s: str) -> str:
         """Remove hyphens/spaces, uppercase — for fuzzy SKU matching."""
@@ -3916,8 +3921,8 @@ def avance_forecast_integral():
 
     m = re.match(r'^(\d{4})-(\d{4})$', periodo)
     year1, year2 = int(m.group(1)), int(m.group(2))
-    fecha_inicio = f'{year1 - 1}-07-01'
-    fecha_fin    = f'{year2}-04-30'
+    fecha_inicio = f'{year1}-07-01'
+    fecha_fin    = f'{year2}-06-30'
 
     def _norm(s: str) -> str:
         return re.sub(r'[\-\s]', '', str(s or '')).upper()
