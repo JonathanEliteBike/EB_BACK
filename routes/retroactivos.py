@@ -2441,11 +2441,14 @@ def _calcular_valores_previo_clave(cursor_dict, clave, f_inicio, fecha_cierre):
     Regresa None si la clave no tiene fila en `previo` (o es un renglon
     Integral -- esos se calculan aparte, sumando a sus miembros).
     """
+    # SCOTT_COND: cualquier venta SCOTT/MEGAMO que no sea apparel (bicicletas,
+    # refacciones, cuadros, kits de conversion, accesorios, soporte de ventas...)
+    # cuenta como "SCOTT" -- asi acumulado_anticipado (= scott + app_global) cuadra
+    # siempre con el total real de monitor, sin dejar ventas fuera de ambos buckets.
     SCOTT_COND = """(
         (
             UPPER(TRIM(m.marca)) IN ('SCOTT', 'MEGAMO')
-            AND (UPPER(TRIM(m.subcategoria)) = 'BICICLETA' OR UPPER(m.nombre_producto) LIKE '%%BICICLETA%%')
-            AND (UPPER(TRIM(m.apparel)) = 'NO' OR UPPER(m.nombre_producto) LIKE '%%BICICLETA%%')
+            AND UPPER(TRIM(COALESCE(m.apparel, ''))) != 'SI'
         )
         OR (UPPER(TRIM(m.marca)) = 'BOLD' AND UPPER(TRIM(m.subcategoria)) = 'BICICLETA')
     )"""
@@ -2527,13 +2530,15 @@ def _calcular_valores_previo_clave(cursor_dict, clave, f_inicio, fecha_cierre):
     vittoria = flt(row.get('vittoria'))
     bold     = flt(row.get('bold'))
     scott    = flt(row.get('scott'))
-    acum_total = round(flt(row.get('total_bruto')), 2)
 
     p_syncros  = {p: flt(row.get(f'syncros_{p}'))  for p in PERIODS}
     p_apparel  = {p: flt(row.get(f'apparel_{p}'))  for p in PERIODS}
     p_vittoria = {p: flt(row.get(f'vittoria_{p}')) for p in PERIODS}
     p_scott    = {p: flt(row.get(f'scott_{p}'))    for p in PERIODS}
     app_global = round(syncros + apparel + vittoria, 2)
+    # acumulado_anticipado = SCOTT + APPAREL,SYNCROS,VITTORIA (mismo criterio que
+    # "Resumen Acumulado"), no el total bruto de monitor.
+    acum_total = round(scott + app_global, 2)
     p_app = {p: round(p_syncros[p] + p_apparel[p] + p_vittoria[p], 2) for p in PERIODS}
 
     cm_ini = flt(previo_row.get('compra_minima_inicial'))

@@ -690,6 +690,13 @@ def sync_monitor_odoo():
                 nombre = nombre[6:]
             elif nombre.startswith('All/'):
                 nombre = nombre[4:]
+            nombre = nombre.strip()
+            # Algunas categorías de Odoo traen un segmento numérico espurio antes de
+            # la marca real (ej. "25161506 / MEGAMO / BICICLETA / ...") que hace que
+            # `marca` termine siendo ese ID en vez de "MEGAMO" -- se descarta.
+            partes_raw = [p.strip() for p in nombre.split('/')]
+            if partes_raw and partes_raw[0].isdigit():
+                nombre = ' / '.join(partes_raw[1:])
             categs_map[c['id']] = nombre.strip()
 
         # ── 6. Partners en batch ──────────────────────────────────────────────
@@ -938,18 +945,15 @@ def _recalcular_acumulados_previo(conexion, cursor):
     R_MAR_ABR_INI, R_MAR_ABR_FIN = _rangos['mar_abr']
     R_MAY_JUN_INI, R_MAY_JUN_FIN = _rangos['may_jun']
 
+    # Cualquier venta SCOTT/MEGAMO que no sea apparel (bicicletas, refacciones,
+    # cuadros, kits de conversion, accesorios, soporte de ventas...) cuenta como
+    # "SCOTT" -- asi acumulado_anticipado (= scott + app_global) cuadra siempre
+    # con el total real de monitor, sin dejar ventas fuera de ambos buckets.
     SCOTT_COND = """
         (
             (
                 UPPER(TRIM(m.marca)) IN ('SCOTT', 'MEGAMO')
-                AND (
-                    UPPER(TRIM(m.subcategoria)) = 'BICICLETA'
-                    OR UPPER(m.nombre_producto) LIKE '%%BICICLETA%%'
-                )
-                AND (
-                    UPPER(TRIM(m.apparel)) = 'NO'
-                    OR UPPER(m.nombre_producto) LIKE '%%BICICLETA%%'
-                )
+                AND UPPER(TRIM(COALESCE(m.apparel, ''))) != 'SI'
             )
             OR
             (
@@ -1146,7 +1150,6 @@ def _recalcular_acumulados_previo(conexion, cursor):
             vittoria = sf(claves, 'vittoria')
             bold     = sf(claves, 'bold')
             scott    = sf(claves, 'scott')
-            total_bruto = sf(claves, 'total_bruto')
             p_syncros  = {p: sf(claves, f'syncros_{p}')  for p in PERIODS}
             p_apparel  = {p: sf(claves, f'apparel_{p}')  for p in PERIODS}
             p_vittoria = {p: sf(claves, f'vittoria_{p}') for p in PERIODS}
@@ -1161,7 +1164,6 @@ def _recalcular_acumulados_previo(conexion, cursor):
             vittoria = flt(row.get('vittoria'))
             bold     = flt(row.get('bold'))
             scott    = flt(row.get('scott'))
-            total_bruto = flt(row.get('total_bruto'))
             p_syncros  = {p: flt(row.get(f'syncros_{p}'))  for p in PERIODS}
             p_apparel  = {p: flt(row.get(f'apparel_{p}'))  for p in PERIODS}
             p_vittoria = {p: flt(row.get(f'vittoria_{p}')) for p in PERIODS}
@@ -1169,7 +1171,12 @@ def _recalcular_acumulados_previo(conexion, cursor):
 
 
         app_global = round(syncros + apparel + vittoria, 2)
-        acum_total = round(total_bruto, 2)
+        # acumulado_anticipado / avance_global = SCOTT + APPAREL,SYNCROS,VITTORIA
+        # (las mismas dos categorías que se muestran en "Resumen Acumulado"), no el
+        # total bruto de monitor -- así "Avance" siempre cuadra exactamente con la
+        # suma de esas dos categorías. Ventas fuera de ambas (repuestos, accesorios,
+        # productos sin categoría en Odoo) no cuentan para la Compra Mínima.
+        acum_total = round(scott + app_global, 2)
         p_app = {p: round(p_syncros[p] + p_apparel[p] + p_vittoria[p], 2) for p in PERIODS}
 
         cm_ini = flt(fila.get('compra_minima_inicial'))
