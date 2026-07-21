@@ -137,6 +137,16 @@ CAMPOS_COSTOS = [
 ]
 
 
+# Campos "proyectado" (fechas plan) — son columnas editables pero no cuentan
+# para el progreso, por eso no están en las listas CAMPOS_*. Deben permitirse
+# explícitamente en INSERT/UPDATE o se filtran silenciosamente al guardar.
+_CAMPOS_PROG = [
+    "log_fecha_entrega_prog", "log_fecha_booking_prog",
+    "imp_llegada_contenedor_prog", "des_fecha_cruce_prog",
+    "des_fecha_entrega_almacen_prog", "rec_recepcion_odoo_prog",
+    "rec_liberacion_verificacion_prog", "rec_liberacion_final_prog",
+]
+
 _COLS_PERMITIDAS: set = (
     set(CAMPOS_LOGISTICA)
     | set(CAMPOS_IMPORTACION)
@@ -146,6 +156,7 @@ _COLS_PERMITIDAS: set = (
     | set(CAMPOS_RECEPCION)
     | set(CAMPOS_CIERRE)
     | set(CAMPOS_COSTOS)
+    | set(_CAMPOS_PROG)
     | {
         "referencia", "nombre", "estado", "via_transporte", "notas",
     }
