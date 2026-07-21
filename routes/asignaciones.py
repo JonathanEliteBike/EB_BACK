@@ -678,7 +678,6 @@ def obtener_asignacion(asignacion_id):
         cursor.close()
         conexion.close()
 
-
 # ============================================================
 # POST: CREAR ASIGNACIÓN
 # ============================================================
@@ -743,11 +742,8 @@ def crear_asignacion():
                 puesto,
                 correo,
                 estado
-
             FROM inventario_colaboradores
-
             WHERE id = %s
-
             FOR UPDATE
         """, (colaborador_id,))
 
@@ -790,11 +786,8 @@ def crear_asignacion():
                 departamento,
                 cargo,
                 responsiva_estado
-
             FROM inventario_equipos
-
             WHERE id = %s
-
             FOR UPDATE
         """, (equipo_id,))
 
@@ -837,8 +830,7 @@ def crear_asignacion():
 
             return jsonify({
                 "error": (
-                    "El equipo ya tiene una asignación "
-                    "activa."
+                    "El equipo ya tiene una asignación activa."
                 )
             }), 409
 
@@ -874,7 +866,85 @@ def crear_asignacion():
         asignacion_id = cursor.lastrowid
 
         # ----------------------------------------------------
-        # 5. ACTUALIZAR EL EQUIPO
+        # 5. GENERAR FOLIO DE RESPONSIVA
+        # ----------------------------------------------------
+
+        año_actual = datetime.now().year
+
+        cursor.execute("""
+            SELECT folio
+            FROM inventario_responsivas
+            WHERE folio LIKE %s
+            ORDER BY id DESC
+            LIMIT 1
+            FOR UPDATE
+        """, (
+            f"RESP-{año_actual}-%",
+        ))
+
+        ultima_responsiva = cursor.fetchone()
+
+        consecutivo = 1
+
+        if (
+            ultima_responsiva
+            and ultima_responsiva.get("folio")
+        ):
+            try:
+                consecutivo = (
+                    int(
+                        ultima_responsiva[
+                            "folio"
+                        ].split("-")[-1]
+                    ) + 1
+                )
+            except (
+                ValueError,
+                IndexError
+            ):
+                consecutivo = 1
+
+        folio_responsiva = (
+            f"RESP-{año_actual}-"
+            f"{consecutivo:06d}"
+        )
+
+        # ----------------------------------------------------
+        # 6. CREAR RESPONSIVA PENDIENTE
+        # ----------------------------------------------------
+
+        cursor.execute("""
+            INSERT INTO inventario_responsivas (
+                asignacion_id,
+                equipo_id,
+                colaborador_id,
+                folio,
+                responsable,
+                departamento,
+                estado,
+                fecha_generacion
+            )
+            VALUES (
+                %s,
+                %s,
+                %s,
+                %s,
+                %s,
+                %s,
+                'Pendiente',
+                CURRENT_TIMESTAMP
+            )
+        """, (
+            asignacion_id,
+            equipo_id,
+            colaborador_id,
+            folio_responsiva,
+            nombre_responsable,
+            colaborador["departamento"]
+        ))
+
+        # ----------------------------------------------------
+        # 7. ACTUALIZAR EL EQUIPO
         # ----------------------------------------------------
 
         cursor.execute("""
@@ -894,14 +964,15 @@ def crear_asignacion():
         ))
 
         # ----------------------------------------------------
-        # 6. REGISTRAR MOVIMIENTO
+        # 8. REGISTRAR MOVIMIENTO
         # ----------------------------------------------------
 
         descripcion_movimiento = (
             f"Asignación del equipo "
             f"{equipo['numero_inventario']} "
             f"a {nombre_responsable}. "
-            f"Asignación #{asignacion_id}."
+            f"Asignación #{asignacion_id}. "
+            f"Responsiva {folio_responsiva}."
         )
 
         cursor.execute("""
@@ -938,7 +1009,8 @@ def crear_asignacion():
             ),
             "id": asignacion_id,
             "equipoId": equipo_id,
-            "colaboradorId": colaborador_id
+            "colaboradorId": colaborador_id,
+            "folioResponsiva": folio_responsiva
         }), 201
 
     except Exception as error:
@@ -947,194 +1019,6 @@ def crear_asignacion():
         return jsonify({
             "error": (
                 "No se pudo crear la asignación."
-            ),
-            "detalle": str(error)
-        }), 500
-
-    finally:
-        cursor.close()
-        conexion.close()
-
-
-# ============================================================
-# PUT: FINALIZAR ASIGNACIÓN / DEVOLVER EQUIPO
-# ============================================================
-
-@asignaciones_bp.route(
-    "/<int:asignacion_id>/finalizar",
-    methods=["PUT"]
-)
-def finalizar_asignacion(asignacion_id):
-    data = request.get_json(silent=True) or {}
-
-    try:
-        fecha_devolucion = normalizar_fecha_hora(
-            data.get("fechaDevolucion")
-        )
-
-    except ValueError as error:
-        return jsonify({
-            "error": str(error)
-        }), 400
-
-    observaciones_devolucion = limpiar_texto(
-        data.get("observacionesDevolucion")
-    )
-
-    usuario_registro = limpiar_texto(
-        data.get("usuarioRegistro")
-    ) or "Sistema"
-
-    conexion = obtener_conexion()
-    cursor = conexion.cursor(dictionary=True)
-
-    try:
-        conexion.start_transaction()
-
-        # ----------------------------------------------------
-        # 1. BLOQUEAR ASIGNACIÓN
-        # ----------------------------------------------------
-
-        cursor.execute("""
-            SELECT
-                a.id,
-                a.equipo_id,
-                a.colaborador_id,
-                a.estado,
-                a.fecha_asignacion,
-
-                e.numero_inventario,
-                e.responsable,
-
-                c.nombre,
-                c.apellido_paterno,
-                c.apellido_materno
-
-            FROM inventario_asignaciones a
-
-            INNER JOIN inventario_equipos e
-                ON e.id = a.equipo_id
-
-            INNER JOIN inventario_colaboradores c
-                ON c.id = a.colaborador_id
-
-            WHERE a.id = %s
-
-            FOR UPDATE
-        """, (asignacion_id,))
-
-        asignacion = cursor.fetchone()
-
-        if not asignacion:
-            conexion.rollback()
-
-            return jsonify({
-                "error": "Asignación no encontrada."
-            }), 404
-
-        if asignacion["estado"] != "Activa":
-            conexion.rollback()
-
-            return jsonify({
-                "error": (
-                    "La asignación ya no está activa."
-                )
-            }), 409
-
-        equipo_id = asignacion["equipo_id"]
-
-        nombre_responsable = (
-            nombre_completo_colaborador(
-                asignacion
-            )
-        )
-
-        # ----------------------------------------------------
-        # 2. FINALIZAR ASIGNACIÓN
-        # ----------------------------------------------------
-
-        cursor.execute("""
-            UPDATE inventario_asignaciones
-            SET
-                fecha_devolucion = %s,
-                estado = 'Finalizada',
-                observaciones_devolucion = %s
-            WHERE id = %s
-        """, (
-            fecha_devolucion,
-            observaciones_devolucion,
-            asignacion_id
-        ))
-
-        # ----------------------------------------------------
-        # 3. LIBERAR EL EQUIPO
-        # ----------------------------------------------------
-
-        cursor.execute("""
-            UPDATE inventario_equipos
-            SET
-                responsable = NULL,
-                departamento = NULL,
-                cargo = NULL,
-                estado = 'Disponible',
-                responsiva_estado = 'No aplica'
-            WHERE id = %s
-        """, (equipo_id,))
-
-        # ----------------------------------------------------
-        # 4. REGISTRAR MOVIMIENTO
-        # ----------------------------------------------------
-
-        descripcion_movimiento = (
-            f"Devolución del equipo "
-            f"{asignacion['numero_inventario']} "
-            f"por {nombre_responsable}. "
-            f"Asignación #{asignacion_id} finalizada."
-        )
-
-        cursor.execute("""
-            INSERT INTO inventario_movimientos (
-                equipo_id,
-                tipo_movimiento,
-                descripcion,
-                responsable_anterior,
-                responsable_nuevo,
-                usuario_registro
-            )
-            VALUES (
-                %s,
-                %s,
-                %s,
-                %s,
-                %s,
-                %s
-            )
-        """, (
-            equipo_id,
-            "Devolución",
-            descripcion_movimiento,
-            nombre_responsable,
-            None,
-            usuario_registro
-        ))
-
-        conexion.commit()
-
-        return jsonify({
-            "message": (
-                "Asignación finalizada correctamente."
-            ),
-            "id": asignacion_id,
-            "equipoId": equipo_id,
-            "estado": "Finalizada"
-        })
-
-    except Exception as error:
-        conexion.rollback()
-
-        return jsonify({
-            "error": (
-                "No se pudo finalizar la asignación."
             ),
             "detalle": str(error)
         }), 500
