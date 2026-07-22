@@ -4,11 +4,23 @@ import requests
 import pytz
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
+from apscheduler.triggers.interval import IntervalTrigger
+from datetime import datetime, timedelta
 
 logger = logging.getLogger(__name__)
 
 MEXICO_TZ = pytz.timezone('America/Mexico_City')
 _scheduler = None
+
+
+def _run_precalentar():
+    """Precalienta el caché Redis de detalle-compras-odoo para todos los clientes."""
+    try:
+        from routes.caratulas import iniciar_precalentamiento
+        n = iniciar_precalentamiento()
+        logger.info('[SCHEDULER] Precalentamiento Redis iniciado para %d clientes', n)
+    except Exception as e:
+        logger.error('[SCHEDULER] Error al precalentar Redis: %s', e)
 
 
 def _run_sync_diario():
@@ -76,7 +88,26 @@ def init_scheduler():
         misfire_grace_time=300   # si el servidor estaba apagado, corre hasta 5 min tarde
     )
 
+    # Pre-calentamiento Redis: disparo inicial a los 10 s de startup
+    _scheduler.add_job(
+        _run_precalentar,
+        'date',
+        run_date=datetime.now(MEXICO_TZ) + timedelta(seconds=10),
+        id='precalentar_startup',
+        name='Pre-calentar Redis al arranque (10 s delay)',
+        replace_existing=True,
+    )
+
+    # Pre-calentamiento Redis: recurrente cada 25 min (TTL del caché = 30 min)
+    _scheduler.add_job(
+        _run_precalentar,
+        IntervalTrigger(minutes=25),
+        id='precalentar_periodico',
+        name='Pre-calentar Redis Monitor Pedidos (cada 25 min)',
+        replace_existing=True,
+    )
+
     _scheduler.start()
 
     next_run = _scheduler.get_job('sync_diario_retroactivos').next_run_time
-    logger.info('[SCHEDULER] Iniciado. Próxima ejecución: %s', next_run)
+    logger.info('[SCHEDULER] Iniciado. Próxima ejecución sync: %s', next_run)
