@@ -36,6 +36,7 @@ from routes.asignaciones import asignaciones_bp
 from routes.responsivas import responsivas_bp
 from routes.historial import historial_bp
 from routes.auditorias import auditorias_bp
+from routes.reportes import reportes_bp
 # Importamos la instancia de Celery desde celery_worker
 from celery_worker import celery_app as celery
 
@@ -157,6 +158,7 @@ def create_app():
     app.register_blueprint(responsivas_bp)
     app.register_blueprint(historial_bp)
     app.register_blueprint(auditorias_bp)
+    app.register_blueprint(reportes_bp)
     return app
 
 app = create_app()
