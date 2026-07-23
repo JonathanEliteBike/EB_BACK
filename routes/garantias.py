@@ -10,7 +10,7 @@ from services.s3_service import subir_archivo_s3, generar_url_firmada_s3, existe
 from werkzeug.utils import secure_filename
 
 from db_conexion import obtener_conexion
-from services.garantias_service import exportar_excel, get_dashboard_data, invalidar_cache
+from services.garantias_service import exportar_pdf, get_dashboard_data, invalidar_cache
 from utils.jwt_utils import verificar_token
 
 garantias_bp = Blueprint("garantias", __name__, url_prefix="/garantias")
@@ -30,7 +30,9 @@ def allowed_file(filename):
 @garantias_bp.route("/dashboard", methods=["GET"])
 def dashboard():
     try:
-        data = get_dashboard_data()
+        desde = request.args.get('desde') or None
+        hasta = request.args.get('hasta') or None
+        data = get_dashboard_data(desde, hasta)
         return jsonify(data)
     except Exception as e:
         logging.exception("Error en /garantias/dashboard: %s", e)
@@ -40,18 +42,22 @@ def dashboard():
 @garantias_bp.route("/exportar", methods=["GET"])
 def exportar():
     try:
-        excel_bytes = exportar_excel()
-        buf = io.BytesIO(excel_bytes)
+        distribuidor = request.args.get('distribuidor') or None
+        desde = request.args.get('desde') or None
+        hasta = request.args.get('hasta') or None
+        pdf_bytes = exportar_pdf(distribuidor, desde, hasta)
+        buf = io.BytesIO(pdf_bytes)
         buf.seek(0)
+        nombre = "garantias.pdf" if not distribuidor else f"garantias_{secure_filename(distribuidor)}.pdf"
         return send_file(
             buf,
             as_attachment=True,
-            download_name="garantias.xlsx",
-            mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            download_name=nombre,
+            mimetype="application/pdf",
         )
     except Exception as e:
-        logging.exception("Error al exportar garantias Excel: %s", e)
-        return jsonify({"error": "Error al generar Excel"}), 500
+        logging.exception("Error al exportar garantias PDF: %s", e)
+        return jsonify({"error": "Error al generar PDF"}), 500
 
 
 @garantias_bp.route("/refrescar", methods=["POST"])
@@ -500,6 +506,33 @@ def actualizar_fecha_estatus(form_id):
         conn.close()
 
 
+@garantias_bp.route("/formulario/<int:form_id>/fecha-creacion", methods=["PUT"])
+def actualizar_fecha_creacion(form_id):
+    """Corrige la fecha de alta (creación) del ticket cuando se registró mal, sin borrar y recrear."""
+    conn = obtener_conexion()
+    if not conn:
+        return jsonify({"error": "Sin conexion a BD"}), 500
+    try:
+        datos = request.get_json(force=True) or {}
+        fecha = datos.get('fecha') or date.today().isoformat()
+        cursor = conn.cursor()
+        cursor.execute(
+            "UPDATE garantia_formularios SET fecha_creacion = %s WHERE id = %s",
+            (fecha, form_id)
+        )
+        cursor.execute(
+            "INSERT INTO garantia_comentarios (formulario_id, autor, texto, tipo) VALUES (%s,%s,%s,%s)",
+            (form_id, 'Sistema', f'Fecha de creación corregida a {fecha}', 'estatus')
+        )
+        conn.commit()
+        return jsonify({"ok": True, "fecha_creacion": fecha})
+    except Exception as e:
+        logging.exception("Error al actualizar fecha_creacion: %s", e)
+        return jsonify({"error": str(e)}), 500
+    finally:
+        conn.close()
+
+
 @garantias_bp.route("/formulario/<int:form_id>/pieza-reemplazo", methods=["PUT"])
 def actualizar_pieza_reemplazo(form_id):
     conn = obtener_conexion()
@@ -873,7 +906,8 @@ def get_latencias():
         cursor = conn.cursor(dictionary=True)
         cursor.execute("""
             SELECT
-                f.id, f.folio, f.estatus, f.distribuidor,
+                f.id, f.folio, f.estatus, f.distribuidor, f.marca,
+                DATE_FORMAT(f.fecha_creacion, '%d/%m/%Y %H:%i') AS fecha_creacion,
                 CASE WHEN f.estatus IN ('Cerrado','Rechazado')
                      THEN DATEDIFF(
                          COALESCE(f.fecha_estatus, DATE(f.fecha_actualizacion)),
@@ -885,10 +919,10 @@ def get_latencias():
                          ELSE NULL END) AS lat_atencion
             FROM garantia_formularios f
             LEFT JOIN garantia_comentarios c ON c.formulario_id = f.id
-            GROUP BY f.id, f.folio, f.estatus, f.distribuidor,
+            GROUP BY f.id, f.folio, f.estatus, f.distribuidor, f.marca,
                      f.fecha_creacion, f.fecha_actualizacion, f.fecha_estatus
             ORDER BY f.fecha_creacion DESC
-        """)
+        """, ())
         rows = cursor.fetchall()
         return jsonify(rows)
     except Exception as e:
@@ -957,6 +991,58 @@ def agregar_pieza():
         return jsonify({"ok": True, "nombre": nombre})
     except Exception as e:
         logging.exception("Error al agregar pieza: %s", e)
+        return jsonify({"error": str(e)}), 500
+    finally:
+        conn.close()
+
+
+@garantias_bp.route("/piezas/uso", methods=["GET"])
+def contar_uso_pieza():
+    """Cuántos tickets tienen asignada esta pieza actualmente -- para avisar
+    antes de quitarla del catálogo (no se tocan esos tickets, solo informa)."""
+    nombre = (request.args.get('nombre') or '').strip().upper()
+    if not nombre:
+        return jsonify({"error": "El nombre de la pieza es requerido"}), 400
+    conn = obtener_conexion()
+    if not conn:
+        return jsonify({"error": "Sin conexion a BD"}), 500
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT COUNT(*) FROM garantia_formularios WHERE pieza_reemplazo = %s",
+            (nombre,)
+        )
+        count = cursor.fetchone()[0]
+        return jsonify({"nombre": nombre, "count": count})
+    except Exception as e:
+        logging.exception("Error al contar uso de pieza: %s", e)
+        return jsonify({"error": str(e)}), 500
+    finally:
+        conn.close()
+
+
+@garantias_bp.route("/piezas", methods=["DELETE"])
+def eliminar_pieza():
+    """Quita una pieza del catálogo (soft-delete via activo=0) -- para
+    duplicados o nombres capturados por error (ej. 'MAUBRIO'). No afecta los
+    tickets que ya tengan esa pieza asignada, solo deja de ofrecerse en el
+    selector de nuevas asignaciones."""
+    conn = obtener_conexion()
+    if not conn:
+        return jsonify({"error": "Sin conexion a BD"}), 500
+    try:
+        datos = request.get_json(force=True) or {}
+        nombre = (datos.get('nombre') or '').strip().upper()
+        if not nombre:
+            return jsonify({"error": "El nombre de la pieza es requerido"}), 400
+        if nombre == 'N/A':
+            return jsonify({"error": "No se puede eliminar 'N/A' del catálogo"}), 400
+        cursor = conn.cursor()
+        cursor.execute("UPDATE garantia_piezas SET activo = 0 WHERE nombre = %s", (nombre,))
+        conn.commit()
+        return jsonify({"ok": True, "nombre": nombre})
+    except Exception as e:
+        logging.exception("Error al eliminar pieza: %s", e)
         return jsonify({"error": str(e)}), 500
     finally:
         conn.close()
