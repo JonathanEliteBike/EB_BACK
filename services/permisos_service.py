@@ -6,7 +6,7 @@ class PermisosService:
 
     @staticmethod
     def obtener_permisos_delegables(padre_id):
-        """Obtiene ÚNICAMENTE los módulos y acciones activos con la jerarquía del padre."""
+        """Obtiene ÚNICAMENTE los módulos y acciones activos con la jerarquía de la bolsa del padre."""
         conn = obtener_conexion()
         cur = conn.cursor(dictionary=True)
         try:
