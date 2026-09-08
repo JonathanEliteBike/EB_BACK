@@ -1,8 +1,52 @@
 # utils/auth_decorators.py
 
 from functools import wraps
-from flask import request, jsonify
+from flask import request, jsonify, g
 from db_conexion import obtener_conexion
+from utils.jwt_utils import verificar_token
+
+
+def requiere_autenticacion(f):
+    """Valida un JWT Bearer y deja su payload disponible en ``g.usuario_actual``."""
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        auth_header = request.headers.get('Authorization', '')
+
+        if not auth_header.startswith('Bearer '):
+            return jsonify({"error": "Token de autenticación requerido."}), 401
+
+        token = auth_header[7:].strip()
+        if not token:
+            return jsonify({"error": "Token de autenticación requerido."}), 401
+
+        payload = verificar_token(token)
+        if not payload or not payload.get('id'):
+            return jsonify({"error": "Token inválido o expirado."}), 401
+
+        g.usuario_actual = payload
+        return f(*args, **kwargs)
+
+    return decorated_function
+
+
+def requiere_rol(*roles_permitidos):
+    """Restringe una ruta a los roles presentes en el payload JWT autenticado."""
+    def decorator(f):
+        @wraps(f)
+        def decorated_function(*args, **kwargs):
+            try:
+                rol_usuario = int(g.usuario_actual.get('rol'))
+            except (AttributeError, TypeError, ValueError):
+                return jsonify({"error": "Rol no autorizado."}), 403
+
+            if rol_usuario not in roles_permitidos:
+                return jsonify({"error": "Rol no autorizado."}), 403
+
+            return f(*args, **kwargs)
+
+        return decorated_function
+    return decorator
+
 
 def requiere_permiso(modulo_identificador, accion_identificador):
     """

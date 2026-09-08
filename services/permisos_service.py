@@ -37,6 +37,9 @@ class PermisosService:
     @staticmethod
     def obtener_permisos_usuario(padre_id, hijo_id):
         """Obtiene los permisos del usuario hijo filtrando en tiempo real contra la bolsa delegable vigente del padre."""
+        if not UsuariosHijosService.validar_pertenencia_hijo(padre_id, hijo_id):
+            raise Exception("Acceso denegado: Este usuario no pertenece a su ámbito de administración.")
+
         conn = obtener_conexion()
         cur = conn.cursor(dictionary=True)
         try:
@@ -101,6 +104,24 @@ class PermisosService:
         finally:
             cur.close()
             conn.close()
+
+    @staticmethod
+    def obtener_permisos_propios_hijo(hijo_id):
+        """Obtiene los permisos efectivos del hijo autenticado usando su padre real."""
+        conn = obtener_conexion()
+        cur = conn.cursor(dictionary=True)
+        try:
+            cur.execute("SELECT padre_id FROM jerarquia_usuarios WHERE hijo_id = %s", (hijo_id,))
+            jerarquia_res = cur.fetchone()
+            if not jerarquia_res:
+                raise PermissionError("Acceso denegado: El usuario no tiene una relación padre-hijo válida.")
+
+            padre_id = jerarquia_res['padre_id']
+        finally:
+            cur.close()
+            conn.close()
+
+        return PermisosService.obtener_permisos_usuario(padre_id, hijo_id)
 
     @staticmethod
     def asignar_permiso_hijo(padre_id, hijo_id, modulo_id, accion_id):

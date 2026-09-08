@@ -2,6 +2,7 @@
 
 from db_conexion import obtener_conexion
 from utils.seguridad import hash_password
+import re
 
 class UsuariosHijosService:
 
@@ -61,9 +62,30 @@ class UsuariosHijosService:
     @staticmethod
     def crear_usuario_hijo(padre_id, datos_hijo):
         """Crea el usuario y la relacion jerarquica en una sola transaccion atomica."""
+        nombre = datos_hijo['nombre']
+        correo = datos_hijo['correo']
+        usuario = datos_hijo['usuario']
+        contrasena = datos_hijo['contrasena']
+
+        if not all(isinstance(valor, str) for valor in (nombre, correo, usuario, contrasena)):
+            raise ValueError("Los datos del usuario hijo no son válidos.")
+
+        nombre = nombre.strip()
+        correo = correo.strip()
+        usuario = usuario.strip()
+
+        if not nombre:
+            raise ValueError("El nombre es obligatorio.")
+        if not re.fullmatch(r"[a-zA-Z0-9_.-]{3,20}", usuario):
+            raise ValueError("El nombre de usuario debe tener entre 3 y 20 caracteres alfanuméricos.")
+        if not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", correo):
+            raise ValueError("El correo electrónico no tiene un formato válido.")
+        if not isinstance(contrasena, str) or len(contrasena) < 6:
+            raise ValueError("La contraseña debe tener al menos 6 caracteres.")
+
         cupo = UsuariosHijosService.obtener_cupo_padre(padre_id)
         if not cupo["tiene_cupo"]:
-            raise Exception("Ha alcanzado el límite máximo de usuarios permitidos.")
+            raise ValueError("Ha alcanzado el límite máximo de usuarios permitidos.")
 
         conn = obtener_conexion()
         cur = conn.cursor(dictionary=True)
@@ -72,12 +94,20 @@ class UsuariosHijosService:
             padre_res = cur.fetchone()
             
             if not padre_res:
-                raise Exception("El usuario administrador especificado no existe.")
+                raise ValueError("El distribuidor autenticado no existe.")
                 
             cliente_id = padre_res['cliente_id']
 
+            cur.execute("SELECT id FROM usuarios WHERE correo = %s", (correo,))
+            if cur.fetchone():
+                raise ValueError("El correo electrónico ya está registrado.")
+
+            cur.execute("SELECT id FROM usuarios WHERE usuario = %s", (usuario,))
+            if cur.fetchone():
+                raise ValueError("El nombre de usuario ya está registrado.")
+
             # Encriptar la contraseña con el mismo método del sistema
-            contrasena_hash = hash_password(datos_hijo['contrasena'])
+            contrasena_hash = hash_password(contrasena)
 
             sql_usuario = """
                 INSERT INTO usuarios (nombre, correo, usuario, contrasena, activo, rol_id, cliente_id)
@@ -85,9 +115,9 @@ class UsuariosHijosService:
             """
             
             cur.execute(sql_usuario, (
-                datos_hijo['nombre'],
-                datos_hijo['correo'],
-                datos_hijo['usuario'],
+                nombre,
+                correo,
+                usuario,
                 contrasena_hash,
                 cliente_id
             ))
