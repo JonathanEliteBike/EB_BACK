@@ -5,6 +5,15 @@ from db_conexion import obtener_conexion
 class AdminSistemaService:
 
     @staticmethod
+    def validar_administrador_cliente(cur, admin_id):
+        """Confirma que el destinatario de una bolsa sea un Administrador Cliente."""
+        cur.execute(
+            "SELECT 1 FROM usuarios WHERE id = %s AND rol_id = 2",
+            (admin_id,)
+        )
+        return cur.fetchone() is not None
+
+    @staticmethod
     def _obtener_columna_limite(cur):
         """Detecta automáticamente el nombre de la columna en limites_usuario."""
         cur.execute("SHOW COLUMNS FROM limites_usuario")
@@ -24,7 +33,10 @@ class AdminSistemaService:
             sql = f"""
                 SELECT u.id, u.nombre, u.correo, u.usuario, u.activo, u.cliente_id,
                        COALESCE(l.max_hijos, 0) as max_hijos,
-                       (SELECT COUNT(*) FROM usuarios WHERE padre_id = u.id AND activo = 1) as hijos_activos
+                       (SELECT COUNT(*)
+                        FROM jerarquia_usuarios ju
+                        INNER JOIN usuarios h ON h.id = ju.hijo_id
+                        WHERE ju.padre_id = u.id AND h.activo = 1) as hijos_activos
                 FROM usuarios u
                 LEFT JOIN limites_usuario l ON u.id = l.{col_fk}
                 WHERE u.rol_id = 2
@@ -59,6 +71,9 @@ class AdminSistemaService:
         conn = obtener_conexion()
         cur = conn.cursor(dictionary=True)
         try:
+            if not AdminSistemaService.validar_administrador_cliente(cur, admin_id):
+                raise ValueError("El usuario seleccionado no corresponde a un distribuidor activo para este flujo.")
+
             col_fk = AdminSistemaService._obtener_columna_limite(cur)
             sql = f"""
                 INSERT INTO limites_usuario ({col_fk}, max_hijos)
@@ -81,6 +96,19 @@ class AdminSistemaService:
         conn = obtener_conexion()
         cur = conn.cursor()
         try:
+            if not AdminSistemaService.validar_administrador_cliente(cur, admin_id):
+                raise ValueError("El administrador seleccionado no existe o no corresponde al rol 2.")
+
+            cur.execute("""
+                SELECT 1
+                FROM modulo_acciones ma
+                INNER JOIN modulos m ON m.id = ma.modulo_id AND m.activo = 1
+                INNER JOIN acciones a ON a.id = ma.accion_id AND a.activo = 1
+                WHERE ma.modulo_id = %s AND ma.accion_id = %s
+            """, (modulo_id, accion_id))
+            if not cur.fetchone():
+                raise ValueError("La acción no está disponible para el módulo seleccionado.")
+
             sql = """
                 INSERT IGNORE INTO permisos_delegables (administrador_id, modulo_id, accion_id)
                 VALUES (%s, %s, %s)
@@ -102,6 +130,9 @@ class AdminSistemaService:
         conn = obtener_conexion()
         cur = conn.cursor()
         try:
+            if not AdminSistemaService.validar_administrador_cliente(cur, admin_id):
+                raise ValueError("El administrador seleccionado no existe o no corresponde al rol 2.")
+
             # 1. Borrar físicamente el permiso de TODOS los usuarios hijos (Rol 3) que pertenezcan a este administrador
             sql_hijos = """
                 DELETE up FROM usuario_permisos up
@@ -125,3 +156,19 @@ class AdminSistemaService:
         finally:
             cur.close()
             conn.close()
+
+    @staticmethod
+    def obtener_permisos_delegables_administrador(admin_id):
+        """Obtiene la bolsa vigente de un Administrador Cliente para su gestión por rol 1."""
+        conn = obtener_conexion()
+        cur = conn.cursor()
+        try:
+            if not AdminSistemaService.validar_administrador_cliente(cur, admin_id):
+                raise ValueError("El administrador seleccionado no existe o no corresponde al rol 2.")
+        finally:
+            cur.close()
+            conn.close()
+
+        # Reutiliza la consulta que alimenta la bolsa real del distribuidor.
+        from services.permisos_service import PermisosService
+        return PermisosService.obtener_permisos_delegables(admin_id)
