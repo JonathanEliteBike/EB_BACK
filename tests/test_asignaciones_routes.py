@@ -100,6 +100,7 @@ def test_crear_y_listar_producto_end_to_end():
 
 
 def test_asignar_concurrente_nunca_deja_disponible_negativo():
+    import time
     conn = obtener_conexion()
     if not conn:
         import pytest
@@ -117,7 +118,9 @@ def test_asignar_concurrente_nunca_deja_disponible_negativo():
         import pytest
         pytest.skip("Se necesita al menos 1 embarque y 2 clientes en la BD local para este test")
 
-    producto = crear_producto(embarque["id"], "TEST-CONCURRENCIA-0001", 2, "2026-2027")
+    # Use timestamp to ensure SKU uniqueness across test runs
+    sku_unico = f"TEST-CONCURRENCIA-{int(time.time())}"
+    producto = crear_producto(embarque["id"], sku_unico, 2, "2026-2027")
 
     import threading
     resultados = []
