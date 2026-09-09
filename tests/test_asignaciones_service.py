@@ -11,6 +11,7 @@ from services.asignaciones_service import asignar
 from services.asignaciones_service import crear_venta_sobrante
 from services.asignaciones_service import validar_venta_odoo
 from services.asignaciones_service import cancelar_venta
+from services.asignaciones_service import obtener_detalle_producto, resumen_embarque, listar_movimientos
 
 
 def _mock_conn(mocker, cursor):
@@ -563,3 +564,90 @@ def test_cancelar_venta_restaura_disponibilidad_con_movimiento_positivo(mocker):
     movimientos = [c for c in cursor.execute.call_args_list if "INSERT INTO importacion_movimientos" in c.args[0]]
     assert movimientos[0].args[1][1] == "CANCELACION"
     assert movimientos[0].args[1][2] == 2  # positivo: restaura las 2 unidades
+
+
+def test_obtener_detalle_producto_no_existe(mocker):
+    cursor = MagicMock()
+    cursor.fetchone.return_value = None
+    _mock_conn(mocker, cursor)
+
+    with pytest.raises(AsignacionesError) as exc:
+        obtener_detalle_producto(999)
+    assert exc.value.code == "PRODUCTO_NO_EXISTE"
+
+
+def test_obtener_detalle_producto_incluye_los_3_bloques(mocker):
+    cursor = MagicMock()
+    cursor.fetchone.return_value = {
+        "id": 10, "importacion_id": 1, "periodo": "2026-2027", "sku_norm": "SKU1",
+    }
+    cursor.fetchall.side_effect = [
+        [{"id": 1, "clave_cliente": "LC657", "cantidad_asignada": 3}],  # asignaciones
+        [{"id": 1, "clave_cliente": "MC677", "cantidad": 1, "estado": "VALIDADO"}],  # ventas
+    ]
+    _mock_conn(mocker, cursor)
+    mocker.patch(
+        "services.asignaciones_service.recalcular_propuesta",
+        return_value=[{"producto_id": 10, "propuesta": [{"clave_cliente": "LC657", "cantidad_sugerida": 3}]}],
+    )
+
+    detalle = obtener_detalle_producto(10)
+
+    assert detalle["producto"]["id"] == 10
+    assert len(detalle["asignaciones"]) == 1
+    assert len(detalle["sobrantes_ventas"]) == 1
+    assert detalle["proyecciones"][0]["clave_cliente"] == "LC657"
+
+
+def test_resumen_embarque_no_existe(mocker):
+    cursor = MagicMock()
+    cursor.fetchone.return_value = None
+    _mock_conn(mocker, cursor)
+
+    with pytest.raises(AsignacionesError) as exc:
+        resumen_embarque(999)
+    assert exc.value.code == "IMPORTACION_NO_EXISTE"
+
+
+def test_resumen_embarque_suma_kpis_de_todos_los_productos(mocker):
+    cursor = MagicMock()
+    cursor.fetchone.return_value = {"id": 1, "referencia": "IMP-001", "nombre": "Test", "estado": "activo"}
+    _mock_conn(mocker, cursor)
+    mocker.patch(
+        "services.asignaciones_service.listar_productos",
+        return_value=[
+            {"cantidad_embarcada": 10, "cantidad_asignada": 6, "cantidad_sobrante": 4,
+             "cantidad_vendida": 1, "cantidad_disponible": 3},
+            {"cantidad_embarcada": 5, "cantidad_asignada": 5, "cantidad_sobrante": 0,
+             "cantidad_vendida": 0, "cantidad_disponible": 0},
+        ],
+    )
+
+    resumen = resumen_embarque(1)
+
+    assert resumen["kpis"] == {
+        "unidades_embarcadas": 15, "unidades_asignadas": 11, "unidades_sobrantes": 4,
+        "unidades_vendidas": 1, "unidades_disponibles": 3,
+    }
+
+
+def test_listar_movimientos_importacion_no_existe(mocker):
+    cursor = MagicMock()
+    cursor.fetchone.return_value = None
+    _mock_conn(mocker, cursor)
+
+    with pytest.raises(AsignacionesError) as exc:
+        listar_movimientos(999)
+    assert exc.value.code == "IMPORTACION_NO_EXISTE"
+
+
+def test_listar_movimientos_devuelve_los_del_embarque(mocker):
+    cursor = MagicMock()
+    cursor.fetchone.return_value = {"id": 1}
+    cursor.fetchall.return_value = [{"id": 1, "tipo_movimiento": "ENTRADA", "cantidad": 10}]
+    _mock_conn(mocker, cursor)
+
+    resultado = listar_movimientos(1)
+
+    assert len(resultado) == 1
+    assert resultado[0]["tipo_movimiento"] == "ENTRADA"

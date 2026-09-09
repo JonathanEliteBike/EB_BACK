@@ -145,3 +145,29 @@ def cancelar_venta_ruta(importacion_id, venta_id):
     payload = getattr(request, "cliente_data", {}) or {}
     data = svc.cancelar_venta(venta_id, usuario_id=payload.get("id"))
     return jsonify({"ok": True, "data": data}), 200
+
+
+@asignaciones_bp.route("/<int:importacion_id>/asignaciones", methods=["GET"])
+@token_required
+@_requiere_rol_importaciones
+def resumen_ruta(importacion_id):
+    data = svc.resumen_embarque(importacion_id)
+    return jsonify({"ok": True, "data": data}), 200
+
+
+@asignaciones_bp.route(
+    "/<int:importacion_id>/asignaciones/productos/<int:producto_id>/detalle", methods=["GET"]
+)
+@token_required
+@_requiere_rol_importaciones
+def detalle_producto_ruta(importacion_id, producto_id):
+    data = svc.obtener_detalle_producto(producto_id)
+    return jsonify({"ok": True, "data": data}), 200
+
+
+@asignaciones_bp.route("/<int:importacion_id>/asignaciones/movimientos", methods=["GET"])
+@token_required
+@_requiere_rol_importaciones
+def movimientos_ruta(importacion_id):
+    data = svc.listar_movimientos(importacion_id)
+    return jsonify({"ok": True, "data": data}), 200

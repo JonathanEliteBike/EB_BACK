@@ -653,3 +653,86 @@ def validar_venta_odoo(venta_id: int, numero_pedido_odoo: str = None) -> dict:
         return cursor2.fetchone()
     finally:
         conn2.close()
+
+
+def obtener_detalle_producto(producto_id: int) -> dict:
+    conn = obtener_conexion()
+    if not conn:
+        raise AsignacionesError("DB_NO_DISPONIBLE", "Sin conexión a BD", 500)
+    try:
+        cursor = conn.cursor(dictionary=True)
+        cursor.execute("SELECT * FROM importacion_productos WHERE id = %s", (producto_id,))
+        producto = cursor.fetchone()
+        if not producto:
+            raise AsignacionesError("PRODUCTO_NO_EXISTE", "El producto no existe", 404)
+
+        cursor.execute(
+            "SELECT * FROM importacion_asignaciones WHERE importacion_producto_id = %s ORDER BY prioridad",
+            (producto_id,),
+        )
+        asignaciones = cursor.fetchall()
+
+        cursor.execute(
+            "SELECT * FROM importacion_sobrantes_ventas WHERE importacion_producto_id = %s "
+            "ORDER BY created_at DESC",
+            (producto_id,),
+        )
+        ventas = cursor.fetchall()
+    finally:
+        conn.close()
+
+    propuesta = recalcular_propuesta(producto["importacion_id"], producto["periodo"])
+    fila = next((p for p in propuesta if p["producto_id"] == producto_id), None)
+
+    return {
+        "producto": producto,
+        "proyecciones": fila["propuesta"] if fila else [],
+        "asignaciones": asignaciones,
+        "sobrantes_ventas": ventas,
+    }
+
+
+def resumen_embarque(importacion_id: int) -> dict:
+    conn = obtener_conexion()
+    if not conn:
+        raise AsignacionesError("DB_NO_DISPONIBLE", "Sin conexión a BD", 500)
+    try:
+        cursor = conn.cursor(dictionary=True)
+        cursor.execute(
+            "SELECT id, referencia, nombre, estado FROM importaciones WHERE id = %s", (importacion_id,)
+        )
+        embarque = cursor.fetchone()
+        if not embarque:
+            raise AsignacionesError("IMPORTACION_NO_EXISTE", "El embarque no existe", 404)
+    finally:
+        conn.close()
+
+    productos = listar_productos(importacion_id)
+    kpis = {
+        "unidades_embarcadas": sum(p["cantidad_embarcada"] for p in productos),
+        "unidades_asignadas": sum(p["cantidad_asignada"] for p in productos),
+        "unidades_sobrantes": sum(p["cantidad_sobrante"] for p in productos),
+        "unidades_vendidas": sum(p["cantidad_vendida"] for p in productos),
+        "unidades_disponibles": sum(p["cantidad_disponible"] for p in productos),
+    }
+    return {"embarque": embarque, "kpis": kpis, "productos": productos}
+
+
+def listar_movimientos(importacion_id: int) -> list:
+    conn = obtener_conexion()
+    if not conn:
+        raise AsignacionesError("DB_NO_DISPONIBLE", "Sin conexión a BD", 500)
+    try:
+        cursor = conn.cursor(dictionary=True)
+        cursor.execute("SELECT id FROM importaciones WHERE id = %s", (importacion_id,))
+        if not cursor.fetchone():
+            raise AsignacionesError("IMPORTACION_NO_EXISTE", "El embarque no existe", 404)
+        cursor.execute(
+            "SELECT m.* FROM importacion_movimientos m "
+            "JOIN importacion_productos p ON p.id = m.importacion_producto_id "
+            "WHERE p.importacion_id = %s ORDER BY m.created_at DESC, m.id DESC",
+            (importacion_id,),
+        )
+        return cursor.fetchall()
+    finally:
+        conn.close()
