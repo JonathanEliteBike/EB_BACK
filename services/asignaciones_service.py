@@ -98,3 +98,119 @@ TABLAS_SQL = [
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci
     """,
 ]
+
+
+from services.proyecciones_service import _norm_sku
+
+
+def _disponible_producto(cursor, producto_id: int) -> int:
+    cursor.execute(
+        "SELECT COALESCE(SUM(cantidad), 0) AS disponible FROM importacion_movimientos "
+        "WHERE importacion_producto_id = %s",
+        (producto_id,),
+    )
+    return int(cursor.fetchone()["disponible"])
+
+
+def _registrar_movimiento(cursor, producto_id, tipo_movimiento, cantidad, clave_cliente=None,
+                           referencia_externa=None, usuario_id=None, metadata=None):
+    import json
+    cursor.execute(
+        "INSERT INTO importacion_movimientos "
+        "(importacion_producto_id, tipo_movimiento, cantidad, clave_cliente, referencia_externa, "
+        "usuario_id, metadata_json) VALUES (%s, %s, %s, %s, %s, %s, %s)",
+        (producto_id, tipo_movimiento, cantidad, clave_cliente, referencia_externa, usuario_id,
+         json.dumps(metadata) if metadata else None),
+    )
+
+
+def crear_producto(importacion_id: int, sku: str, cantidad_embarcada, periodo: str,
+                    descripcion: str = None, usuario_id: int = None) -> dict:
+    if not isinstance(cantidad_embarcada, int) or cantidad_embarcada < 0:
+        raise AsignacionesError("SKU_INVALIDO", "La cantidad embarcada debe ser un entero >= 0")
+    sku = (sku or "").strip()
+    if not sku:
+        raise AsignacionesError("SKU_INVALIDO", "El SKU es obligatorio")
+    periodo = (periodo or "").strip()
+    if not periodo:
+        raise AsignacionesError("SKU_INVALIDO", "El periodo es obligatorio")
+    sku_norm = _norm_sku(sku)
+
+    conn = obtener_conexion()
+    if not conn:
+        raise AsignacionesError("DB_NO_DISPONIBLE", "Sin conexión a BD", 500)
+    try:
+        cursor = conn.cursor(dictionary=True)
+        cursor.execute("SELECT id FROM importaciones WHERE id = %s", (importacion_id,))
+        if not cursor.fetchone():
+            raise AsignacionesError("IMPORTACION_NO_EXISTE", "El embarque no existe", 404)
+
+        cursor.execute(
+            "SELECT id FROM importacion_productos WHERE importacion_id = %s AND sku_norm = %s",
+            (importacion_id, sku_norm),
+        )
+        if cursor.fetchone():
+            raise AsignacionesError("SKU_DUPLICADO", "Este SKU ya está registrado en el embarque", 409)
+
+        cursor.execute(
+            "INSERT INTO importacion_productos "
+            "(importacion_id, periodo, sku, sku_norm, descripcion, cantidad_embarcada) "
+            "VALUES (%s, %s, %s, %s, %s, %s)",
+            (importacion_id, periodo, sku, sku_norm, descripcion, cantidad_embarcada),
+        )
+        producto_id = cursor.lastrowid
+        _registrar_movimiento(cursor, producto_id, "ENTRADA", cantidad_embarcada, usuario_id=usuario_id)
+        conn.commit()
+
+        cursor.execute("SELECT * FROM importacion_productos WHERE id = %s", (producto_id,))
+        return cursor.fetchone()
+    except AsignacionesError:
+        conn.rollback()
+        raise
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def listar_productos(importacion_id: int) -> list:
+    conn = obtener_conexion()
+    if not conn:
+        raise AsignacionesError("DB_NO_DISPONIBLE", "Sin conexión a BD", 500)
+    try:
+        cursor = conn.cursor(dictionary=True)
+        cursor.execute("SELECT id FROM importaciones WHERE id = %s", (importacion_id,))
+        if not cursor.fetchone():
+            raise AsignacionesError("IMPORTACION_NO_EXISTE", "El embarque no existe", 404)
+
+        cursor.execute(
+            "SELECT * FROM importacion_productos WHERE importacion_id = %s ORDER BY sku",
+            (importacion_id,),
+        )
+        productos = cursor.fetchall()
+        resultado = []
+        for p in productos:
+            disponible = _disponible_producto(cursor, p["id"])
+            cursor.execute(
+                "SELECT COALESCE(SUM(cantidad_asignada), 0) AS total FROM importacion_asignaciones "
+                "WHERE importacion_producto_id = %s AND estado = 'ACTIVA'",
+                (p["id"],),
+            )
+            asignado = int(cursor.fetchone()["total"])
+            cursor.execute(
+                "SELECT COALESCE(SUM(cantidad), 0) AS total FROM importacion_sobrantes_ventas "
+                "WHERE importacion_producto_id = %s AND estado = 'VALIDADO'",
+                (p["id"],),
+            )
+            vendido = int(cursor.fetchone()["total"])
+            resultado.append({
+                **p,
+                "cantidad_asignada": asignado,
+                "cantidad_vendida": vendido,
+                "cantidad_sobrante": max(p["cantidad_embarcada"] - asignado, 0),
+                "cantidad_disponible": int(disponible),
+            })
+        return resultado
+    finally:
+        conn.close()

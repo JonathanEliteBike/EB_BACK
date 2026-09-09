@@ -46,3 +46,28 @@ def inicializar_tablas():
         return jsonify({"ok": False, "error": {"code": "DB_ERROR", "message": str(e)}}), 500
     finally:
         conn.close()
+
+
+@asignaciones_bp.route("/<int:importacion_id>/asignaciones/productos", methods=["GET"])
+@token_required
+@_requiere_rol_importaciones
+def listar_productos_ruta(importacion_id):
+    data = svc.listar_productos(importacion_id)
+    return jsonify({"ok": True, "data": data}), 200
+
+
+@asignaciones_bp.route("/<int:importacion_id>/asignaciones/productos", methods=["POST"])
+@token_required
+@_requiere_rol_importaciones
+def crear_producto_ruta(importacion_id):
+    body = request.get_json(silent=True) or {}
+    payload = getattr(request, "cliente_data", {}) or {}
+    data = svc.crear_producto(
+        importacion_id=importacion_id,
+        sku=body.get("sku"),
+        cantidad_embarcada=body.get("cantidad_embarcada"),
+        periodo=body.get("periodo"),
+        descripcion=body.get("descripcion"),
+        usuario_id=payload.get("id"),
+    )
+    return jsonify({"ok": True, "data": data}), 201

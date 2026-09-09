@@ -60,3 +60,40 @@ def test_inicializar_tablas_crea_las_4_tablas_en_bd_real():
         "importacion_productos", "importacion_asignaciones",
         "importacion_sobrantes_ventas", "importacion_movimientos",
     }.issubset(tablas)
+
+
+def test_crear_y_listar_producto_end_to_end():
+    import time
+    conn = obtener_conexion()
+    if not conn:
+        import pytest
+        pytest.skip("Sin conexión a BD local para este test")
+    cursor = conn.cursor(dictionary=True)
+    cursor.execute("SELECT id FROM importaciones LIMIT 1")
+    embarque = cursor.fetchone()
+    conn.close()
+    if not embarque:
+        import pytest
+        pytest.skip("No hay embarques en la BD local para probar")
+
+    client = _cliente_test()
+    token = _token_valido(rol=1)
+    headers = {"Authorization": f"Bearer {token}"}
+    # Use timestamp to ensure SKU uniqueness across test runs
+    sku_unico = f"TEST-{embarque['id']}-{int(time.time())}"
+
+    resp = client.post(
+        f"/importaciones/{embarque['id']}/asignaciones/productos",
+        json={"sku": sku_unico, "cantidad_embarcada": 5, "periodo": "2026-2027"},
+        headers=headers,
+    )
+    assert resp.status_code == 201
+    producto = resp.get_json()["data"]
+    assert producto["sku_norm"] == sku_unico.replace("-", "")
+
+    resp2 = client.get(f"/importaciones/{embarque['id']}/asignaciones/productos", headers=headers)
+    assert resp2.status_code == 200
+    productos = resp2.get_json()["data"]
+    encontrado = next(p for p in productos if p["id"] == producto["id"])
+    assert encontrado["cantidad_disponible"] == 5
+    assert encontrado["cantidad_asignada"] == 0
