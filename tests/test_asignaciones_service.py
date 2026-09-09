@@ -3,7 +3,9 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from services.asignaciones_service import AsignacionesError, actualizar_producto, crear_producto, listar_productos
+from services.asignaciones_service import (
+    AsignacionesError, actualizar_producto, crear_producto, listar_productos, recalcular_propuesta,
+)
 
 
 def _mock_conn(mocker, cursor):
@@ -131,3 +133,67 @@ def test_actualizar_producto_registra_movimiento_ajuste(mocker):
     assert len(ajustes) == 1
     assert ajustes[0].args[1][1] == "AJUSTE"
     assert ajustes[0].args[1][2] == 5  # 15 - 10
+
+
+def test_recalcular_reparte_por_prioridad_hasta_agotar_disponible(mocker):
+    cursor = MagicMock()
+    cursor.fetchone.side_effect = [{"id": 1}]  # importacion existe
+    cursor.fetchall.return_value = [
+        {"id": 10, "sku": "SKU-1", "sku_norm": "SKU1", "periodo": "2026-2027",
+         "cantidad_embarcada": 10, "importacion_id": 1},
+    ]
+    _mock_conn(mocker, cursor)
+    mocker.patch("services.asignaciones_service._disponible_producto", return_value=10)
+    mocker.patch(
+        "services.asignaciones_service.demanda_neta_por_cliente",
+        return_value={"SKU1": {"MC677": 2, "LC657": 3}},  # LC657 tiene mayor prioridad (1 vs 2)
+    )
+
+    propuestas = recalcular_propuesta(1)
+
+    assert len(propuestas) == 1
+    orden = [c["clave_cliente"] for c in propuestas[0]["propuesta"]]
+    assert orden == ["LC657", "MC677"]  # prioridad 1 antes que prioridad 2
+    assert propuestas[0]["sobrante_estimado"] == 5  # 10 - 3 - 2
+
+
+def test_recalcular_no_sobreasigna_cuando_demanda_supera_disponible(mocker):
+    cursor = MagicMock()
+    cursor.fetchone.side_effect = [{"id": 1}]
+    cursor.fetchall.return_value = [
+        {"id": 10, "sku": "SKU-1", "sku_norm": "SKU1", "periodo": "2026-2027",
+         "cantidad_embarcada": 4, "importacion_id": 1},
+    ]
+    _mock_conn(mocker, cursor)
+    mocker.patch("services.asignaciones_service._disponible_producto", return_value=4)
+    mocker.patch(
+        "services.asignaciones_service.demanda_neta_por_cliente",
+        return_value={"SKU1": {"LC657": 3, "MC677": 3}},  # demanda total 6 > disponible 4
+    )
+
+    propuestas = recalcular_propuesta(1)
+
+    total_sugerido = sum(c["cantidad_sugerida"] for c in propuestas[0]["propuesta"])
+    assert total_sugerido == 4  # nunca más que el disponible
+    assert propuestas[0]["sobrante_estimado"] == 0
+
+
+def test_recalcular_degrada_sin_romper_si_proyecciones_falla(mocker):
+    cursor = MagicMock()
+    cursor.fetchone.side_effect = [{"id": 1}]
+    cursor.fetchall.return_value = [
+        {"id": 10, "sku": "SKU-1", "sku_norm": "SKU1", "periodo": "2026-2027",
+         "cantidad_embarcada": 4, "importacion_id": 1},
+    ]
+    _mock_conn(mocker, cursor)
+    mocker.patch("services.asignaciones_service._disponible_producto", return_value=4)
+    mocker.patch(
+        "services.asignaciones_service.demanda_neta_por_cliente",
+        side_effect=RuntimeError("Sin conexión a BD para consultar forecast_proyecciones"),
+    )
+
+    propuestas = recalcular_propuesta(1)
+
+    assert propuestas[0]["proyecciones_disponibles"] is False
+    assert propuestas[0]["propuesta"] == []
+    assert propuestas[0]["sobrante_estimado"] == 4

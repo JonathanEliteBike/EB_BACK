@@ -100,7 +100,7 @@ TABLAS_SQL = [
 ]
 
 
-from services.proyecciones_service import _norm_sku
+from services.proyecciones_service import _norm_sku, demanda_neta_por_cliente, _PRIORIDAD_MAP
 
 
 def _disponible_producto(cursor, producto_id: int) -> int:
@@ -268,3 +268,77 @@ def actualizar_producto(producto_id: int, cantidad_embarcada=None, descripcion: 
         raise
     finally:
         conn.close()
+
+
+def recalcular_propuesta(importacion_id: int, periodo_filtro: str = None) -> list:
+    conn = obtener_conexion()
+    if not conn:
+        raise AsignacionesError("DB_NO_DISPONIBLE", "Sin conexión a BD", 500)
+    try:
+        cursor = conn.cursor(dictionary=True)
+        cursor.execute("SELECT id FROM importaciones WHERE id = %s", (importacion_id,))
+        if not cursor.fetchone():
+            raise AsignacionesError("IMPORTACION_NO_EXISTE", "El embarque no existe", 404)
+
+        sql = "SELECT * FROM importacion_productos WHERE importacion_id = %s"
+        params = [importacion_id]
+        if periodo_filtro:
+            sql += " AND periodo = %s"
+            params.append(periodo_filtro)
+        cursor.execute(sql, params)
+        productos = cursor.fetchall()
+
+        disponibles = {p["id"]: _disponible_producto(cursor, p["id"]) for p in productos}
+    finally:
+        conn.close()
+
+    if not productos:
+        return []
+
+    por_periodo: dict = {}
+    for p in productos:
+        por_periodo.setdefault(p["periodo"], []).append(p)
+
+    propuestas = []
+    for periodo, prods in por_periodo.items():
+        skus_norm = [p["sku_norm"] for p in prods]
+        try:
+            demanda = demanda_neta_por_cliente(periodo, skus_norm)
+            proyecciones_disponibles = True
+        except Exception:
+            logging.exception("Proyecciones no disponibles al recalcular embarque %s", importacion_id)
+            demanda = {}
+            proyecciones_disponibles = False
+
+        for p in prods:
+            demanda_sku = demanda.get(p["sku_norm"], {})
+            clientes_ordenados = sorted(
+                demanda_sku.items(),
+                key=lambda item: (_PRIORIDAD_MAP.get(item[0].strip().upper(), (999, ""))[0], item[0]),
+            )
+            disponible = disponibles[p["id"]]
+            restante = disponible
+            sugerido = []
+            for clave, cantidad_neta in clientes_ordenados:
+                asignar_cant = min(cantidad_neta, restante)
+                if asignar_cant <= 0:
+                    continue
+                prio_info = _PRIORIDAD_MAP.get(clave.strip().upper(), (999, clave))
+                sugerido.append({
+                    "clave_cliente": clave,
+                    "prioridad": prio_info[0],
+                    "cantidad_proyectada": cantidad_neta,
+                    "cantidad_sugerida": asignar_cant,
+                })
+                restante -= asignar_cant
+            propuestas.append({
+                "producto_id": p["id"],
+                "sku": p["sku"],
+                "periodo": periodo,
+                "cantidad_embarcada": p["cantidad_embarcada"],
+                "disponible": disponible,
+                "proyecciones_disponibles": proyecciones_disponibles,
+                "propuesta": sugerido,
+                "sobrante_estimado": restante,
+            })
+    return propuestas

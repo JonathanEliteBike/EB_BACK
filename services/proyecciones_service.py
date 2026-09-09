@@ -8,6 +8,7 @@ import logging
 import re
 import time
 
+from db_conexion import obtener_conexion
 from utils.odoo_utils import get_odoo_models, ODOO_DB, ODOO_PASSWORD
 
 # Lista de prioridad para distribución de inventario.
@@ -187,3 +188,52 @@ def _get_ordenes_my27(periodo: str) -> dict:
     except Exception as e:
         logging.exception('[ordenes_my27] error: %s', e)
         return _ORDENES_CACHE['data']
+
+
+def demanda_neta_por_cliente(periodo: str, skus_norm: list) -> dict:
+    """
+    {sku_norm: {clave_cliente: cantidad_neta_pendiente}} — proyección total
+    del periodo por cliente, menos lo que Odoo ya tiene confirmado (sale.order).
+    Lanza RuntimeError si no hay conexión a BD (el caller decide cómo degradar).
+    """
+    if not skus_norm:
+        return {}
+    skus_norm_set = set(skus_norm)
+
+    conn = obtener_conexion()
+    if not conn:
+        raise RuntimeError("Sin conexión a BD para consultar forecast_proyecciones")
+    try:
+        cursor = conn.cursor(dictionary=True)
+        cursor.execute(
+            "SELECT clave_cliente, sku, "
+            "(mayo+junio+julio+agosto+septiembre+octubre+noviembre+diciembre"
+            "+enero+febrero+marzo+abril) AS total "
+            "FROM forecast_proyecciones WHERE periodo = %s",
+            (periodo,),
+        )
+        crudo: dict = {}
+        for row in cursor.fetchall():
+            sku_n = _norm_sku(row["sku"])
+            if sku_n not in skus_norm_set:
+                continue
+            crudo.setdefault(sku_n, {})
+            crudo[sku_n][row["clave_cliente"]] = crudo[sku_n].get(row["clave_cliente"], 0) + (row["total"] or 0)
+    finally:
+        conn.close()
+
+    try:
+        ordenes = _get_ordenes_my27(periodo)
+    except Exception:
+        logging.exception("No se pudo deducir órdenes Odoo para %s", periodo)
+        ordenes = {}
+
+    resultado: dict = {}
+    for sku_n, por_cliente in crudo.items():
+        resultado[sku_n] = {}
+        for clave, cantidad in por_cliente.items():
+            ya_en_odoo = ordenes.get(clave, {}).get(sku_n, 0)
+            neta = max(cantidad - ya_en_odoo, 0)
+            if neta > 0:
+                resultado[sku_n][clave] = neta
+    return resultado

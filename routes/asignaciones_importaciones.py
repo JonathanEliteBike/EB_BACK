@@ -86,3 +86,12 @@ def actualizar_producto_ruta(importacion_id, producto_id):
         usuario_id=payload.get("id"),
     )
     return jsonify({"ok": True, "data": data}), 200
+
+
+@asignaciones_bp.route("/<int:importacion_id>/asignaciones/recalcular", methods=["POST"])
+@token_required
+@_requiere_rol_importaciones
+def recalcular_ruta(importacion_id):
+    body = request.get_json(silent=True) or {}
+    data = svc.recalcular_propuesta(importacion_id, body.get("periodo"))
+    return jsonify({"ok": True, "data": data}), 200
