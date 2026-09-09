@@ -56,6 +56,29 @@ def test_crear_producto_sku_duplicado(mocker):
     assert exc.value.status == 409
 
 
+def test_crear_producto_sku_duplicado_por_carrera_en_el_insert(mocker):
+    """El chequeo previo pasa (nadie tenía el SKU) pero el INSERT choca con
+    uq_producto_embarque: debe salir como el mismo 409 SKU_DUPLICADO, no un 500 crudo."""
+    cursor = MagicMock()
+    cursor.fetchone.side_effect = [
+        {"id": 1},  # importacion existe
+        None,       # chequeo previo: no hay duplicado (todavía)
+    ]
+    cursor.execute.side_effect = [
+        None,  # SELECT importaciones
+        None,  # SELECT duplicado
+        mysql.connector.errors.IntegrityError("Duplicate entry for key 'uq_producto_embarque'"),
+    ]
+    conn = _mock_conn(mocker, cursor)
+
+    with pytest.raises(AsignacionesError) as exc:
+        crear_producto(1, "427102-0001004", 10, "2026-2027")
+    assert exc.value.code == "SKU_DUPLICADO"
+    assert exc.value.status == 409
+    assert conn.rollback.called
+    assert not conn.commit.called
+
+
 def test_crear_producto_exitoso_normaliza_sku_y_registra_entrada(mocker):
     cursor = MagicMock()
     cursor.fetchone.side_effect = [
@@ -98,6 +121,35 @@ def test_listar_productos_calcula_disponible_asignado_sobrante_vendido(mocker):
     assert resultado[0]["cantidad_asignada"] == 3
     assert resultado[0]["cantidad_sobrante"] == 7  # 10 embarcado - 3 asignado
     assert resultado[0]["cantidad_vendida"] == 0
+    consultas_vendido = [
+        c for c in cursor.execute.call_args_list
+        if "FROM importacion_sobrantes_ventas" in c.args[0]
+    ]
+    assert len(consultas_vendido) == 1
+    # una venta PENDIENTE_VALIDACION ya descontó del disponible: debe contar como vendida
+    assert "estado IN ('VALIDADO', 'PENDIENTE_VALIDACION')" in consultas_vendido[0].args[0]
+
+
+def test_listar_productos_cuenta_ventas_pendientes_de_validacion_como_vendidas(mocker):
+    cursor = MagicMock()
+    cursor.fetchone.side_effect = [
+        {"id": 1},            # importacion existe
+        {"disponible": 8},     # _disponible_producto (10 embarcadas - 2 vendidas pendientes)
+        {"total": 0},          # asignado
+        {"total": 2},          # vendido: 2 unidades en PENDIENTE_VALIDACION
+    ]
+    cursor.fetchall.return_value = [
+        {"id": 10, "importacion_id": 1, "sku": "SKU-1", "sku_norm": "SKU1",
+         "cantidad_embarcada": 10, "periodo": "2026-2027", "descripcion": None},
+    ]
+    _mock_conn(mocker, cursor)
+
+    resultado = listar_productos(1)
+
+    assert resultado[0]["cantidad_vendida"] == 2
+    # sobrante (10 - 0 asignado) menos vendida (2) reconcilia con disponible (8)
+    assert resultado[0]["cantidad_sobrante"] - resultado[0]["cantidad_vendida"] == \
+        resultado[0]["cantidad_disponible"]
 
 
 def test_actualizar_producto_no_existe(mocker):
@@ -448,18 +500,7 @@ def test_validar_odoo_rechaza_cantidad_insuficiente_en_las_lineas(mocker):
     assert exc.value.code == "PEDIDO_ODOO_INVALIDO"
 
 
-def test_validar_odoo_exitoso_marca_validado(mocker):
-    cursor = MagicMock()
-    cursor.fetchone.side_effect = [
-        {"id": 1, "estado": "PENDIENTE_VALIDACION", "numero_pedido_odoo": "SO1",
-         "clave_cliente": "LC657", "cantidad": 2, "importacion_producto_id": 10},
-        {"sku_norm": "4271020001004"},
-        {"id": 1, "estado": "VALIDADO", "numero_pedido_odoo": "SO1"},  # SELECT final (2da conexión)
-    ]
-    conn = MagicMock()
-    conn.cursor.return_value = cursor
-    mocker.patch("services.asignaciones_service.obtener_conexion", return_value=conn)
-
+def _models_odoo_ok(mocker):
     models = MagicMock()
     models.execute_kw.side_effect = [
         [{"id": 5, "name": "SO1", "partner_id": [1, "LC657"], "state": "sale", "order_line": [50]}],
@@ -468,10 +509,128 @@ def test_validar_odoo_exitoso_marca_validado(mocker):
         [{"id": 200, "default_code": "427102-0001004"}],
     ]
     mocker.patch("services.asignaciones_service.get_odoo_models", return_value=(1, models, None))
+    return models
+
+
+def test_validar_odoo_exitoso_marca_validado(mocker):
+    cursor = MagicMock()
+    cursor.fetchone.side_effect = [
+        # Fase 1 (lectura)
+        {"id": 1, "estado": "PENDIENTE_VALIDACION", "numero_pedido_odoo": "SO1",
+         "clave_cliente": "LC657", "cantidad": 2, "importacion_producto_id": 10},
+        {"sku_norm": "4271020001004"},
+        # Fase 3 (escritura bloqueada)
+        {"id": 1, "estado": "PENDIENTE_VALIDACION", "numero_pedido_odoo": "SO1"},  # SELECT ... FOR UPDATE
+        {"id": 1, "estado": "VALIDADO", "numero_pedido_odoo": "SO1"},              # SELECT final
+    ]
+    conn = MagicMock()
+    conn.cursor.return_value = cursor
+    mocker.patch("services.asignaciones_service.obtener_conexion", return_value=conn)
+    _models_odoo_ok(mocker)
 
     resultado = validar_venta_odoo(1, "SO1")
 
     assert resultado["estado"] == "VALIDADO"
+    # la escritura final se hace sobre la fila bloqueada
+    locks = [c for c in cursor.execute.call_args_list if "FOR UPDATE" in c.args[0]]
+    assert len(locks) == 1
+    assert "importacion_sobrantes_ventas" in locks[0].args[0]
+    updates = [c for c in cursor.execute.call_args_list if c.args[0].startswith("UPDATE")]
+    assert len(updates) == 1
+    assert "SET estado = 'VALIDADO'" in updates[0].args[0]
+
+
+def test_validar_odoo_persiste_folio_nuevo_y_estado_en_un_solo_update(mocker):
+    cursor = MagicMock()
+    cursor.fetchone.side_effect = [
+        {"id": 1, "estado": "PENDIENTE_VALIDACION", "numero_pedido_odoo": None,
+         "clave_cliente": "LC657", "cantidad": 2, "importacion_producto_id": 10},
+        {"sku_norm": "4271020001004"},
+        {"id": 1, "estado": "PENDIENTE_VALIDACION", "numero_pedido_odoo": None},
+        {"id": 1, "estado": "VALIDADO", "numero_pedido_odoo": "SO1"},
+    ]
+    conn = MagicMock()
+    conn.cursor.return_value = cursor
+    mocker.patch("services.asignaciones_service.obtener_conexion", return_value=conn)
+    _models_odoo_ok(mocker)
+
+    resultado = validar_venta_odoo(1, "SO1")
+
+    assert resultado["numero_pedido_odoo"] == "SO1"
+    updates = [c for c in cursor.execute.call_args_list if c.args[0].startswith("UPDATE")]
+    assert len(updates) == 1  # folio y estado en un único UPDATE, misma transacción
+    assert "numero_pedido_odoo = %s" in updates[0].args[0]
+    assert "estado = 'VALIDADO'" in updates[0].args[0]
+
+
+def test_validar_odoo_no_persiste_folio_si_la_validacion_falla(mocker):
+    """Un folio nuevo nunca debe quedar escrito si Odoo no confirma el pedido."""
+    cursor = _mock_conn_secuencia(mocker, [
+        {"id": 1, "estado": "PENDIENTE_VALIDACION", "numero_pedido_odoo": None,
+         "clave_cliente": "LC657", "cantidad": 2, "importacion_producto_id": 10},
+        {"sku_norm": "4271020001004"},
+    ])
+    models = MagicMock()
+    models.execute_kw.side_effect = [
+        [{"id": 5, "name": "SO1", "partner_id": [1, "LC657"], "state": "sale", "order_line": [50]}],
+        [{"ref": "LC657"}],
+        Exception("boom"),  # sale.order.line read falla a mitad de la validación
+    ]
+    mocker.patch("services.asignaciones_service.get_odoo_models", return_value=(1, models, None))
+
+    with pytest.raises(AsignacionesError) as exc:
+        validar_venta_odoo(1, "SO1")
+    assert exc.value.code == "PEDIDO_ODOO_NO_DISPONIBLE"
+    assert [c for c in cursor.execute.call_args_list if c.args[0].startswith("UPDATE")] == []
+
+
+def test_validar_odoo_venta_cancelada_durante_el_viaje_a_odoo(mocker):
+    """La re-verificación bajo FOR UPDATE evita revivir una venta cancelada mientras
+    se consultaba Odoo."""
+    cursor = MagicMock()
+    cursor.fetchone.side_effect = [
+        {"id": 1, "estado": "PENDIENTE_VALIDACION", "numero_pedido_odoo": "SO1",
+         "clave_cliente": "LC657", "cantidad": 2, "importacion_producto_id": 10},
+        {"sku_norm": "4271020001004"},
+        {"id": 1, "estado": "CANCELADO", "numero_pedido_odoo": "SO1"},  # cancelada entre tanto
+    ]
+    conn = MagicMock()
+    conn.cursor.return_value = cursor
+    mocker.patch("services.asignaciones_service.obtener_conexion", return_value=conn)
+    _models_odoo_ok(mocker)
+
+    with pytest.raises(AsignacionesError) as exc:
+        validar_venta_odoo(1, "SO1")
+    assert exc.value.code == "VENTA_YA_CANCELADA"
+    assert exc.value.status == 409
+    assert [c for c in cursor.execute.call_args_list if c.args[0].startswith("UPDATE")] == []
+
+
+def test_validar_odoo_integrity_error_en_el_update_final_devuelve_409(mocker):
+    cursor = MagicMock()
+    cursor.fetchone.side_effect = [
+        {"id": 1, "estado": "PENDIENTE_VALIDACION", "numero_pedido_odoo": None,
+         "clave_cliente": "LC657", "cantidad": 2, "importacion_producto_id": 10},
+        {"sku_norm": "4271020001004"},
+        {"id": 1, "estado": "PENDIENTE_VALIDACION", "numero_pedido_odoo": None},
+    ]
+    cursor.execute.side_effect = [
+        None,  # SELECT venta
+        None,  # SELECT sku_norm
+        None,  # SELECT ... FOR UPDATE
+        mysql.connector.errors.IntegrityError("Duplicate entry for key 'uq_pedido_odoo'"),
+    ]
+    conn = MagicMock()
+    conn.cursor.return_value = cursor
+    mocker.patch("services.asignaciones_service.obtener_conexion", return_value=conn)
+    _models_odoo_ok(mocker)
+
+    with pytest.raises(AsignacionesError) as exc:
+        validar_venta_odoo(1, "SO1")
+    assert exc.value.code == "PEDIDO_ODOO_YA_ASOCIADO"
+    assert exc.value.status == 409
+    assert conn.rollback.called
+    assert not conn.commit.called
 
 
 def test_validar_odoo_no_disponible_si_falla_sale_order_line_read(mocker):
@@ -576,10 +735,11 @@ def test_obtener_detalle_producto_no_existe(mocker):
     assert exc.value.code == "PRODUCTO_NO_EXISTE"
 
 
-def test_obtener_detalle_producto_incluye_los_3_bloques(mocker):
+def _detalle_producto_mocks(mocker, producto_calculado=None):
     cursor = MagicMock()
     cursor.fetchone.return_value = {
         "id": 10, "importacion_id": 1, "periodo": "2026-2027", "sku_norm": "SKU1",
+        "cantidad_embarcada": 10,
     }
     cursor.fetchall.side_effect = [
         [{"id": 1, "clave_cliente": "LC657", "cantidad_asignada": 3}],  # asignaciones
@@ -587,9 +747,22 @@ def test_obtener_detalle_producto_incluye_los_3_bloques(mocker):
     ]
     _mock_conn(mocker, cursor)
     mocker.patch(
+        "services.asignaciones_service.listar_productos",
+        return_value=[producto_calculado or {
+            "id": 10, "importacion_id": 1, "periodo": "2026-2027", "sku_norm": "SKU1",
+            "cantidad_embarcada": 10, "cantidad_asignada": 3, "cantidad_vendida": 1,
+            "cantidad_sobrante": 7, "cantidad_disponible": 6,
+        }],
+    )
+    mocker.patch(
         "services.asignaciones_service.recalcular_propuesta",
         return_value=[{"producto_id": 10, "propuesta": [{"clave_cliente": "LC657", "cantidad_sugerida": 3}]}],
     )
+    return cursor
+
+
+def test_obtener_detalle_producto_incluye_los_3_bloques(mocker):
+    _detalle_producto_mocks(mocker)
 
     detalle = obtener_detalle_producto(10)
 
@@ -597,6 +770,17 @@ def test_obtener_detalle_producto_incluye_los_3_bloques(mocker):
     assert len(detalle["asignaciones"]) == 1
     assert len(detalle["sobrantes_ventas"]) == 1
     assert detalle["proyecciones"][0]["clave_cliente"] == "LC657"
+
+
+def test_obtener_detalle_producto_incluye_las_cantidades_calculadas(mocker):
+    _detalle_producto_mocks(mocker)
+
+    detalle = obtener_detalle_producto(10)
+
+    assert detalle["producto"]["cantidad_asignada"] == 3
+    assert detalle["producto"]["cantidad_vendida"] == 1
+    assert detalle["producto"]["cantidad_sobrante"] == 7
+    assert detalle["producto"]["cantidad_disponible"] == 6
 
 
 def test_resumen_embarque_no_existe(mocker):
@@ -751,3 +935,85 @@ def test_caso_sku_con_y_sin_guiones_se_detecta_como_duplicado(mocker):
     with pytest.raises(AsignacionesError) as exc:
         crear_producto(1, "4271020001004", 10, "2026-2027")  # ahora sin guiones
     assert exc.value.code == "SKU_DUPLICADO"
+
+
+# --- Pertenencia al embarque de la URL (rutas anidadas) ---------------------------------
+# Un producto/venta de OTRO embarque debe verse igual que uno inexistente: 404, sin pistas.
+
+def test_actualizar_producto_de_otro_embarque_se_ve_como_inexistente(mocker):
+    cursor = MagicMock()
+    cursor.fetchone.return_value = {"id": 10, "importacion_id": 2, "cantidad_embarcada": 10}
+    _mock_conn(mocker, cursor)
+
+    with pytest.raises(AsignacionesError) as exc:
+        actualizar_producto(10, descripcion="x", importacion_id=1)  # el producto es del embarque 2
+    assert exc.value.code == "PRODUCTO_NO_EXISTE"
+    assert exc.value.status == 404
+    assert [c for c in cursor.execute.call_args_list if c.args[0].startswith("UPDATE")] == []
+
+
+def test_obtener_detalle_producto_de_otro_embarque_se_ve_como_inexistente(mocker):
+    cursor = MagicMock()
+    cursor.fetchone.return_value = {"id": 10, "importacion_id": 2, "periodo": "2026-2027"}
+    _mock_conn(mocker, cursor)
+
+    with pytest.raises(AsignacionesError) as exc:
+        obtener_detalle_producto(10, importacion_id=1)
+    assert exc.value.code == "PRODUCTO_NO_EXISTE"
+    assert exc.value.status == 404
+
+
+def test_asignar_a_producto_de_otro_embarque_se_ve_como_inexistente(mocker):
+    cursor = MagicMock()
+    cursor.fetchone.return_value = {"id": 10, "importacion_id": 2}
+    _mock_conn(mocker, cursor)
+
+    with pytest.raises(AsignacionesError) as exc:
+        asignar(10, [{"clave_cliente": "LC657", "cantidad": 1}], importacion_id=1)
+    assert exc.value.code == "PRODUCTO_NO_EXISTE"
+    assert exc.value.status == 404
+    assert [c for c in cursor.execute.call_args_list if c.args[0].startswith("INSERT")] == []
+
+
+def test_venta_sobrante_sobre_producto_de_otro_embarque_se_ve_como_inexistente(mocker):
+    cursor = MagicMock()
+    cursor.fetchone.return_value = {"id": 10, "importacion_id": 2}
+    _mock_conn(mocker, cursor)
+
+    with pytest.raises(AsignacionesError) as exc:
+        crear_venta_sobrante(10, "LC657", 1, importacion_id=1)
+    assert exc.value.code == "PRODUCTO_NO_EXISTE"
+    assert exc.value.status == 404
+    assert [c for c in cursor.execute.call_args_list if c.args[0].startswith("INSERT")] == []
+
+
+def test_cancelar_venta_de_otro_embarque_se_ve_como_inexistente(mocker):
+    cursor = MagicMock()
+    cursor.fetchone.side_effect = [
+        {"id": 1, "estado": "PENDIENTE_VALIDACION", "importacion_producto_id": 10,
+         "clave_cliente": "LC657", "cantidad": 2, "numero_pedido_odoo": "SO1"},
+        {"importacion_id": 2},  # el producto de la venta pertenece a otro embarque
+    ]
+    _mock_conn(mocker, cursor)
+
+    with pytest.raises(AsignacionesError) as exc:
+        cancelar_venta(1, importacion_id=1)
+    assert exc.value.code == "VENTA_NO_EXISTE"
+    assert exc.value.status == 404
+    assert [c for c in cursor.execute.call_args_list if c.args[0].startswith("UPDATE")] == []
+
+
+def test_validar_odoo_de_venta_de_otro_embarque_se_ve_como_inexistente(mocker):
+    cursor = _mock_conn_secuencia(mocker, [
+        {"id": 1, "estado": "PENDIENTE_VALIDACION", "numero_pedido_odoo": "SO1",
+         "clave_cliente": "LC657", "cantidad": 2, "importacion_producto_id": 10},
+        {"importacion_id": 2},  # el producto de la venta pertenece a otro embarque
+    ])
+    odoo = mocker.patch("services.asignaciones_service.get_odoo_models")
+
+    with pytest.raises(AsignacionesError) as exc:
+        validar_venta_odoo(1, "SO1", importacion_id=1)
+    assert exc.value.code == "VENTA_NO_EXISTE"
+    assert exc.value.status == 404
+    assert not odoo.called  # ni siquiera se consulta Odoo
+    assert [c for c in cursor.execute.call_args_list if c.args[0].startswith("UPDATE")] == []

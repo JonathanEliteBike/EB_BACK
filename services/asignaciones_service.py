@@ -113,6 +113,31 @@ def _disponible_producto(cursor, producto_id: int) -> int:
     return int(cursor.fetchone()["disponible"])
 
 
+def _verificar_pertenencia(producto: dict, importacion_id, code: str = "PRODUCTO_NO_EXISTE",
+                            mensaje: str = "El producto no existe"):
+    """Confirma que el recurso pertenece al embarque que viene en la URL.
+
+    Un recurso de otro embarque se reporta igual que uno inexistente (404), para no
+    filtrar a qué embarque pertenece realmente.
+    """
+    if importacion_id is None:
+        return
+    if not producto or producto.get("importacion_id") != importacion_id:
+        raise AsignacionesError(code, mensaje, 404)
+
+
+def _verificar_pertenencia_venta(cursor, venta: dict, importacion_id):
+    """Igual que _verificar_pertenencia, pero para recursos identificados por venta_id:
+    resuelve el embarque a través del producto al que pertenece la venta."""
+    if importacion_id is None:
+        return
+    cursor.execute(
+        "SELECT importacion_id FROM importacion_productos WHERE id = %s",
+        (venta["importacion_producto_id"],),
+    )
+    _verificar_pertenencia(cursor.fetchone(), importacion_id, "VENTA_NO_EXISTE", "La venta no existe")
+
+
 def _registrar_movimiento(cursor, producto_id, tipo_movimiento, cantidad, clave_cliente=None,
                            referencia_externa=None, usuario_id=None, metadata=None):
     import json
@@ -153,12 +178,18 @@ def crear_producto(importacion_id: int, sku: str, cantidad_embarcada, periodo: s
         if cursor.fetchone():
             raise AsignacionesError("SKU_DUPLICADO", "Este SKU ya está registrado en el embarque", 409)
 
-        cursor.execute(
-            "INSERT INTO importacion_productos "
-            "(importacion_id, periodo, sku, sku_norm, descripcion, cantidad_embarcada) "
-            "VALUES (%s, %s, %s, %s, %s, %s)",
-            (importacion_id, periodo, sku, sku_norm, descripcion, cantidad_embarcada),
-        )
+        try:
+            cursor.execute(
+                "INSERT INTO importacion_productos "
+                "(importacion_id, periodo, sku, sku_norm, descripcion, cantidad_embarcada) "
+                "VALUES (%s, %s, %s, %s, %s, %s)",
+                (importacion_id, periodo, sku, sku_norm, descripcion, cantidad_embarcada),
+            )
+        except mysql.connector.errors.IntegrityError:
+            # Carrera contra otro alta simultánea del mismo SKU: uq_producto_embarque la
+            # rechaza en BD; la devolvemos como el mismo 409 del chequeo previo.
+            conn.rollback()
+            raise AsignacionesError("SKU_DUPLICADO", "Este SKU ya está registrado en el embarque", 409)
         producto_id = cursor.lastrowid
         _registrar_movimiento(cursor, producto_id, "ENTRADA", cantidad_embarcada, usuario_id=usuario_id)
         conn.commit()
@@ -199,9 +230,11 @@ def listar_productos(importacion_id: int) -> list:
                 (p["id"],),
             )
             asignado = int(cursor.fetchone()["total"])
+            # PENDIENTE_VALIDACION cuenta igual que VALIDADO: la venta ya descontó del
+            # disponible (movimiento VENTA_SOBRANTE) en el momento de crearse.
             cursor.execute(
                 "SELECT COALESCE(SUM(cantidad), 0) AS total FROM importacion_sobrantes_ventas "
-                "WHERE importacion_producto_id = %s AND estado = 'VALIDADO'",
+                "WHERE importacion_producto_id = %s AND estado IN ('VALIDADO', 'PENDIENTE_VALIDACION')",
                 (p["id"],),
             )
             vendido = int(cursor.fetchone()["total"])
@@ -218,7 +251,7 @@ def listar_productos(importacion_id: int) -> list:
 
 
 def actualizar_producto(producto_id: int, cantidad_embarcada=None, descripcion: str = None,
-                         usuario_id: int = None) -> dict:
+                         usuario_id: int = None, importacion_id: int = None) -> dict:
     conn = obtener_conexion()
     if not conn:
         raise AsignacionesError("DB_NO_DISPONIBLE", "Sin conexión a BD", 500)
@@ -228,6 +261,7 @@ def actualizar_producto(producto_id: int, cantidad_embarcada=None, descripcion: 
         producto = cursor.fetchone()
         if not producto:
             raise AsignacionesError("PRODUCTO_NO_EXISTE", "El producto no existe", 404)
+        _verificar_pertenencia(producto, importacion_id)
 
         if cantidad_embarcada is not None:
             if not isinstance(cantidad_embarcada, int) or cantidad_embarcada < 0:
@@ -271,7 +305,8 @@ def actualizar_producto(producto_id: int, cantidad_embarcada=None, descripcion: 
         conn.close()
 
 
-def asignar(producto_id: int, asignaciones: list, usuario_id: int = None) -> dict:
+def asignar(producto_id: int, asignaciones: list, usuario_id: int = None,
+            importacion_id: int = None) -> dict:
     if not asignaciones:
         raise AsignacionesError("ASIGNACION_INVALIDA", "Debes enviar al menos una asignación")
     for item in asignaciones:
@@ -286,9 +321,14 @@ def asignar(producto_id: int, asignaciones: list, usuario_id: int = None) -> dic
         raise AsignacionesError("DB_NO_DISPONIBLE", "Sin conexión a BD", 500)
     try:
         cursor = conn.cursor(dictionary=True)
-        cursor.execute("SELECT id FROM importacion_productos WHERE id = %s FOR UPDATE", (producto_id,))
-        if not cursor.fetchone():
+        cursor.execute(
+            "SELECT id, importacion_id FROM importacion_productos WHERE id = %s FOR UPDATE",
+            (producto_id,),
+        )
+        producto = cursor.fetchone()
+        if not producto:
             raise AsignacionesError("PRODUCTO_NO_EXISTE", "El producto no existe", 404)
+        _verificar_pertenencia(producto, importacion_id)
 
         for item in asignaciones:
             clave = item["clave_cliente"].strip().upper()
@@ -345,7 +385,7 @@ def asignar(producto_id: int, asignaciones: list, usuario_id: int = None) -> dic
 
 
 def crear_venta_sobrante(producto_id: int, clave_cliente: str, cantidad, numero_pedido_odoo: str = None,
-                          usuario_id: int = None) -> dict:
+                          usuario_id: int = None, importacion_id: int = None) -> dict:
     if not isinstance(cantidad, int) or cantidad <= 0:
         raise AsignacionesError("VENTA_INVALIDA", "La cantidad debe ser un entero > 0")
     clave = (clave_cliente or "").strip().upper()
@@ -367,9 +407,14 @@ def crear_venta_sobrante(producto_id: int, clave_cliente: str, cantidad, numero_
             if existente:
                 return existente  # idempotente: no duplica, devuelve la venta ya creada
 
-        cursor.execute("SELECT id FROM importacion_productos WHERE id = %s FOR UPDATE", (producto_id,))
-        if not cursor.fetchone():
+        cursor.execute(
+            "SELECT id, importacion_id FROM importacion_productos WHERE id = %s FOR UPDATE",
+            (producto_id,),
+        )
+        producto = cursor.fetchone()
+        if not producto:
             raise AsignacionesError("PRODUCTO_NO_EXISTE", "El producto no existe", 404)
+        _verificar_pertenencia(producto, importacion_id)
 
         cursor.execute("SELECT clave FROM clientes WHERE clave = %s", (clave,))
         if not cursor.fetchone():
@@ -492,7 +537,7 @@ def recalcular_propuesta(importacion_id: int, periodo_filtro: str = None) -> lis
     return propuestas
 
 
-def cancelar_venta(venta_id: int, usuario_id: int = None) -> dict:
+def cancelar_venta(venta_id: int, usuario_id: int = None, importacion_id: int = None) -> dict:
     conn = obtener_conexion()
     if not conn:
         raise AsignacionesError("DB_NO_DISPONIBLE", "Sin conexión a BD", 500)
@@ -502,6 +547,7 @@ def cancelar_venta(venta_id: int, usuario_id: int = None) -> dict:
         venta = cursor.fetchone()
         if not venta:
             raise AsignacionesError("VENTA_NO_EXISTE", "La venta no existe", 404)
+        _verificar_pertenencia_venta(cursor, venta, importacion_id)
         if venta["estado"] == "CANCELADO":
             raise AsignacionesError("VENTA_YA_CANCELADA", "La venta ya estaba cancelada", 409)
 
@@ -526,7 +572,10 @@ def cancelar_venta(venta_id: int, usuario_id: int = None) -> dict:
         conn.close()
 
 
-def validar_venta_odoo(venta_id: int, numero_pedido_odoo: str = None) -> dict:
+def validar_venta_odoo(venta_id: int, numero_pedido_odoo: str = None,
+                        importacion_id: int = None) -> dict:
+    # Fase 1 — solo lectura. El folio NO se persiste hasta que Odoo confirme el pedido:
+    # si la validación falla en cualquier punto, la BD queda intacta.
     conn = obtener_conexion()
     if not conn:
         raise AsignacionesError("DB_NO_DISPONIBLE", "Sin conexión a BD", 500)
@@ -536,19 +585,13 @@ def validar_venta_odoo(venta_id: int, numero_pedido_odoo: str = None) -> dict:
         venta = cursor.fetchone()
         if not venta:
             raise AsignacionesError("VENTA_NO_EXISTE", "La venta no existe", 404)
+        _verificar_pertenencia_venta(cursor, venta, importacion_id)
         if venta["estado"] == "CANCELADO":
             raise AsignacionesError("VENTA_YA_CANCELADA", "No se puede validar una venta cancelada", 409)
 
         folio = (numero_pedido_odoo or venta["numero_pedido_odoo"] or "").strip()
         if not folio:
             raise AsignacionesError("PEDIDO_ODOO_INVALIDO", "Falta el número de pedido de Odoo")
-
-        if folio != venta["numero_pedido_odoo"]:
-            cursor.execute(
-                "UPDATE importacion_sobrantes_ventas SET numero_pedido_odoo = %s WHERE id = %s",
-                (folio, venta_id),
-            )
-            conn.commit()
 
         cursor.execute(
             "SELECT sku_norm FROM importacion_productos WHERE id = %s",
@@ -559,6 +602,7 @@ def validar_venta_odoo(venta_id: int, numero_pedido_odoo: str = None) -> dict:
     finally:
         conn.close()
 
+    # Fase 2 — validación contra Odoo, sin tocar la BD.
     uid, models, err = get_odoo_models()
     if not uid:
         logging.error("Odoo no disponible al validar pedido %s: %s", folio, err)
@@ -640,22 +684,57 @@ def validar_venta_odoo(venta_id: int, numero_pedido_odoo: str = None) -> dict:
             f"se esperaban {venta['cantidad']}",
         )
 
+    # Fase 3 — única escritura, ya con el pedido confirmado en Odoo: fila bloqueada,
+    # estado re-verificado (pudieron cancelarla durante el viaje a Odoo) y folio+estado
+    # en un solo UPDATE dentro de la misma transacción.
     conn2 = obtener_conexion()
     if not conn2:
         raise AsignacionesError("DB_NO_DISPONIBLE", "Sin conexión a BD", 500)
     try:
         cursor2 = conn2.cursor(dictionary=True)
         cursor2.execute(
-            "UPDATE importacion_sobrantes_ventas SET estado = 'VALIDADO' WHERE id = %s", (venta_id,)
+            "SELECT id, estado, numero_pedido_odoo FROM importacion_sobrantes_ventas "
+            "WHERE id = %s FOR UPDATE",
+            (venta_id,),
         )
+        actual = cursor2.fetchone()
+        if not actual:
+            raise AsignacionesError("VENTA_NO_EXISTE", "La venta no existe", 404)
+        if actual["estado"] == "CANCELADO":
+            raise AsignacionesError("VENTA_YA_CANCELADA", "No se puede validar una venta cancelada", 409)
+
+        try:
+            if folio != actual["numero_pedido_odoo"]:
+                cursor2.execute(
+                    "UPDATE importacion_sobrantes_ventas "
+                    "SET numero_pedido_odoo = %s, estado = 'VALIDADO' WHERE id = %s",
+                    (folio, venta_id),
+                )
+            else:
+                cursor2.execute(
+                    "UPDATE importacion_sobrantes_ventas SET estado = 'VALIDADO' WHERE id = %s",
+                    (venta_id,),
+                )
+        except mysql.connector.errors.IntegrityError:
+            conn2.rollback()
+            raise AsignacionesError(
+                "PEDIDO_ODOO_YA_ASOCIADO", f"El pedido {folio} ya está asociado a otra venta", 409
+            )
+
         conn2.commit()
         cursor2.execute("SELECT * FROM importacion_sobrantes_ventas WHERE id = %s", (venta_id,))
         return cursor2.fetchone()
+    except AsignacionesError:
+        conn2.rollback()
+        raise
+    except Exception:
+        conn2.rollback()
+        raise
     finally:
         conn2.close()
 
 
-def obtener_detalle_producto(producto_id: int) -> dict:
+def obtener_detalle_producto(producto_id: int, importacion_id: int = None) -> dict:
     conn = obtener_conexion()
     if not conn:
         raise AsignacionesError("DB_NO_DISPONIBLE", "Sin conexión a BD", 500)
@@ -665,6 +744,7 @@ def obtener_detalle_producto(producto_id: int) -> dict:
         producto = cursor.fetchone()
         if not producto:
             raise AsignacionesError("PRODUCTO_NO_EXISTE", "El producto no existe", 404)
+        _verificar_pertenencia(producto, importacion_id)
 
         cursor.execute(
             "SELECT * FROM importacion_asignaciones WHERE importacion_producto_id = %s ORDER BY prioridad",
@@ -681,11 +761,16 @@ def obtener_detalle_producto(producto_id: int) -> dict:
     finally:
         conn.close()
 
+    # Reusa el cálculo de listar_productos para no duplicar la lógica de
+    # cantidad_asignada/vendida/sobrante/disponible.
+    productos = listar_productos(producto["importacion_id"])
+    producto_calculado = next((p for p in productos if p["id"] == producto_id), producto)
+
     propuesta = recalcular_propuesta(producto["importacion_id"], producto["periodo"])
     fila = next((p for p in propuesta if p["producto_id"] == producto_id), None)
 
     return {
-        "producto": producto,
+        "producto": producto_calculado,
         "proyecciones": fila["propuesta"] if fila else [],
         "asignaciones": asignaciones,
         "sobrantes_ventas": ventas,
