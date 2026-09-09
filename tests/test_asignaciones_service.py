@@ -651,3 +651,103 @@ def test_listar_movimientos_devuelve_los_del_embarque(mocker):
 
     assert len(resultado) == 1
     assert resultado[0]["tipo_movimiento"] == "ENTRADA"
+
+
+def test_caso_10_embarcadas_8_proyectadas_deja_2_sobrantes(mocker):
+    cursor = MagicMock()
+    cursor.fetchone.side_effect = [{"id": 1}]
+    cursor.fetchall.return_value = [
+        {"id": 10, "sku": "SKU-1", "sku_norm": "SKU1", "periodo": "2026-2027",
+         "cantidad_embarcada": 10, "importacion_id": 1},
+    ]
+    _mock_conn(mocker, cursor)
+    mocker.patch("services.asignaciones_service._disponible_producto", return_value=10)
+    mocker.patch(
+        "services.asignaciones_service.demanda_neta_por_cliente",
+        return_value={"SKU1": {"LC657": 3, "MC677": 2, "HE420": 1, "JC539": 2}},  # total 8
+    )
+
+    propuestas = recalcular_propuesta(1)
+
+    assert sum(c["cantidad_sugerida"] for c in propuestas[0]["propuesta"]) == 8
+    assert propuestas[0]["sobrante_estimado"] == 2
+
+
+def test_caso_10_embarcadas_15_proyectadas_asigna_10_deja_0_sobrante_5_faltan(mocker):
+    cursor = MagicMock()
+    cursor.fetchone.side_effect = [{"id": 1}]
+    cursor.fetchall.return_value = [
+        {"id": 10, "sku": "SKU-1", "sku_norm": "SKU1", "periodo": "2026-2027",
+         "cantidad_embarcada": 10, "importacion_id": 1},
+    ]
+    _mock_conn(mocker, cursor)
+    mocker.patch("services.asignaciones_service._disponible_producto", return_value=10)
+    mocker.patch(
+        "services.asignaciones_service.demanda_neta_por_cliente",
+        return_value={"SKU1": {"LC657": 8, "MC677": 7}},  # total 15 > 10 embarcado
+    )
+
+    propuestas = recalcular_propuesta(1)
+
+    total_asignado = sum(c["cantidad_sugerida"] for c in propuestas[0]["propuesta"])
+    assert total_asignado == 10  # nunca más de lo embarcado
+    assert propuestas[0]["sobrante_estimado"] == 0
+    faltante = sum(c["cantidad_proyectada"] for c in propuestas[0]["propuesta"]) - total_asignado
+    assert faltante == 5  # 15 proyectado - 10 asignado
+
+
+def test_caso_10_embarcadas_10_proyectadas_deja_0_sobrante(mocker):
+    cursor = MagicMock()
+    cursor.fetchone.side_effect = [{"id": 1}]
+    cursor.fetchall.return_value = [
+        {"id": 10, "sku": "SKU-1", "sku_norm": "SKU1", "periodo": "2026-2027",
+         "cantidad_embarcada": 10, "importacion_id": 1},
+    ]
+    _mock_conn(mocker, cursor)
+    mocker.patch("services.asignaciones_service._disponible_producto", return_value=10)
+    mocker.patch(
+        "services.asignaciones_service.demanda_neta_por_cliente",
+        return_value={"SKU1": {"LC657": 10}},
+    )
+
+    propuestas = recalcular_propuesta(1)
+
+    assert propuestas[0]["sobrante_estimado"] == 0
+
+
+def test_caso_cliente_sin_prioridad_usa_fallback_999_y_orden_alfabetico(mocker):
+    cursor = MagicMock()
+    cursor.fetchone.side_effect = [{"id": 1}]
+    cursor.fetchall.return_value = [
+        {"id": 10, "sku": "SKU-1", "sku_norm": "SKU1", "periodo": "2026-2027",
+         "cantidad_embarcada": 100, "importacion_id": 1},
+    ]
+    _mock_conn(mocker, cursor)
+    mocker.patch("services.asignaciones_service._disponible_producto", return_value=100)
+    mocker.patch(
+        "services.asignaciones_service.demanda_neta_por_cliente",
+        return_value={"SKU1": {
+            "ZZ999": 5,    # no está en PRIORIDAD_CLIENTES -> 999
+            "AA111": 5,    # tampoco está -> 999, pero alfabéticamente antes que ZZ999
+            "LC657": 5,    # prioridad real 1
+        }},
+    )
+
+    propuestas = recalcular_propuesta(1)
+
+    orden = [c["clave_cliente"] for c in propuestas[0]["propuesta"]]
+    assert orden == ["LC657", "AA111", "ZZ999"]  # prioridad real primero, luego alfabético entre los 999
+    assert next(c["prioridad"] for c in propuestas[0]["propuesta"] if c["clave_cliente"] == "AA111") == 999
+
+
+def test_caso_sku_con_y_sin_guiones_se_detecta_como_duplicado(mocker):
+    cursor = MagicMock()
+    cursor.fetchone.side_effect = [
+        {"id": 1},                                # importacion existe
+        {"id": 5, "sku_norm": "4271020001004"},   # YA existe el mismo sku_norm (se cargó antes con guiones)
+    ]
+    _mock_conn(mocker, cursor)
+
+    with pytest.raises(AsignacionesError) as exc:
+        crear_producto(1, "4271020001004", 10, "2026-2027")  # ahora sin guiones
+    assert exc.value.code == "SKU_DUPLICADO"
