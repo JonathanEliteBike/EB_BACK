@@ -30,6 +30,7 @@ from routes.ventas import ventas_bp
 from routes.garantias import garantias_bp
 from routes.importaciones import importaciones_bp
 from routes.proyecciones_my27 import proyecciones_my27_bp
+from routes.asignaciones_importaciones import asignaciones_bp
 from routes.solicitud_retroactivo import solicitud_retroactivo_bp
 from routes.solicitud_retroactivo_campanias import solicitud_retroactivo_campanias_bp
 
@@ -170,6 +171,7 @@ def create_app():
     app.register_blueprint(garantias_bp)
     app.register_blueprint(importaciones_bp)
     app.register_blueprint(proyecciones_my27_bp)
+    app.register_blueprint(asignaciones_bp)
     app.register_blueprint(solicitud_retroactivo_bp)
     app.register_blueprint(solicitud_retroactivo_campanias_bp)
 
