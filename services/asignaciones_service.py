@@ -343,6 +343,80 @@ def asignar(producto_id: int, asignaciones: list, usuario_id: int = None) -> dic
         conn.close()
 
 
+def crear_venta_sobrante(producto_id: int, clave_cliente: str, cantidad, numero_pedido_odoo: str = None,
+                          usuario_id: int = None) -> dict:
+    if not isinstance(cantidad, int) or cantidad <= 0:
+        raise AsignacionesError("VENTA_INVALIDA", "La cantidad debe ser un entero > 0")
+    clave = (clave_cliente or "").strip().upper()
+    if not clave:
+        raise AsignacionesError("CLIENTE_NO_EXISTE", "Falta clave_cliente")
+    folio = (numero_pedido_odoo or "").strip() or None
+
+    conn = obtener_conexion()
+    if not conn:
+        raise AsignacionesError("DB_NO_DISPONIBLE", "Sin conexión a BD", 500)
+    try:
+        cursor = conn.cursor(dictionary=True)
+
+        if folio:
+            cursor.execute(
+                "SELECT * FROM importacion_sobrantes_ventas WHERE numero_pedido_odoo = %s", (folio,)
+            )
+            existente = cursor.fetchone()
+            if existente:
+                return existente  # idempotente: no duplica, devuelve la venta ya creada
+
+        cursor.execute("SELECT id FROM importacion_productos WHERE id = %s FOR UPDATE", (producto_id,))
+        if not cursor.fetchone():
+            raise AsignacionesError("PRODUCTO_NO_EXISTE", "El producto no existe", 404)
+
+        cursor.execute("SELECT clave FROM clientes WHERE clave = %s", (clave,))
+        if not cursor.fetchone():
+            raise AsignacionesError("CLIENTE_NO_EXISTE", f"El cliente {clave} no existe", 404)
+
+        disponible = _disponible_producto(cursor, producto_id)
+        if cantidad > disponible:
+            raise AsignacionesError(
+                "SOBRANTE_INSUFICIENTE", f"Disponible: {disponible}, solicitado: {cantidad}", 409
+            )
+
+        try:
+            cursor.execute(
+                "INSERT INTO importacion_sobrantes_ventas "
+                "(importacion_producto_id, clave_cliente, cantidad, numero_pedido_odoo, estado, created_by) "
+                "VALUES (%s, %s, %s, %s, 'PENDIENTE_VALIDACION', %s)",
+                (producto_id, clave, cantidad, folio, usuario_id),
+            )
+        except mysql.connector.errors.IntegrityError:
+            conn.rollback()
+            if not folio:
+                raise
+            cursor.execute(
+                "SELECT * FROM importacion_sobrantes_ventas WHERE numero_pedido_odoo = %s", (folio,)
+            )
+            existente = cursor.fetchone()
+            if existente:
+                return existente
+            raise AsignacionesError(
+                "PEDIDO_ODOO_YA_ASOCIADO", f"El pedido {folio} ya está asociado a otra venta", 409
+            )
+
+        venta_id = cursor.lastrowid
+        _registrar_movimiento(cursor, producto_id, "VENTA_SOBRANTE", -cantidad, clave_cliente=clave,
+                               referencia_externa=folio, usuario_id=usuario_id)
+        conn.commit()
+        cursor.execute("SELECT * FROM importacion_sobrantes_ventas WHERE id = %s", (venta_id,))
+        return cursor.fetchone()
+    except AsignacionesError:
+        conn.rollback()
+        raise
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
 def recalcular_propuesta(importacion_id: int, periodo_filtro: str = None) -> list:
     conn = obtener_conexion()
     if not conn:

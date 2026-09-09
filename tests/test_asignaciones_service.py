@@ -1,12 +1,14 @@
 # tests/test_asignaciones_service.py
 from unittest.mock import MagicMock
 
+import mysql.connector.errors
 import pytest
 
 from services.asignaciones_service import (
     AsignacionesError, actualizar_producto, crear_producto, listar_productos, recalcular_propuesta,
 )
 from services.asignaciones_service import asignar
+from services.asignaciones_service import crear_venta_sobrante
 
 
 def _mock_conn(mocker, cursor):
@@ -281,3 +283,73 @@ def test_asignar_a_cliente_ya_asignado_suma_en_lugar_de_duplicar(mocker):
     assert len(updates) == 1
     inserts = [c for c in cursor.execute.call_args_list if "INSERT INTO importacion_asignaciones" in c.args[0]]
     assert len(inserts) == 0
+
+
+def test_venta_sobrante_rechaza_cantidad_invalida():
+    with pytest.raises(AsignacionesError) as exc:
+        crear_venta_sobrante(10, "LC657", 0)
+    assert exc.value.code == "VENTA_INVALIDA"
+
+
+def test_venta_sobrante_rechaza_sobreventa(mocker):
+    cursor = MagicMock()
+    cursor.fetchone.side_effect = [{"id": 10}, {"clave": "LC657"}]
+    _mock_conn(mocker, cursor)
+    mocker.patch("services.asignaciones_service._disponible_producto", return_value=1)
+
+    with pytest.raises(AsignacionesError) as exc:
+        crear_venta_sobrante(10, "LC657", 2)  # pide 2, solo hay 1 disponible
+    assert exc.value.code == "SOBRANTE_INSUFICIENTE"
+
+
+def test_venta_sobrante_exitosa_queda_pendiente_de_validacion(mocker):
+    cursor = MagicMock()
+    cursor.fetchone.side_effect = [
+        {"id": 10},                    # producto FOR UPDATE
+        {"clave": "LC657"},            # cliente existe
+        {"id": 77, "estado": "PENDIENTE_VALIDACION", "numero_pedido_odoo": None},  # SELECT final
+    ]
+    cursor.lastrowid = 77
+    _mock_conn(mocker, cursor)
+    mocker.patch("services.asignaciones_service._disponible_producto", return_value=5)
+
+    resultado = crear_venta_sobrante(10, "LC657", 1)
+
+    assert resultado["estado"] == "PENDIENTE_VALIDACION"
+
+
+def test_venta_sobrante_con_folio_repetido_devuelve_la_existente_sin_duplicar(mocker):
+    cursor = MagicMock()
+    venta_existente = {"id": 1, "numero_pedido_odoo": "SO12345", "estado": "VALIDADO"}
+    cursor.fetchone.side_effect = [venta_existente]  # el chequeo previo ya la encuentra
+    _mock_conn(mocker, cursor)
+
+    resultado = crear_venta_sobrante(10, "LC657", 1, numero_pedido_odoo="SO12345")
+
+    assert resultado == venta_existente
+    inserts = [c for c in cursor.execute.call_args_list if c.args[0].startswith("INSERT")]
+    assert len(inserts) == 0  # nunca llegó a intentar el INSERT
+
+
+def test_venta_sobrante_race_condition_en_integrity_error_no_duplica(mocker):
+    cursor = MagicMock()
+    venta_ganadora = {"id": 1, "numero_pedido_odoo": "SO12345", "estado": "PENDIENTE_VALIDACION"}
+    cursor.fetchone.side_effect = [
+        None,               # chequeo previo: todavía no existe
+        {"id": 10},          # producto FOR UPDATE
+        {"clave": "LC657"},  # cliente existe
+        venta_ganadora,       # SELECT tras el IntegrityError: otro proceso ganó la carrera
+    ]
+    cursor.execute.side_effect = [
+        None, None, None,  # SELECT folio, SELECT producto FOR UPDATE, SELECT cliente
+        # (_disponible_producto está mockeado a nivel de función más abajo, así que no
+        # pasa por cursor.execute: no le corresponde una entrada aquí)
+        mysql.connector.errors.IntegrityError("Duplicate entry"),  # INSERT falla por la carrera
+        None,  # SELECT de recuperación
+    ]
+    _mock_conn(mocker, cursor)
+    mocker.patch("services.asignaciones_service._disponible_producto", return_value=5)
+
+    resultado = crear_venta_sobrante(10, "LC657", 1, numero_pedido_odoo="SO12345")
+
+    assert resultado == venta_ganadora
