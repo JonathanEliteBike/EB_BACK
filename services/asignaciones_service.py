@@ -307,6 +307,11 @@ def actualizar_producto(producto_id: int, cantidad_embarcada=None, descripcion: 
 
 def asignar(producto_id: int, asignaciones: list, usuario_id: int = None,
             importacion_id: int = None) -> dict:
+    """Cada item admite un `cantidad_proyectada` opcional: la demanda proyectada para ese
+    cliente en el momento de esta decisión (típicamente lo que `recalcular_propuesta` reportó
+    para él). Es un snapshot, no un total: al insertar se guarda tal cual (0 si se omite); al
+    actualizar una asignación ya existente se SOBRESCRIBE con el nuevo valor si se envía, y se
+    deja intacta si se omite — nunca se suma."""
     if not asignaciones:
         raise AsignacionesError("ASIGNACION_INVALIDA", "Debes enviar al menos una asignación")
     for item in asignaciones:
@@ -315,6 +320,11 @@ def asignar(producto_id: int, asignaciones: list, usuario_id: int = None,
             raise AsignacionesError("ASIGNACION_INVALIDA", "La cantidad de cada asignación debe ser un entero > 0")
         if not item.get("clave_cliente"):
             raise AsignacionesError("CLIENTE_NO_EXISTE", "Falta clave_cliente en una de las asignaciones")
+        cantidad_proyectada = item.get("cantidad_proyectada")
+        if cantidad_proyectada is not None and (not isinstance(cantidad_proyectada, int) or cantidad_proyectada < 0):
+            raise AsignacionesError(
+                "ASIGNACION_INVALIDA", "cantidad_proyectada debe ser un entero >= 0"
+            )
 
     conn = obtener_conexion()
     if not conn:
@@ -348,6 +358,7 @@ def asignar(producto_id: int, asignaciones: list, usuario_id: int = None,
         for item in asignaciones:
             clave = item["clave_cliente"].strip().upper()
             cantidad = item["cantidad"]
+            cantidad_proyectada = item.get("cantidad_proyectada")
             prio_info = _PRIORIDAD_MAP.get(clave, (999, clave))
 
             cursor.execute(
@@ -357,17 +368,26 @@ def asignar(producto_id: int, asignaciones: list, usuario_id: int = None,
             )
             existente = cursor.fetchone()
             if existente:
-                cursor.execute(
-                    "UPDATE importacion_asignaciones SET cantidad_asignada = cantidad_asignada + %s, "
-                    "estado = 'ACTIVA', usuario_id = %s, prioridad = %s WHERE id = %s",
-                    (cantidad, usuario_id, prio_info[0], existente["id"]),
-                )
+                if cantidad_proyectada is not None:
+                    cursor.execute(
+                        "UPDATE importacion_asignaciones SET cantidad_asignada = cantidad_asignada + %s, "
+                        "cantidad_proyectada = %s, estado = 'ACTIVA', usuario_id = %s, prioridad = %s "
+                        "WHERE id = %s",
+                        (cantidad, cantidad_proyectada, usuario_id, prio_info[0], existente["id"]),
+                    )
+                else:
+                    cursor.execute(
+                        "UPDATE importacion_asignaciones SET cantidad_asignada = cantidad_asignada + %s, "
+                        "estado = 'ACTIVA', usuario_id = %s, prioridad = %s WHERE id = %s",
+                        (cantidad, usuario_id, prio_info[0], existente["id"]),
+                    )
             else:
                 cursor.execute(
                     "INSERT INTO importacion_asignaciones "
                     "(importacion_producto_id, clave_cliente, cantidad_proyectada, cantidad_asignada, "
                     "prioridad, estado, usuario_id) VALUES (%s, %s, %s, %s, %s, 'ACTIVA', %s)",
-                    (producto_id, clave, cantidad, cantidad, prio_info[0], usuario_id),
+                    (producto_id, clave, cantidad_proyectada if cantidad_proyectada is not None else 0,
+                     cantidad, prio_info[0], usuario_id),
                 )
             _registrar_movimiento(cursor, producto_id, "ASIGNACION", -cantidad, clave_cliente=clave,
                                    usuario_id=usuario_id)

@@ -317,9 +317,68 @@ def test_asignar_exitoso_inserta_asignacion_y_movimiento(mocker):
     inserts = [c for c in cursor.execute.call_args_list if "INSERT INTO importacion_asignaciones" in c.args[0]]
     assert len(inserts) == 1
     assert inserts[0].args[1][1] == "LC657"  # clave normalizada a mayúsculas
+    assert inserts[0].args[1][2] == 0  # cantidad_proyectada omitida -> default 0, no duplica cantidad
     movimientos = [c for c in cursor.execute.call_args_list if "INSERT INTO importacion_movimientos" in c.args[0]]
     assert movimientos[0].args[1][1] == "ASIGNACION"
     assert movimientos[0].args[1][2] == -3
+
+
+def test_asignar_rechaza_cantidad_proyectada_negativa():
+    with pytest.raises(AsignacionesError) as exc:
+        asignar(10, [{"clave_cliente": "LC657", "cantidad": 1, "cantidad_proyectada": -1}])
+    assert exc.value.code == "ASIGNACION_INVALIDA"
+
+
+def test_asignar_guarda_cantidad_proyectada_provista_en_insert(mocker):
+    cursor = MagicMock()
+    cursor.fetchone.side_effect = [
+        {"id": 10},                # producto FOR UPDATE
+        {"clave": "LC657"},        # cliente existe
+        None,                      # no hay asignación previa para este cliente
+    ]
+    _mock_conn(mocker, cursor)
+    mocker.patch("services.asignaciones_service._disponible_producto", return_value=5)
+
+    asignar(10, [{"clave_cliente": "LC657", "cantidad": 3, "cantidad_proyectada": 8}])
+
+    inserts = [c for c in cursor.execute.call_args_list if "INSERT INTO importacion_asignaciones" in c.args[0]]
+    assert len(inserts) == 1
+    assert inserts[0].args[1][2] == 8  # se guarda tal cual, no igual a la cantidad asignada (3)
+
+
+def test_asignar_sobrescribe_cantidad_proyectada_en_update_no_suma(mocker):
+    cursor = MagicMock()
+    cursor.fetchone.side_effect = [
+        {"id": 10},
+        {"clave": "LC657"},
+        {"id": 55},  # ya existe una fila de asignación para este producto+cliente
+    ]
+    _mock_conn(mocker, cursor)
+    mocker.patch("services.asignaciones_service._disponible_producto", return_value=5)
+
+    asignar(10, [{"clave_cliente": "LC657", "cantidad": 2, "cantidad_proyectada": 9}])
+
+    updates = [c for c in cursor.execute.call_args_list if "UPDATE importacion_asignaciones" in c.args[0]]
+    assert len(updates) == 1
+    assert "cantidad_proyectada = %s" in updates[0].args[0]
+    assert updates[0].args[1][1] == 9  # sobrescribe, no suma sobre un valor previo
+
+
+def test_asignar_no_toca_cantidad_proyectada_si_se_omite_en_update(mocker):
+    cursor = MagicMock()
+    cursor.fetchone.side_effect = [
+        {"id": 10},
+        {"clave": "LC657"},
+        {"id": 55},  # ya existe una fila de asignación para este producto+cliente
+    ]
+    _mock_conn(mocker, cursor)
+    mocker.patch("services.asignaciones_service._disponible_producto", return_value=5)
+
+    asignar(10, [{"clave_cliente": "LC657", "cantidad": 2}])  # sin cantidad_proyectada
+
+    updates = [c for c in cursor.execute.call_args_list if "UPDATE importacion_asignaciones" in c.args[0]]
+    assert len(updates) == 1
+    assert "cantidad_proyectada" not in updates[0].args[0]
 
 
 def test_asignar_a_cliente_ya_asignado_suma_en_lugar_de_duplicar(mocker):
