@@ -36,6 +36,31 @@ def test_inicializar_tablas_con_rol_no_permitido_devuelve_403():
     assert resp.get_json()["error"]["code"] == "NO_AUTORIZADO"
 
 
+def test_error_de_negocio_respeta_el_contrato_uniforme_end_to_end():
+    """El errorhandler del blueprint debe producir {"ok": false, "error": {code, message}}
+    con el status del error, no un HTML 500 ni otra forma."""
+    conn = obtener_conexion()
+    if not conn:
+        import pytest
+        pytest.skip("Sin conexión a BD local para este test")
+    conn.close()
+
+    client = _cliente_test()
+    token = _token_valido(rol=1)
+    resp = client.get(
+        "/importaciones/999999/asignaciones",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+
+    assert resp.status_code == 404
+    assert resp.is_json
+    body = resp.get_json()
+    assert body["ok"] is False
+    assert body["error"]["code"] == "IMPORTACION_NO_EXISTE"
+    assert isinstance(body["error"]["message"], str) and body["error"]["message"]
+    assert set(body.keys()) == {"ok", "error"}
+
+
 def test_inicializar_tablas_crea_las_4_tablas_en_bd_real():
     conn = obtener_conexion()
     if not conn:

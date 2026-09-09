@@ -28,6 +28,14 @@ def _manejar_error_asignaciones(err):
     return jsonify({"ok": False, "error": {"code": err.code, "message": err.message}}), err.status
 
 
+@asignaciones_bp.errorhandler(Exception)
+def _manejar_error_inesperado(err):
+    # Flask resuelve primero el handler más específico (AsignacionesError), así que esto
+    # solo atrapa lo que hoy se escaparía como HTML 500 fuera del contrato {ok, error}.
+    logging.exception("Error inesperado en asignaciones")
+    return jsonify({"ok": False, "error": {"code": "ERROR_INTERNO", "message": "Error interno"}}), 500
+
+
 @asignaciones_bp.route("/asignaciones/inicializar-tablas", methods=["POST"])
 @token_required
 @_requiere_rol_importaciones
@@ -84,6 +92,7 @@ def actualizar_producto_ruta(importacion_id, producto_id):
         cantidad_embarcada=body.get("cantidad_embarcada"),
         descripcion=body.get("descripcion"),
         usuario_id=payload.get("id"),
+        importacion_id=importacion_id,
     )
     return jsonify({"ok": True, "data": data}), 200
 
@@ -103,7 +112,10 @@ def recalcular_ruta(importacion_id):
 def asignar_ruta(importacion_id, producto_id):
     body = request.get_json(silent=True) or {}
     payload = getattr(request, "cliente_data", {}) or {}
-    data = svc.asignar(producto_id, body.get("asignaciones") or [], usuario_id=payload.get("id"))
+    data = svc.asignar(
+        producto_id, body.get("asignaciones") or [], usuario_id=payload.get("id"),
+        importacion_id=importacion_id,
+    )
     return jsonify({"ok": True, "data": data}), 200
 
 
@@ -121,6 +133,7 @@ def venta_sobrante_ruta(importacion_id, producto_id):
         cantidad=body.get("cantidad"),
         numero_pedido_odoo=body.get("numero_pedido_odoo"),
         usuario_id=payload.get("id"),
+        importacion_id=importacion_id,
     )
     return jsonify({"ok": True, "data": data}), 201
 
@@ -132,7 +145,9 @@ def venta_sobrante_ruta(importacion_id, producto_id):
 @_requiere_rol_importaciones
 def validar_odoo_ruta(importacion_id, venta_id):
     body = request.get_json(silent=True) or {}
-    data = svc.validar_venta_odoo(venta_id, body.get("numero_pedido_odoo"))
+    data = svc.validar_venta_odoo(
+        venta_id, body.get("numero_pedido_odoo"), importacion_id=importacion_id
+    )
     return jsonify({"ok": True, "data": data}), 200
 
 
@@ -143,7 +158,7 @@ def validar_odoo_ruta(importacion_id, venta_id):
 @_requiere_rol_importaciones
 def cancelar_venta_ruta(importacion_id, venta_id):
     payload = getattr(request, "cliente_data", {}) or {}
-    data = svc.cancelar_venta(venta_id, usuario_id=payload.get("id"))
+    data = svc.cancelar_venta(venta_id, usuario_id=payload.get("id"), importacion_id=importacion_id)
     return jsonify({"ok": True, "data": data}), 200
 
 
@@ -161,7 +176,7 @@ def resumen_ruta(importacion_id):
 @token_required
 @_requiere_rol_importaciones
 def detalle_producto_ruta(importacion_id, producto_id):
-    data = svc.obtener_detalle_producto(producto_id)
+    data = svc.obtener_detalle_producto(producto_id, importacion_id=importacion_id)
     return jsonify({"ok": True, "data": data}), 200
 
 
