@@ -9,6 +9,7 @@ import logging
 import mysql.connector
 
 from db_conexion import obtener_conexion
+from utils.odoo_utils import get_odoo_models, ODOO_DB, ODOO_PASSWORD, ODOO_COMPANY_ID
 
 
 class AsignacionesError(Exception):
@@ -489,3 +490,132 @@ def recalcular_propuesta(importacion_id: int, periodo_filtro: str = None) -> lis
                 "sobrante_estimado": restante,
             })
     return propuestas
+
+
+def validar_venta_odoo(venta_id: int, numero_pedido_odoo: str = None) -> dict:
+    conn = obtener_conexion()
+    if not conn:
+        raise AsignacionesError("DB_NO_DISPONIBLE", "Sin conexión a BD", 500)
+    try:
+        cursor = conn.cursor(dictionary=True)
+        cursor.execute("SELECT * FROM importacion_sobrantes_ventas WHERE id = %s", (venta_id,))
+        venta = cursor.fetchone()
+        if not venta:
+            raise AsignacionesError("VENTA_NO_EXISTE", "La venta no existe", 404)
+        if venta["estado"] == "CANCELADO":
+            raise AsignacionesError("VENTA_YA_CANCELADA", "No se puede validar una venta cancelada", 409)
+
+        folio = (numero_pedido_odoo or venta["numero_pedido_odoo"] or "").strip()
+        if not folio:
+            raise AsignacionesError("PEDIDO_ODOO_INVALIDO", "Falta el número de pedido de Odoo")
+
+        if folio != venta["numero_pedido_odoo"]:
+            cursor.execute(
+                "UPDATE importacion_sobrantes_ventas SET numero_pedido_odoo = %s WHERE id = %s",
+                (folio, venta_id),
+            )
+            conn.commit()
+
+        cursor.execute(
+            "SELECT sku_norm FROM importacion_productos WHERE id = %s",
+            (venta["importacion_producto_id"],),
+        )
+        producto = cursor.fetchone()
+        sku_norm_esperado = producto["sku_norm"] if producto else None
+    finally:
+        conn.close()
+
+    uid, models, err = get_odoo_models()
+    if not uid:
+        logging.error("Odoo no disponible al validar pedido %s: %s", folio, err)
+        raise AsignacionesError(
+            "PEDIDO_ODOO_NO_DISPONIBLE", "No fue posible validar el pedido en Odoo, intenta de nuevo", 503
+        )
+
+    try:
+        pedidos = models.execute_kw(
+            ODOO_DB, uid, ODOO_PASSWORD, "sale.order", "search_read",
+            [[("company_id", "=", ODOO_COMPANY_ID), ("name", "=", folio)]],
+            {"fields": ["id", "name", "partner_id", "state", "order_line"]},
+        )
+    except Exception:
+        logging.exception("Error consultando sale.order %s en Odoo", folio)
+        raise AsignacionesError(
+            "PEDIDO_ODOO_NO_DISPONIBLE", "No fue posible validar el pedido en Odoo, intenta de nuevo", 503
+        )
+
+    if not pedidos:
+        raise AsignacionesError("PEDIDO_ODOO_NO_EXISTE", f"No existe el pedido {folio} en Odoo", 404)
+    pedido = pedidos[0]
+
+    partner_ref = None
+    try:
+        partner = models.execute_kw(
+            ODOO_DB, uid, ODOO_PASSWORD, "res.partner", "read",
+            [[pedido["partner_id"][0]]], {"fields": ["ref"]},
+        )
+        partner_ref = (partner[0].get("ref") or "").strip().upper() if partner else None
+    except Exception:
+        logging.exception("Error leyendo res.partner para pedido %s", folio)
+
+    if partner_ref and partner_ref != venta["clave_cliente"].strip().upper():
+        raise AsignacionesError(
+            "PEDIDO_ODOO_INVALIDO",
+            f"El pedido {folio} pertenece a {partner_ref}, no a {venta['clave_cliente']}",
+        )
+
+    lineas = []
+    if pedido.get("order_line"):
+        try:
+            lineas = models.execute_kw(
+                ODOO_DB, uid, ODOO_PASSWORD, "sale.order.line", "read",
+                [pedido["order_line"]], {"fields": ["product_id", "product_uom_qty"]},
+            )
+        except Exception:
+            logging.exception("Error leyendo sale.order.line para pedido %s", folio)
+            raise AsignacionesError(
+                "PEDIDO_ODOO_NO_DISPONIBLE", "No fue posible validar el pedido en Odoo, intenta de nuevo", 503
+            )
+
+    producto_ids = list({linea["product_id"][0] for linea in lineas if linea.get("product_id")})
+    codigos = {}
+    if producto_ids:
+        try:
+            info = models.execute_kw(
+                ODOO_DB, uid, ODOO_PASSWORD, "product.product", "read",
+                [producto_ids], {"fields": ["default_code"]},
+            )
+        except Exception:
+            logging.exception("Error leyendo product.product para pedido %s", folio)
+            raise AsignacionesError(
+                "PEDIDO_ODOO_NO_DISPONIBLE", "No fue posible validar el pedido en Odoo, intenta de nuevo", 503
+            )
+        codigos = {row["id"]: row.get("default_code") for row in info}
+
+    cantidad_en_pedido = 0
+    for linea in lineas:
+        prod = linea.get("product_id")
+        default_code = codigos.get(prod[0]) if prod else None
+        if default_code and _norm_sku(default_code) == sku_norm_esperado:
+            cantidad_en_pedido += linea.get("product_uom_qty", 0)
+
+    if cantidad_en_pedido < venta["cantidad"]:
+        raise AsignacionesError(
+            "PEDIDO_ODOO_INVALIDO",
+            f"El pedido {folio} solo tiene {cantidad_en_pedido} unidades del SKU, "
+            f"se esperaban {venta['cantidad']}",
+        )
+
+    conn2 = obtener_conexion()
+    if not conn2:
+        raise AsignacionesError("DB_NO_DISPONIBLE", "Sin conexión a BD", 500)
+    try:
+        cursor2 = conn2.cursor(dictionary=True)
+        cursor2.execute(
+            "UPDATE importacion_sobrantes_ventas SET estado = 'VALIDADO' WHERE id = %s", (venta_id,)
+        )
+        conn2.commit()
+        cursor2.execute("SELECT * FROM importacion_sobrantes_ventas WHERE id = %s", (venta_id,))
+        return cursor2.fetchone()
+    finally:
+        conn2.close()

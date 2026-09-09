@@ -123,3 +123,14 @@ def venta_sobrante_ruta(importacion_id, producto_id):
         usuario_id=payload.get("id"),
     )
     return jsonify({"ok": True, "data": data}), 201
+
+
+@asignaciones_bp.route(
+    "/<int:importacion_id>/asignaciones/ventas/<int:venta_id>/validar-odoo", methods=["POST"]
+)
+@token_required
+@_requiere_rol_importaciones
+def validar_odoo_ruta(importacion_id, venta_id):
+    body = request.get_json(silent=True) or {}
+    data = svc.validar_venta_odoo(venta_id, body.get("numero_pedido_odoo"))
+    return jsonify({"ok": True, "data": data}), 200

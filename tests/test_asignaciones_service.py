@@ -9,6 +9,7 @@ from services.asignaciones_service import (
 )
 from services.asignaciones_service import asignar
 from services.asignaciones_service import crear_venta_sobrante
+from services.asignaciones_service import validar_venta_odoo
 
 
 def _mock_conn(mocker, cursor):
@@ -353,3 +354,119 @@ def test_venta_sobrante_race_condition_en_integrity_error_no_duplica(mocker):
     resultado = crear_venta_sobrante(10, "LC657", 1, numero_pedido_odoo="SO12345")
 
     assert resultado == venta_ganadora
+
+
+def _mock_conn_secuencia(mocker, fetchone_side_effect):
+    cursor = MagicMock()
+    cursor.fetchone.side_effect = fetchone_side_effect
+    conn = MagicMock()
+    conn.cursor.return_value = cursor
+    mocker.patch("services.asignaciones_service.obtener_conexion", return_value=conn)
+    return cursor
+
+
+def test_validar_odoo_venta_no_existe(mocker):
+    _mock_conn_secuencia(mocker, [None])
+    with pytest.raises(AsignacionesError) as exc:
+        validar_venta_odoo(999, "SO1")
+    assert exc.value.code == "VENTA_NO_EXISTE"
+
+
+def test_validar_odoo_rechaza_venta_cancelada(mocker):
+    _mock_conn_secuencia(mocker, [{"id": 1, "estado": "CANCELADO", "numero_pedido_odoo": "SO1"}])
+    with pytest.raises(AsignacionesError) as exc:
+        validar_venta_odoo(1, "SO1")
+    assert exc.value.code == "VENTA_YA_CANCELADA"
+
+
+def test_validar_odoo_no_disponible_no_rompe_la_venta(mocker):
+    _mock_conn_secuencia(mocker, [
+        {"id": 1, "estado": "PENDIENTE_VALIDACION", "numero_pedido_odoo": "SO1",
+         "clave_cliente": "LC657", "cantidad": 2, "importacion_producto_id": 10},
+        {"sku_norm": "SKU1"},
+    ])
+    mocker.patch("services.asignaciones_service.get_odoo_models", return_value=(None, None, "timeout"))
+
+    with pytest.raises(AsignacionesError) as exc:
+        validar_venta_odoo(1, "SO1")
+    assert exc.value.code == "PEDIDO_ODOO_NO_DISPONIBLE"
+    assert exc.value.status == 503
+
+
+def test_validar_odoo_pedido_no_existe_en_odoo(mocker):
+    _mock_conn_secuencia(mocker, [
+        {"id": 1, "estado": "PENDIENTE_VALIDACION", "numero_pedido_odoo": "SO1",
+         "clave_cliente": "LC657", "cantidad": 2, "importacion_producto_id": 10},
+        {"sku_norm": "SKU1"},
+    ])
+    models = MagicMock()
+    models.execute_kw.return_value = []  # sale.order search_read no encuentra nada
+    mocker.patch("services.asignaciones_service.get_odoo_models", return_value=(1, models, None))
+
+    with pytest.raises(AsignacionesError) as exc:
+        validar_venta_odoo(1, "SO1")
+    assert exc.value.code == "PEDIDO_ODOO_NO_EXISTE"
+
+
+def test_validar_odoo_rechaza_cliente_distinto(mocker):
+    _mock_conn_secuencia(mocker, [
+        {"id": 1, "estado": "PENDIENTE_VALIDACION", "numero_pedido_odoo": "SO1",
+         "clave_cliente": "LC657", "cantidad": 2, "importacion_producto_id": 10},
+        {"sku_norm": "SKU1"},
+    ])
+    models = MagicMock()
+    models.execute_kw.side_effect = [
+        [{"id": 5, "name": "SO1", "partner_id": [99, "Otro"], "state": "sale", "order_line": []}],
+        [{"ref": "MC677"}],  # partner con ref distinto al de la venta
+    ]
+    mocker.patch("services.asignaciones_service.get_odoo_models", return_value=(1, models, None))
+
+    with pytest.raises(AsignacionesError) as exc:
+        validar_venta_odoo(1, "SO1")
+    assert exc.value.code == "PEDIDO_ODOO_INVALIDO"
+
+
+def test_validar_odoo_rechaza_cantidad_insuficiente_en_las_lineas(mocker):
+    _mock_conn_secuencia(mocker, [
+        {"id": 1, "estado": "PENDIENTE_VALIDACION", "numero_pedido_odoo": "SO1",
+         "clave_cliente": "LC657", "cantidad": 2, "importacion_producto_id": 10},
+        {"sku_norm": "4271020001004"},
+    ])
+    models = MagicMock()
+    models.execute_kw.side_effect = [
+        [{"id": 5, "name": "SO1", "partner_id": [1, "LC657"], "state": "sale", "order_line": [50]}],
+        [{"ref": "LC657"}],
+        [{"product_id": [200, "Bici"], "product_uom_qty": 1.0}],  # solo 1 unidad, se esperaban 2
+        [{"id": 200, "default_code": "427102-0001004"}],
+    ]
+    mocker.patch("services.asignaciones_service.get_odoo_models", return_value=(1, models, None))
+
+    with pytest.raises(AsignacionesError) as exc:
+        validar_venta_odoo(1, "SO1")
+    assert exc.value.code == "PEDIDO_ODOO_INVALIDO"
+
+
+def test_validar_odoo_exitoso_marca_validado(mocker):
+    cursor = MagicMock()
+    cursor.fetchone.side_effect = [
+        {"id": 1, "estado": "PENDIENTE_VALIDACION", "numero_pedido_odoo": "SO1",
+         "clave_cliente": "LC657", "cantidad": 2, "importacion_producto_id": 10},
+        {"sku_norm": "4271020001004"},
+        {"id": 1, "estado": "VALIDADO", "numero_pedido_odoo": "SO1"},  # SELECT final (2da conexión)
+    ]
+    conn = MagicMock()
+    conn.cursor.return_value = cursor
+    mocker.patch("services.asignaciones_service.obtener_conexion", return_value=conn)
+
+    models = MagicMock()
+    models.execute_kw.side_effect = [
+        [{"id": 5, "name": "SO1", "partner_id": [1, "LC657"], "state": "sale", "order_line": [50]}],
+        [{"ref": "LC657"}],
+        [{"product_id": [200, "Bici"], "product_uom_qty": 2.0}],
+        [{"id": 200, "default_code": "427102-0001004"}],
+    ]
+    mocker.patch("services.asignaciones_service.get_odoo_models", return_value=(1, models, None))
+
+    resultado = validar_venta_odoo(1, "SO1")
+
+    assert resultado["estado"] == "VALIDADO"
