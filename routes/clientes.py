@@ -5,6 +5,7 @@ from datetime import date, datetime
 
 from utils.jwt_utils import verificar_token, SECRET_KEY
 from functools import wraps
+from services.proyecciones_service import obtener_prioridad_clientes
 
 clientes_bp = Blueprint('clientes', __name__, url_prefix='')
 
@@ -586,24 +587,24 @@ def obtener_facturas_grupo(id_grupo):
 
         ## NUEVO: Consulta optimizada con JOIN para filtrar por fecha en una sola operación
         query_facturas = """
-            SELECT 
+            SELECT
                 m.* -- Seleccionamos todas las columnas de la tabla monitor
-            FROM 
+            FROM
                 monitor m
-            JOIN 
+            JOIN
                 clientes c ON m.contacto_referencia = c.clave -- Unimos con clientes por la clave
-            WHERE 
+            WHERE
                 c.id_grupo = %s -- Filtramos por el ID del grupo
                 AND m.fecha_factura >= c.f_inicio -- Condición: la fecha de factura debe ser mayor o igual a la f_inicio del cliente
-                AND m.numero_factura IS NOT NULL 
+                AND m.numero_factura IS NOT NULL
                 AND m.numero_factura != '/'
-            ORDER BY 
+            ORDER BY
                 m.fecha_factura DESC
         """
-        
+
         cursor.execute(query_facturas, (id_grupo,))
         facturas = cursor.fetchall()
-        
+
         for factura in facturas:
             if factura.get('fecha_factura') and isinstance(factura['fecha_factura'], (datetime, date)):
                 factura['fecha_factura'] = factura['fecha_factura'].strftime('%Y-%m-%d %H:%M:%S')
@@ -618,3 +619,9 @@ def obtener_facturas_grupo(id_grupo):
             cursor.close()
         if conexion and conexion.is_connected():
             conexion.close()
+
+@clientes_bp.route('/clientes/prioridad', methods=['GET'])
+def obtener_prioridad_clientes_endpoint():
+    """Lista de prioridad de clientes centralizada — fuente única para
+    Proyecciones y Asignaciones de Importaciones (evita copias hardcodeadas)."""
+    return jsonify(obtener_prioridad_clientes()), 200
