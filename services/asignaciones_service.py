@@ -214,3 +214,57 @@ def listar_productos(importacion_id: int) -> list:
         return resultado
     finally:
         conn.close()
+
+
+def actualizar_producto(producto_id: int, cantidad_embarcada=None, descripcion: str = None,
+                         usuario_id: int = None) -> dict:
+    conn = obtener_conexion()
+    if not conn:
+        raise AsignacionesError("DB_NO_DISPONIBLE", "Sin conexión a BD", 500)
+    try:
+        cursor = conn.cursor(dictionary=True)
+        cursor.execute("SELECT * FROM importacion_productos WHERE id = %s FOR UPDATE", (producto_id,))
+        producto = cursor.fetchone()
+        if not producto:
+            raise AsignacionesError("PRODUCTO_NO_EXISTE", "El producto no existe", 404)
+
+        if cantidad_embarcada is not None:
+            if not isinstance(cantidad_embarcada, int) or cantidad_embarcada < 0:
+                raise AsignacionesError("AJUSTE_INVALIDO", "La cantidad embarcada debe ser un entero >= 0")
+            cursor.execute(
+                "SELECT COALESCE(SUM(cantidad_asignada), 0) AS total FROM importacion_asignaciones "
+                "WHERE importacion_producto_id = %s AND estado = 'ACTIVA'",
+                (producto_id,),
+            )
+            asignado = cursor.fetchone()["total"]
+            if cantidad_embarcada < asignado:
+                raise AsignacionesError(
+                    "AJUSTE_INVALIDO",
+                    f"No puedes bajar la cantidad embarcada ({cantidad_embarcada}) por debajo "
+                    f"de lo ya asignado ({asignado})",
+                )
+            diferencia = cantidad_embarcada - producto["cantidad_embarcada"]
+            if diferencia != 0:
+                cursor.execute(
+                    "UPDATE importacion_productos SET cantidad_embarcada = %s WHERE id = %s",
+                    (cantidad_embarcada, producto_id),
+                )
+                _registrar_movimiento(cursor, producto_id, "AJUSTE", diferencia, usuario_id=usuario_id)
+
+        if descripcion is not None:
+            cursor.execute(
+                "UPDATE importacion_productos SET descripcion = %s WHERE id = %s",
+                (descripcion, producto_id),
+            )
+
+        conn.commit()
+        cursor.execute("SELECT * FROM importacion_productos WHERE id = %s", (producto_id,))
+        return cursor.fetchone()
+    except AsignacionesError:
+        conn.rollback()
+        raise
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()

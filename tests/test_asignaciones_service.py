@@ -3,7 +3,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from services.asignaciones_service import AsignacionesError, crear_producto, listar_productos
+from services.asignaciones_service import AsignacionesError, actualizar_producto, crear_producto, listar_productos
 
 
 def _mock_conn(mocker, cursor):
@@ -90,3 +90,44 @@ def test_listar_productos_calcula_disponible_asignado_sobrante_vendido(mocker):
     assert resultado[0]["cantidad_asignada"] == 3
     assert resultado[0]["cantidad_sobrante"] == 7  # 10 embarcado - 3 asignado
     assert resultado[0]["cantidad_vendida"] == 0
+
+
+def test_actualizar_producto_no_existe(mocker):
+    cursor = MagicMock()
+    cursor.fetchone.return_value = None
+    _mock_conn(mocker, cursor)
+
+    with pytest.raises(AsignacionesError) as exc:
+        actualizar_producto(999, cantidad_embarcada=10)
+    assert exc.value.code == "PRODUCTO_NO_EXISTE"
+
+
+def test_actualizar_producto_rechaza_bajar_por_debajo_de_lo_asignado(mocker):
+    cursor = MagicMock()
+    cursor.fetchone.side_effect = [
+        {"id": 10, "cantidad_embarcada": 10},  # producto (FOR UPDATE)
+        {"total": 8},                          # ya asignado
+    ]
+    _mock_conn(mocker, cursor)
+
+    with pytest.raises(AsignacionesError) as exc:
+        actualizar_producto(10, cantidad_embarcada=5)
+    assert exc.value.code == "AJUSTE_INVALIDO"
+
+
+def test_actualizar_producto_registra_movimiento_ajuste(mocker):
+    cursor = MagicMock()
+    cursor.fetchone.side_effect = [
+        {"id": 10, "cantidad_embarcada": 10},
+        {"total": 3},
+        {"id": 10, "cantidad_embarcada": 15, "descripcion": None},  # SELECT final
+    ]
+    _mock_conn(mocker, cursor)
+
+    resultado = actualizar_producto(10, cantidad_embarcada=15)
+
+    assert resultado["cantidad_embarcada"] == 15
+    ajustes = [c for c in cursor.execute.call_args_list if "INSERT INTO importacion_movimientos" in c.args[0]]
+    assert len(ajustes) == 1
+    assert ajustes[0].args[1][1] == "AJUSTE"
+    assert ajustes[0].args[1][2] == 5  # 15 - 10
