@@ -270,6 +270,79 @@ def actualizar_producto(producto_id: int, cantidad_embarcada=None, descripcion: 
         conn.close()
 
 
+def asignar(producto_id: int, asignaciones: list, usuario_id: int = None) -> dict:
+    if not asignaciones:
+        raise AsignacionesError("ASIGNACION_INVALIDA", "Debes enviar al menos una asignación")
+    for item in asignaciones:
+        cantidad = item.get("cantidad")
+        if not isinstance(cantidad, int) or cantidad <= 0:
+            raise AsignacionesError("ASIGNACION_INVALIDA", "La cantidad de cada asignación debe ser un entero > 0")
+        if not item.get("clave_cliente"):
+            raise AsignacionesError("CLIENTE_NO_EXISTE", "Falta clave_cliente en una de las asignaciones")
+
+    conn = obtener_conexion()
+    if not conn:
+        raise AsignacionesError("DB_NO_DISPONIBLE", "Sin conexión a BD", 500)
+    try:
+        cursor = conn.cursor(dictionary=True)
+        cursor.execute("SELECT id FROM importacion_productos WHERE id = %s FOR UPDATE", (producto_id,))
+        if not cursor.fetchone():
+            raise AsignacionesError("PRODUCTO_NO_EXISTE", "El producto no existe", 404)
+
+        for item in asignaciones:
+            clave = item["clave_cliente"].strip().upper()
+            cursor.execute("SELECT clave FROM clientes WHERE clave = %s", (clave,))
+            if not cursor.fetchone():
+                raise AsignacionesError("CLIENTE_NO_EXISTE", f"El cliente {clave} no existe", 404)
+
+        disponible = _disponible_producto(cursor, producto_id)
+        total_solicitado = sum(item["cantidad"] for item in asignaciones)
+        if total_solicitado > disponible:
+            raise AsignacionesError(
+                "STOCK_INSUFICIENTE",
+                f"Disponible: {disponible}, solicitado: {total_solicitado}",
+                409,
+            )
+
+        for item in asignaciones:
+            clave = item["clave_cliente"].strip().upper()
+            cantidad = item["cantidad"]
+            prio_info = _PRIORIDAD_MAP.get(clave, (999, clave))
+
+            cursor.execute(
+                "SELECT id FROM importacion_asignaciones "
+                "WHERE importacion_producto_id = %s AND clave_cliente = %s FOR UPDATE",
+                (producto_id, clave),
+            )
+            existente = cursor.fetchone()
+            if existente:
+                cursor.execute(
+                    "UPDATE importacion_asignaciones SET cantidad_asignada = cantidad_asignada + %s, "
+                    "estado = 'ACTIVA', usuario_id = %s, prioridad = %s WHERE id = %s",
+                    (cantidad, usuario_id, prio_info[0], existente["id"]),
+                )
+            else:
+                cursor.execute(
+                    "INSERT INTO importacion_asignaciones "
+                    "(importacion_producto_id, clave_cliente, cantidad_proyectada, cantidad_asignada, "
+                    "prioridad, estado, usuario_id) VALUES (%s, %s, %s, %s, %s, 'ACTIVA', %s)",
+                    (producto_id, clave, cantidad, cantidad, prio_info[0], usuario_id),
+                )
+            _registrar_movimiento(cursor, producto_id, "ASIGNACION", -cantidad, clave_cliente=clave,
+                                   usuario_id=usuario_id)
+
+        conn.commit()
+        return {"producto_id": producto_id, "disponible_restante": disponible - total_solicitado}
+    except AsignacionesError:
+        conn.rollback()
+        raise
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
 def recalcular_propuesta(importacion_id: int, periodo_filtro: str = None) -> list:
     conn = obtener_conexion()
     if not conn:

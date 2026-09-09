@@ -95,3 +95,13 @@ def recalcular_ruta(importacion_id):
     body = request.get_json(silent=True) or {}
     data = svc.recalcular_propuesta(importacion_id, body.get("periodo"))
     return jsonify({"ok": True, "data": data}), 200
+
+
+@asignaciones_bp.route("/<int:importacion_id>/asignaciones/productos/<int:producto_id>/asignar", methods=["POST"])
+@token_required
+@_requiere_rol_importaciones
+def asignar_ruta(importacion_id, producto_id):
+    body = request.get_json(silent=True) or {}
+    payload = getattr(request, "cliente_data", {}) or {}
+    data = svc.asignar(producto_id, body.get("asignaciones") or [], usuario_id=payload.get("id"))
+    return jsonify({"ok": True, "data": data}), 200

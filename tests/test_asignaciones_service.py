@@ -6,6 +6,7 @@ import pytest
 from services.asignaciones_service import (
     AsignacionesError, actualizar_producto, crear_producto, listar_productos, recalcular_propuesta,
 )
+from services.asignaciones_service import asignar
 
 
 def _mock_conn(mocker, cursor):
@@ -197,3 +198,86 @@ def test_recalcular_degrada_sin_romper_si_proyecciones_falla(mocker):
     assert propuestas[0]["proyecciones_disponibles"] is False
     assert propuestas[0]["propuesta"] == []
     assert propuestas[0]["sobrante_estimado"] == 4
+
+
+def test_asignar_rechaza_lista_vacia():
+    with pytest.raises(AsignacionesError) as exc:
+        asignar(10, [])
+    assert exc.value.code == "ASIGNACION_INVALIDA"
+
+
+def test_asignar_rechaza_cantidad_no_entera_o_negativa():
+    with pytest.raises(AsignacionesError) as exc:
+        asignar(10, [{"clave_cliente": "LC657", "cantidad": -1}])
+    assert exc.value.code == "ASIGNACION_INVALIDA"
+
+
+def test_asignar_rechaza_producto_inexistente(mocker):
+    cursor = MagicMock()
+    cursor.fetchone.return_value = None
+    _mock_conn(mocker, cursor)
+
+    with pytest.raises(AsignacionesError) as exc:
+        asignar(999, [{"clave_cliente": "LC657", "cantidad": 1}])
+    assert exc.value.code == "PRODUCTO_NO_EXISTE"
+
+
+def test_asignar_rechaza_cliente_inexistente(mocker):
+    cursor = MagicMock()
+    cursor.fetchone.side_effect = [{"id": 10}, None]  # producto existe, cliente no
+    _mock_conn(mocker, cursor)
+
+    with pytest.raises(AsignacionesError) as exc:
+        asignar(10, [{"clave_cliente": "ZZZZZ", "cantidad": 1}])
+    assert exc.value.code == "CLIENTE_NO_EXISTE"
+
+
+def test_asignar_rechaza_sobreasignacion(mocker):
+    cursor = MagicMock()
+    cursor.fetchone.side_effect = [{"id": 10}, {"clave": "LC657"}]
+    _mock_conn(mocker, cursor)
+    mocker.patch("services.asignaciones_service._disponible_producto", return_value=2)
+
+    with pytest.raises(AsignacionesError) as exc:
+        asignar(10, [{"clave_cliente": "LC657", "cantidad": 3}])  # pide 3, solo hay 2
+    assert exc.value.code == "STOCK_INSUFICIENTE"
+    assert exc.value.status == 409
+
+
+def test_asignar_exitoso_inserta_asignacion_y_movimiento(mocker):
+    cursor = MagicMock()
+    cursor.fetchone.side_effect = [
+        {"id": 10},                # producto FOR UPDATE
+        {"clave": "LC657"},        # cliente existe
+        None,                      # no hay asignación previa para este cliente
+    ]
+    _mock_conn(mocker, cursor)
+    mocker.patch("services.asignaciones_service._disponible_producto", return_value=5)
+
+    resultado = asignar(10, [{"clave_cliente": "lc657", "cantidad": 3}], usuario_id=7)
+
+    assert resultado == {"producto_id": 10, "disponible_restante": 2}
+    inserts = [c for c in cursor.execute.call_args_list if "INSERT INTO importacion_asignaciones" in c.args[0]]
+    assert len(inserts) == 1
+    assert inserts[0].args[1][1] == "LC657"  # clave normalizada a mayúsculas
+    movimientos = [c for c in cursor.execute.call_args_list if "INSERT INTO importacion_movimientos" in c.args[0]]
+    assert movimientos[0].args[1][1] == "ASIGNACION"
+    assert movimientos[0].args[1][2] == -3
+
+
+def test_asignar_a_cliente_ya_asignado_suma_en_lugar_de_duplicar(mocker):
+    cursor = MagicMock()
+    cursor.fetchone.side_effect = [
+        {"id": 10},
+        {"clave": "LC657"},
+        {"id": 55},  # ya existe una fila de asignación para este producto+cliente
+    ]
+    _mock_conn(mocker, cursor)
+    mocker.patch("services.asignaciones_service._disponible_producto", return_value=5)
+
+    asignar(10, [{"clave_cliente": "LC657", "cantidad": 2}])
+
+    updates = [c for c in cursor.execute.call_args_list if "UPDATE importacion_asignaciones" in c.args[0]]
+    assert len(updates) == 1
+    inserts = [c for c in cursor.execute.call_args_list if "INSERT INTO importacion_asignaciones" in c.args[0]]
+    assert len(inserts) == 0
