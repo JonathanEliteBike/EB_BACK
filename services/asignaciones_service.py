@@ -138,6 +138,18 @@ def _verificar_pertenencia_venta(cursor, venta: dict, importacion_id):
     _verificar_pertenencia(cursor.fetchone(), importacion_id, "VENTA_NO_EXISTE", "La venta no existe")
 
 
+def _verificar_pertenencia_asignacion(cursor, asignacion: dict, importacion_id):
+    """Igual que _verificar_pertenencia_venta, pero para recursos identificados por
+    asignacion_id: resuelve el embarque a través del producto al que pertenece la asignación."""
+    if importacion_id is None:
+        return
+    cursor.execute(
+        "SELECT importacion_id FROM importacion_productos WHERE id = %s",
+        (asignacion["importacion_producto_id"],),
+    )
+    _verificar_pertenencia(cursor.fetchone(), importacion_id, "ASIGNACION_NO_EXISTE", "La asignación no existe")
+
+
 def _registrar_movimiento(cursor, producto_id, tipo_movimiento, cantidad, clave_cliente=None,
                            referencia_externa=None, usuario_id=None, metadata=None):
     import json
@@ -581,6 +593,40 @@ def cancelar_venta(venta_id: int, usuario_id: int = None, importacion_id: int = 
         )
         conn.commit()
         cursor.execute("SELECT * FROM importacion_sobrantes_ventas WHERE id = %s", (venta_id,))
+        return cursor.fetchone()
+    except AsignacionesError:
+        conn.rollback()
+        raise
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def cancelar_asignacion(asignacion_id: int, usuario_id: int = None, importacion_id: int = None) -> dict:
+    conn = obtener_conexion()
+    if not conn:
+        raise AsignacionesError("DB_NO_DISPONIBLE", "Sin conexión a BD", 500)
+    try:
+        cursor = conn.cursor(dictionary=True)
+        cursor.execute("SELECT * FROM importacion_asignaciones WHERE id = %s FOR UPDATE", (asignacion_id,))
+        asignacion = cursor.fetchone()
+        if not asignacion:
+            raise AsignacionesError("ASIGNACION_NO_EXISTE", "La asignación no existe", 404)
+        _verificar_pertenencia_asignacion(cursor, asignacion, importacion_id)
+        if asignacion["estado"] == "CANCELADA":
+            raise AsignacionesError("ASIGNACION_YA_CANCELADA", "La asignación ya estaba cancelada", 409)
+
+        cursor.execute(
+            "UPDATE importacion_asignaciones SET estado = 'CANCELADA' WHERE id = %s", (asignacion_id,)
+        )
+        _registrar_movimiento(
+            cursor, asignacion["importacion_producto_id"], "LIBERACION", asignacion["cantidad_asignada"],
+            clave_cliente=asignacion["clave_cliente"], usuario_id=usuario_id,
+        )
+        conn.commit()
+        cursor.execute("SELECT * FROM importacion_asignaciones WHERE id = %s", (asignacion_id,))
         return cursor.fetchone()
     except AsignacionesError:
         conn.rollback()

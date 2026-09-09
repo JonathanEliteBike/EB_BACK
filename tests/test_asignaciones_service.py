@@ -11,6 +11,7 @@ from services.asignaciones_service import asignar
 from services.asignaciones_service import crear_venta_sobrante
 from services.asignaciones_service import validar_venta_odoo
 from services.asignaciones_service import cancelar_venta
+from services.asignaciones_service import cancelar_asignacion
 from services.asignaciones_service import obtener_detalle_producto, resumen_embarque, listar_movimientos
 
 
@@ -784,6 +785,49 @@ def test_cancelar_venta_restaura_disponibilidad_con_movimiento_positivo(mocker):
     assert movimientos[0].args[1][2] == 2  # positivo: restaura las 2 unidades
 
 
+def test_cancelar_asignacion_no_existe(mocker):
+    cursor = MagicMock()
+    cursor.fetchone.return_value = None
+    _mock_conn(mocker, cursor)
+
+    with pytest.raises(AsignacionesError) as exc:
+        cancelar_asignacion(999)
+    assert exc.value.code == "ASIGNACION_NO_EXISTE"
+    assert exc.value.status == 404
+
+
+def test_cancelar_asignacion_ya_cancelada_no_se_puede_cancelar_dos_veces(mocker):
+    cursor = MagicMock()
+    cursor.fetchone.return_value = {
+        "id": 1, "estado": "CANCELADA", "importacion_producto_id": 10,
+        "clave_cliente": "LC657", "cantidad_asignada": 5,
+    }
+    _mock_conn(mocker, cursor)
+
+    with pytest.raises(AsignacionesError) as exc:
+        cancelar_asignacion(1)
+    assert exc.value.code == "ASIGNACION_YA_CANCELADA"
+    assert exc.value.status == 409
+
+
+def test_cancelar_asignacion_restaura_disponibilidad_con_movimiento_positivo(mocker):
+    cursor = MagicMock()
+    cursor.fetchone.side_effect = [
+        {"id": 1, "estado": "ACTIVA", "importacion_producto_id": 10,
+         "clave_cliente": "LC657", "cantidad_asignada": 5},
+        {"id": 1, "estado": "CANCELADA", "importacion_producto_id": 10,
+         "clave_cliente": "LC657", "cantidad_asignada": 5},
+    ]
+    _mock_conn(mocker, cursor)
+
+    resultado = cancelar_asignacion(1, usuario_id=7)
+
+    assert resultado["estado"] == "CANCELADA"
+    movimientos = [c for c in cursor.execute.call_args_list if "INSERT INTO importacion_movimientos" in c.args[0]]
+    assert movimientos[0].args[1][1] == "LIBERACION"
+    assert movimientos[0].args[1][2] == 5  # positivo: restaura las 5 unidades asignadas
+
+
 def test_obtener_detalle_producto_no_existe(mocker):
     cursor = MagicMock()
     cursor.fetchone.return_value = None
@@ -1058,6 +1102,22 @@ def test_cancelar_venta_de_otro_embarque_se_ve_como_inexistente(mocker):
     with pytest.raises(AsignacionesError) as exc:
         cancelar_venta(1, importacion_id=1)
     assert exc.value.code == "VENTA_NO_EXISTE"
+    assert exc.value.status == 404
+    assert [c for c in cursor.execute.call_args_list if c.args[0].startswith("UPDATE")] == []
+
+
+def test_cancelar_asignacion_de_otro_embarque_se_ve_como_inexistente(mocker):
+    cursor = MagicMock()
+    cursor.fetchone.side_effect = [
+        {"id": 1, "estado": "ACTIVA", "importacion_producto_id": 10,
+         "clave_cliente": "LC657", "cantidad_asignada": 5},
+        {"importacion_id": 2},  # el producto de la asignación pertenece a otro embarque
+    ]
+    _mock_conn(mocker, cursor)
+
+    with pytest.raises(AsignacionesError) as exc:
+        cancelar_asignacion(1, importacion_id=1)
+    assert exc.value.code == "ASIGNACION_NO_EXISTE"
     assert exc.value.status == 404
     assert [c for c in cursor.execute.call_args_list if c.args[0].startswith("UPDATE")] == []
 

@@ -139,6 +139,20 @@ def venta_sobrante_ruta(importacion_id, producto_id):
 
 
 @asignaciones_bp.route(
+    "/<int:importacion_id>/asignaciones/productos/<int:producto_id>/asignaciones/<int:asignacion_id>/cancelar",
+    methods=["POST"],
+)
+@token_required
+@_requiere_rol_importaciones
+def cancelar_asignacion_ruta(importacion_id, producto_id, asignacion_id):
+    payload = getattr(request, "cliente_data", {}) or {}
+    data = svc.cancelar_asignacion(
+        asignacion_id, usuario_id=payload.get("id"), importacion_id=importacion_id
+    )
+    return jsonify({"ok": True, "data": data}), 200
+
+
+@asignaciones_bp.route(
     "/<int:importacion_id>/asignaciones/ventas/<int:venta_id>/validar-odoo", methods=["POST"]
 )
 @token_required
