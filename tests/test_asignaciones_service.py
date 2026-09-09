@@ -10,6 +10,7 @@ from services.asignaciones_service import (
 from services.asignaciones_service import asignar
 from services.asignaciones_service import crear_venta_sobrante
 from services.asignaciones_service import validar_venta_odoo
+from services.asignaciones_service import cancelar_venta
 
 
 def _mock_conn(mocker, cursor):
@@ -521,3 +522,44 @@ def test_validar_odoo_no_disponible_si_falla_product_product_read(mocker):
         if "SET estado = 'VALIDADO'" in c.args[0]
     ]
     assert len(updates_validado) == 0  # la venta no se tocó
+
+
+def test_cancelar_venta_no_existe(mocker):
+    cursor = MagicMock()
+    cursor.fetchone.return_value = None
+    _mock_conn(mocker, cursor)
+
+    with pytest.raises(AsignacionesError) as exc:
+        cancelar_venta(999)
+    assert exc.value.code == "VENTA_NO_EXISTE"
+
+
+def test_cancelar_venta_ya_cancelada_no_se_puede_cancelar_dos_veces(mocker):
+    cursor = MagicMock()
+    cursor.fetchone.return_value = {
+        "id": 1, "estado": "CANCELADO", "importacion_producto_id": 10,
+        "clave_cliente": "LC657", "cantidad": 2, "numero_pedido_odoo": "SO1",
+    }
+    _mock_conn(mocker, cursor)
+
+    with pytest.raises(AsignacionesError) as exc:
+        cancelar_venta(1)
+    assert exc.value.code == "VENTA_YA_CANCELADA"
+
+
+def test_cancelar_venta_restaura_disponibilidad_con_movimiento_positivo(mocker):
+    cursor = MagicMock()
+    cursor.fetchone.side_effect = [
+        {"id": 1, "estado": "PENDIENTE_VALIDACION", "importacion_producto_id": 10,
+         "clave_cliente": "LC657", "cantidad": 2, "numero_pedido_odoo": "SO1"},
+        {"id": 1, "estado": "CANCELADO", "importacion_producto_id": 10,
+         "clave_cliente": "LC657", "cantidad": 2, "numero_pedido_odoo": "SO1"},
+    ]
+    _mock_conn(mocker, cursor)
+
+    resultado = cancelar_venta(1, usuario_id=7)
+
+    assert resultado["estado"] == "CANCELADO"
+    movimientos = [c for c in cursor.execute.call_args_list if "INSERT INTO importacion_movimientos" in c.args[0]]
+    assert movimientos[0].args[1][1] == "CANCELACION"
+    assert movimientos[0].args[1][2] == 2  # positivo: restaura las 2 unidades

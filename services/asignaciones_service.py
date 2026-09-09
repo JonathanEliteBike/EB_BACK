@@ -492,6 +492,40 @@ def recalcular_propuesta(importacion_id: int, periodo_filtro: str = None) -> lis
     return propuestas
 
 
+def cancelar_venta(venta_id: int, usuario_id: int = None) -> dict:
+    conn = obtener_conexion()
+    if not conn:
+        raise AsignacionesError("DB_NO_DISPONIBLE", "Sin conexión a BD", 500)
+    try:
+        cursor = conn.cursor(dictionary=True)
+        cursor.execute("SELECT * FROM importacion_sobrantes_ventas WHERE id = %s FOR UPDATE", (venta_id,))
+        venta = cursor.fetchone()
+        if not venta:
+            raise AsignacionesError("VENTA_NO_EXISTE", "La venta no existe", 404)
+        if venta["estado"] == "CANCELADO":
+            raise AsignacionesError("VENTA_YA_CANCELADA", "La venta ya estaba cancelada", 409)
+
+        cursor.execute(
+            "UPDATE importacion_sobrantes_ventas SET estado = 'CANCELADO' WHERE id = %s", (venta_id,)
+        )
+        _registrar_movimiento(
+            cursor, venta["importacion_producto_id"], "CANCELACION", venta["cantidad"],
+            clave_cliente=venta["clave_cliente"], referencia_externa=venta["numero_pedido_odoo"],
+            usuario_id=usuario_id,
+        )
+        conn.commit()
+        cursor.execute("SELECT * FROM importacion_sobrantes_ventas WHERE id = %s", (venta_id,))
+        return cursor.fetchone()
+    except AsignacionesError:
+        conn.rollback()
+        raise
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
 def validar_venta_odoo(venta_id: int, numero_pedido_odoo: str = None) -> dict:
     conn = obtener_conexion()
     if not conn:
