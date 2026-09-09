@@ -470,3 +470,54 @@ def test_validar_odoo_exitoso_marca_validado(mocker):
     resultado = validar_venta_odoo(1, "SO1")
 
     assert resultado["estado"] == "VALIDADO"
+
+
+def test_validar_odoo_no_disponible_si_falla_sale_order_line_read(mocker):
+    cursor = _mock_conn_secuencia(mocker, [
+        {"id": 1, "estado": "PENDIENTE_VALIDACION", "numero_pedido_odoo": "SO1",
+         "clave_cliente": "LC657", "cantidad": 2, "importacion_producto_id": 10},
+        {"sku_norm": "4271020001004"},
+    ])
+    models = MagicMock()
+    models.execute_kw.side_effect = [
+        [{"id": 5, "name": "SO1", "partner_id": [1, "LC657"], "state": "sale", "order_line": [50]}],
+        [{"ref": "LC657"}],
+        Exception("boom"),  # sale.order.line read falla
+    ]
+    mocker.patch("services.asignaciones_service.get_odoo_models", return_value=(1, models, None))
+
+    with pytest.raises(AsignacionesError) as exc:
+        validar_venta_odoo(1, "SO1")
+    assert exc.value.code == "PEDIDO_ODOO_NO_DISPONIBLE"
+    assert exc.value.status == 503
+    updates_validado = [
+        c for c in cursor.execute.call_args_list
+        if "SET estado = 'VALIDADO'" in c.args[0]
+    ]
+    assert len(updates_validado) == 0  # la venta no se tocó
+
+
+def test_validar_odoo_no_disponible_si_falla_product_product_read(mocker):
+    cursor = _mock_conn_secuencia(mocker, [
+        {"id": 1, "estado": "PENDIENTE_VALIDACION", "numero_pedido_odoo": "SO1",
+         "clave_cliente": "LC657", "cantidad": 2, "importacion_producto_id": 10},
+        {"sku_norm": "4271020001004"},
+    ])
+    models = MagicMock()
+    models.execute_kw.side_effect = [
+        [{"id": 5, "name": "SO1", "partner_id": [1, "LC657"], "state": "sale", "order_line": [50]}],
+        [{"ref": "LC657"}],
+        [{"product_id": [200, "Bici"], "product_uom_qty": 2.0}],
+        Exception("boom"),  # product.product read falla
+    ]
+    mocker.patch("services.asignaciones_service.get_odoo_models", return_value=(1, models, None))
+
+    with pytest.raises(AsignacionesError) as exc:
+        validar_venta_odoo(1, "SO1")
+    assert exc.value.code == "PEDIDO_ODOO_NO_DISPONIBLE"
+    assert exc.value.status == 503
+    updates_validado = [
+        c for c in cursor.execute.call_args_list
+        if "SET estado = 'VALIDADO'" in c.args[0]
+    ]
+    assert len(updates_validado) == 0  # la venta no se tocó
