@@ -380,10 +380,10 @@ def parsear_excel_productos(file_bytes: bytes) -> dict:
         try:
             cantidad = int(float(str(cant_val).replace(",", "").strip()))
         except (TypeError, ValueError):
-            errores.append(f"Fila {ri}: cantidad inválida para SKU {sku} ({cant_val!r})")
+            errores.append({"fila": ri, "sku": sku, "motivo": f"Cantidad inválida ({cant_val!r})"})
             continue
         if cantidad <= 0:
-            errores.append(f"Fila {ri}: cantidad debe ser mayor a 0 para SKU {sku} ({cantidad})")
+            errores.append({"fila": ri, "sku": sku, "motivo": f"La cantidad debe ser mayor a 0 ({cantidad})"})
             continue
         desc_val = ws.cell(ri, col_desc).value if col_desc else None
         descripcion = str(desc_val).strip()[:255] if desc_val is not None and str(desc_val).strip() else None

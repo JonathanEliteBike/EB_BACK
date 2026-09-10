@@ -1181,7 +1181,8 @@ def test_parsear_excel_reporta_cantidad_invalida_sin_abortar():
     res = parsear_excel_productos(data)
     assert [f["sku"] for f in res["filas"]] == ["A-3"]
     assert len(res["errores"]) == 2
-    assert "A-1" in res["errores"][0] and "A-2" in res["errores"][1]
+    assert res["errores"][0]["sku"] == "A-1" and res["errores"][0]["fila"] == 2
+    assert res["errores"][1]["sku"] == "A-2" and "mayor a 0" in res["errores"][1]["motivo"]
 
 
 def test_parsear_excel_sin_columna_sku_es_400():
