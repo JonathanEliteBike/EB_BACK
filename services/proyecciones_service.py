@@ -237,3 +237,71 @@ def demanda_neta_por_cliente(periodo: str, skus_norm: list) -> dict:
             if neta > 0:
                 resultado[sku_n][clave] = neta
     return resultado
+
+
+# Orden cronológico MY27 (idéntico a routes/proyecciones_my27.py:MESES).
+_MESES_CRONO = [
+    'mayo', 'junio', 'julio', 'agosto', 'septiembre', 'octubre',
+    'noviembre', 'diciembre', 'enero', 'febrero', 'marzo', 'abril',
+]
+
+
+def demanda_neta_por_cliente_mensual(periodo: str, skus_norm: list) -> dict:
+    """
+    {sku_norm: {clave_cliente: {mes: cantidad_neta}}} — proyección MENSUAL del
+    periodo por cliente, menos lo confirmado en Odoo (sale.order) descontado
+    cronológicamente del mes más antiguo al más reciente (misma regla que
+    routes/proyecciones_my27.py:_compute_distribucion_prioritaria).
+
+    Solo se devuelven meses con cantidad neta > 0. Lanza RuntimeError si no hay
+    conexión a BD (el caller decide cómo degradar).
+    """
+    if not skus_norm:
+        return {}
+    skus_norm_set = set(skus_norm)
+
+    conn = obtener_conexion()
+    if not conn:
+        raise RuntimeError("Sin conexión a BD para consultar forecast_proyecciones")
+    try:
+        cursor = conn.cursor(dictionary=True)
+        cols = ", ".join(f"COALESCE(SUM({m}), 0) AS {m}" for m in _MESES_CRONO)
+        cursor.execute(
+            f"SELECT clave_cliente, sku, {cols} "
+            "FROM forecast_proyecciones WHERE periodo = %s "
+            "GROUP BY clave_cliente, sku",
+            (periodo,),
+        )
+        crudo: dict = {}
+        for row in cursor.fetchall():
+            sku_n = _norm_sku(row["sku"])
+            if sku_n not in skus_norm_set:
+                continue
+            acc = crudo.setdefault(sku_n, {}).setdefault(row["clave_cliente"], {m: 0 for m in _MESES_CRONO})
+            for m in _MESES_CRONO:
+                acc[m] += int(row[m] or 0)
+    finally:
+        conn.close()
+
+    try:
+        ordenes = _get_ordenes_my27(periodo)
+    except Exception:
+        logging.exception("No se pudo deducir órdenes Odoo para %s", periodo)
+        ordenes = {}
+
+    resultado: dict = {}
+    for sku_n, por_cliente in crudo.items():
+        resultado[sku_n] = {}
+        for clave, meses in por_cliente.items():
+            restante_odoo = int(ordenes.get(clave, {}).get(sku_n, 0) or 0)
+            neto_mes = {}
+            for m in _MESES_CRONO:
+                qty = meses[m]
+                ded = min(restante_odoo, qty)
+                restante_odoo -= ded
+                neta = qty - ded
+                if neta > 0:
+                    neto_mes[m] = neta
+            if neto_mes:
+                resultado[sku_n][clave] = neto_mes
+    return resultado

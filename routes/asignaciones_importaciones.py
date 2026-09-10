@@ -47,8 +47,13 @@ def inicializar_tablas():
         cursor = conn.cursor()
         for ddl in svc.TABLAS_SQL:
             cursor.execute(ddl)
+        migraciones = svc._migrar_esquema_reservas(cursor)
         conn.commit()
-        return jsonify({"ok": True, "mensaje": "Tablas de asignaciones creadas/verificadas"}), 201
+        return jsonify({
+            "ok": True,
+            "mensaje": "Tablas de asignaciones creadas/verificadas",
+            "migraciones_aplicadas": migraciones,
+        }), 201
     except Exception as e:
         logging.exception("Error creando tablas de asignaciones")
         return jsonify({"ok": False, "error": {"code": "DB_ERROR", "message": str(e)}}), 500

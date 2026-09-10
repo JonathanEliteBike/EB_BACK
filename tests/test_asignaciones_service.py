@@ -14,6 +14,13 @@ from services.asignaciones_service import cancelar_venta
 from services.asignaciones_service import cancelar_asignacion
 from services.asignaciones_service import obtener_detalle_producto, resumen_embarque, listar_movimientos
 from services.asignaciones_service import resumen_global, listar_productos_global
+from services.asignaciones_service import (
+    _columna_a_fecha, _fecha_a_columna, _meses_en_ventana, _meses_reasignables,
+    _split_periodo, _migrar_esquema_reservas, MESES_ORDEN,
+)
+from services.proyecciones_service import demanda_neta_por_cliente_mensual
+from db_conexion import obtener_conexion
+import datetime as _dt
 
 
 def _mock_conn(mocker, cursor):
@@ -321,7 +328,7 @@ def test_asignar_exitoso_inserta_asignacion_y_movimiento(mocker):
     assert inserts[0].args[1][1] == "LC657"  # clave normalizada a mayúsculas
     assert inserts[0].args[1][2] == 0  # cantidad_proyectada omitida -> default 0, no duplica cantidad
     movimientos = [c for c in cursor.execute.call_args_list if "INSERT INTO importacion_movimientos" in c.args[0]]
-    assert movimientos[0].args[1][1] == "ASIGNACION"
+    assert movimientos[0].args[1][1] == "RESERVA"
     assert movimientos[0].args[1][2] == -3
 
 
@@ -814,7 +821,7 @@ def test_cancelar_asignacion_ya_cancelada_no_se_puede_cancelar_dos_veces(mocker)
 def test_cancelar_asignacion_restaura_disponibilidad_con_movimiento_positivo(mocker):
     cursor = MagicMock()
     cursor.fetchone.side_effect = [
-        {"id": 1, "estado": "ACTIVA", "importacion_producto_id": 10,
+        {"id": 1, "estado": "RESERVADA", "importacion_producto_id": 10,
          "clave_cliente": "LC657", "cantidad_asignada": 5},
         {"id": 1, "estado": "CANCELADA", "importacion_producto_id": 10,
          "clave_cliente": "LC657", "cantidad_asignada": 5},
@@ -1110,7 +1117,7 @@ def test_cancelar_venta_de_otro_embarque_se_ve_como_inexistente(mocker):
 def test_cancelar_asignacion_de_otro_embarque_se_ve_como_inexistente(mocker):
     cursor = MagicMock()
     cursor.fetchone.side_effect = [
-        {"id": 1, "estado": "ACTIVA", "importacion_producto_id": 10,
+        {"id": 1, "estado": "RESERVADA", "importacion_producto_id": 10,
          "clave_cliente": "LC657", "cantidad_asignada": 5},
         {"importacion_id": 2},  # el producto de la asignación pertenece a otro embarque
     ]
@@ -1365,3 +1372,100 @@ def test_listar_productos_global_solo_disponible_filtra_en_sql(mocker):
 
     count_sql = cursor.execute.call_args_list[0][0][0]
     assert "importacion_movimientos m" in count_sql and "> 0" in count_sql
+
+
+# ── Reservas por mes: helpers de calendario ───────────────────────────────────
+
+def test_split_periodo_valido_e_invalido():
+    assert _split_periodo("2026-2027") == (2026, 2027)
+    with pytest.raises(AsignacionesError) as e:
+        _split_periodo("2026")
+    assert e.value.code == "PERIODO_INVALIDO"
+
+
+def test_columna_a_fecha_mapea_year1_y_year2():
+    assert _columna_a_fecha("2026-2027", "mayo") == _dt.date(2026, 5, 1)
+    assert _columna_a_fecha("2026-2027", "diciembre") == _dt.date(2026, 12, 1)
+    assert _columna_a_fecha("2026-2027", "enero") == _dt.date(2027, 1, 1)
+    assert _columna_a_fecha("2026-2027", "abril") == _dt.date(2027, 4, 1)
+
+
+def test_fecha_a_columna_ida_y_vuelta():
+    for col in MESES_ORDEN:
+        assert _fecha_a_columna(_columna_a_fecha("2026-2027", col)) == col
+
+
+def test_meses_en_ventana_es_subsecuencia_cronologica():
+    assert _meses_en_ventana("2026-2027", "octubre", "diciembre") == ["octubre", "noviembre", "diciembre"]
+    assert _meses_en_ventana("2026-2027", "2026-11", "2027-02") == ["noviembre", "diciembre", "enero", "febrero"]
+    with pytest.raises(AsignacionesError) as e:
+        _meses_en_ventana("2026-2027", "diciembre", "octubre")
+    assert e.value.code == "VENTANA_INVALIDA"
+
+
+def test_meses_reasignables_excluye_may_jun_jul_y_la_ventana():
+    # ventana empieza en diciembre -> reasignable ago..nov
+    assert _meses_reasignables("2026-2027", "diciembre") == ["agosto", "septiembre", "octubre", "noviembre"]
+    # ventana empieza en agosto -> nada reasignable (may/jun/jul excluidos)
+    assert _meses_reasignables("2026-2027", "agosto") == []
+
+
+# ── demanda_neta_por_cliente_mensual: deducción Odoo cronológica ──────────────
+
+def test_demanda_mensual_descuenta_odoo_del_mes_mas_antiguo(mocker):
+    cursor = MagicMock()
+    cursor.fetchall.return_value = [
+        {"clave_cliente": "CLI-A", "sku": "BIKE-X",
+         "mayo": 2, "junio": 1, "julio": 0, "agosto": 0, "septiembre": 0, "octubre": 5,
+         "noviembre": 4, "diciembre": 3, "enero": 0, "febrero": 0, "marzo": 0, "abril": 0},
+    ]
+    conn = MagicMock(); conn.cursor.return_value = cursor
+    mocker.patch("services.proyecciones_service.obtener_conexion", return_value=conn)
+    mocker.patch("services.proyecciones_service._get_ordenes_my27",
+                 return_value={"CLI-A": {"BIKEX": 7}})
+
+    res = demanda_neta_por_cliente_mensual("2026-2027", ["BIKEX"])
+
+    # Odoo 7 tapa mayo 2 + junio 1 + octubre 4 -> octubre neto 1
+    assert res == {"BIKEX": {"CLI-A": {"octubre": 1, "noviembre": 4, "diciembre": 3}}}
+
+
+def test_demanda_mensual_sin_odoo_devuelve_proyeccion_intacta(mocker):
+    cursor = MagicMock()
+    cursor.fetchall.return_value = [
+        {"clave_cliente": "CLI-C", "sku": "BIKE-X",
+         **{m: 0 for m in MESES_ORDEN}, "noviembre": 10},
+    ]
+    conn = MagicMock(); conn.cursor.return_value = cursor
+    mocker.patch("services.proyecciones_service.obtener_conexion", return_value=conn)
+    mocker.patch("services.proyecciones_service._get_ordenes_my27", return_value={})
+
+    res = demanda_neta_por_cliente_mensual("2026-2027", ["BIKEX"])
+    assert res == {"BIKEX": {"CLI-C": {"noviembre": 10}}}
+
+
+def test_migrar_esquema_reservas_es_idempotente():
+    conn = obtener_conexion()
+    if not conn:
+        pytest.skip("Sin conexión a BD local para este test")
+    try:
+        cur = conn.cursor()
+        _migrar_esquema_reservas(cur)   # asegura estado final
+        conn.commit()
+        segunda = _migrar_esquema_reservas(cur)
+        conn.commit()
+        assert segunda == []            # nada que aplicar la segunda vez
+        cur.execute(
+            "SELECT COLUMN_TYPE FROM information_schema.COLUMNS "
+            "WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='importacion_asignaciones' AND COLUMN_NAME='estado'"
+        )
+        tipo_estado = cur.fetchone()[0]
+        assert "RESERVADA" in tipo_estado and "ACTIVA" not in tipo_estado
+        cur.execute(
+            "SELECT COLUMN_TYPE FROM information_schema.COLUMNS "
+            "WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='importacion_movimientos' AND COLUMN_NAME='tipo_movimiento'"
+        )
+        assert "RECHAZO_RESERVA" in cur.fetchone()[0]
+        cur.close()
+    finally:
+        conn.close()

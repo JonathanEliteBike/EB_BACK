@@ -46,19 +46,25 @@ TABLAS_SQL = [
       id                       INT AUTO_INCREMENT PRIMARY KEY,
       importacion_producto_id  INT NOT NULL,
       clave_cliente            VARCHAR(10) NOT NULL,
+      mes_objetivo             DATE NULL,
+      origen                   ENUM('INICIAL','REASIGNACION') NOT NULL DEFAULT 'INICIAL',
       cantidad_proyectada      INT NOT NULL DEFAULT 0,
       cantidad_asignada        INT NOT NULL DEFAULT 0,
       prioridad                INT NOT NULL,
-      estado                   ENUM('ACTIVA','CANCELADA') NOT NULL DEFAULT 'ACTIVA',
+      estado                   ENUM('RESERVADA','PENDIENTE_CONFIRMACION','CONFIRMADA','RECHAZADA','CANCELADA')
+                                 NOT NULL DEFAULT 'RESERVADA',
       usuario_id               INT NULL,
+      confirmada_at            DATETIME NULL,
+      confirmada_por           INT NULL,
       created_at               DATETIME DEFAULT CURRENT_TIMESTAMP,
       updated_at               DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
       CONSTRAINT fk_asig_producto FOREIGN KEY (importacion_producto_id) REFERENCES importacion_productos(id),
       CONSTRAINT fk_asig_cliente FOREIGN KEY (clave_cliente) REFERENCES clientes(clave),
       CONSTRAINT chk_asig_cantidad CHECK (cantidad_asignada >= 0),
-      UNIQUE KEY uq_asignacion_producto_cliente (importacion_producto_id, clave_cliente),
+      UNIQUE KEY uq_reserva (importacion_producto_id, clave_cliente, mes_objetivo, origen),
       KEY idx_asig_cliente (clave_cliente),
-      KEY idx_asig_estado (estado)
+      KEY idx_asig_estado (estado),
+      KEY idx_asig_mes (mes_objetivo)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci
     """,
     """
@@ -85,7 +91,8 @@ TABLAS_SQL = [
       id                       INT AUTO_INCREMENT PRIMARY KEY,
       importacion_producto_id  INT NOT NULL,
       tipo_movimiento          ENUM('ENTRADA','ASIGNACION','LIBERACION','SOBRANTE',
-                                     'RESERVA_SOBRANTE','VENTA_SOBRANTE','CANCELACION','AJUSTE') NOT NULL,
+                                     'RESERVA_SOBRANTE','VENTA_SOBRANTE','CANCELACION','AJUSTE',
+                                     'RESERVA','REASIGNACION','RECHAZO_RESERVA') NOT NULL,
       cantidad                 INT NOT NULL,
       clave_cliente            VARCHAR(10) NULL,
       referencia_externa       VARCHAR(64) NULL,
@@ -101,7 +108,189 @@ TABLAS_SQL = [
 ]
 
 
-from services.proyecciones_service import _norm_sku, demanda_neta_por_cliente, _PRIORIDAD_MAP
+from services.proyecciones_service import (
+    _norm_sku, demanda_neta_por_cliente, demanda_neta_por_cliente_mensual, _PRIORIDAD_MAP,
+)
+
+# ── Meses del periodo MY27 (mismo orden cronológico que forecast_proyecciones) ──
+# mayo..diciembre pertenecen a year1; enero..abril a year2 (periodo "2026-2027").
+MESES_ORDEN = [
+    "mayo", "junio", "julio", "agosto", "septiembre", "octubre",
+    "noviembre", "diciembre", "enero", "febrero", "marzo", "abril",
+]
+# Meses ya despachados: informativos, nunca reciben reserva ni reasignación.
+MESES_DESPACHADOS = frozenset({"mayo", "junio", "julio"})
+_MESES_YEAR2 = frozenset({"enero", "febrero", "marzo", "abril"})
+_MES_NUM = {
+    "enero": 1, "febrero": 2, "marzo": 3, "abril": 4, "mayo": 5, "junio": 6,
+    "julio": 7, "agosto": 8, "septiembre": 9, "octubre": 10, "noviembre": 11, "diciembre": 12,
+}
+_NUM_MES = {v: k for k, v in _MES_NUM.items()}
+
+# Estados de reserva que "ocupan" stock: cuentan como demanda cubierta y como
+# reservado en los KPIs. RECHAZADA y CANCELADA quedan fuera.
+_ESTADOS_VIGENTES = ("RESERVADA", "PENDIENTE_CONFIRMACION", "CONFIRMADA")
+_SQL_ESTADOS_VIGENTES = "('RESERVADA', 'PENDIENTE_CONFIRMACION', 'CONFIRMADA')"
+
+
+def _split_periodo(periodo: str):
+    """'2026-2027' -> (2026, 2027). Lanza AsignacionesError si el formato es inválido."""
+    import re
+    m = re.match(r"^\s*(\d{4})-(\d{4})\s*$", str(periodo or ""))
+    if not m:
+        raise AsignacionesError("PERIODO_INVALIDO", f"Periodo con formato inválido: {periodo!r}", 400)
+    return int(m.group(1)), int(m.group(2))
+
+
+def _columna_a_fecha(periodo: str, columna: str):
+    """('2026-2027', 'octubre') -> datetime.date(2026, 10, 1)."""
+    import datetime as _dt
+    col = (columna or "").strip().lower()
+    if col not in _MES_NUM:
+        raise AsignacionesError("MES_INVALIDO", f"Mes desconocido: {columna!r}", 400)
+    year1, year2 = _split_periodo(periodo)
+    year = year2 if col in _MESES_YEAR2 else year1
+    return _dt.date(year, _MES_NUM[col], 1)
+
+
+def _fecha_a_columna(fecha) -> str:
+    """date/datetime/'YYYY-MM-DD' -> 'octubre'."""
+    import datetime as _dt
+    if isinstance(fecha, str):
+        fecha = _dt.date.fromisoformat(fecha[:10])
+    return _NUM_MES[fecha.month]
+
+
+def _parse_mes_arg(periodo: str, valor: str):
+    """Acepta 'octubre' | '2026-10' | '2026-10-01' -> date día 1 dentro del periodo."""
+    import datetime as _dt
+    s = str(valor or "").strip().lower()
+    if not s:
+        raise AsignacionesError("MES_INVALIDO", "Falta el mes", 400)
+    if s in _MES_NUM:
+        return _columna_a_fecha(periodo, s)
+    try:
+        partes = s.split("-")
+        year, month = int(partes[0]), int(partes[1])
+        return _dt.date(year, month, 1)
+    except (ValueError, IndexError):
+        raise AsignacionesError("MES_INVALIDO", f"Mes con formato inválido: {valor!r}", 400)
+
+
+def _meses_en_ventana(periodo: str, mes_desde, mes_hasta) -> list:
+    """Lista de nombres de columna (cronológica) entre mes_desde y mes_hasta inclusive."""
+    d_desde = _parse_mes_arg(periodo, mes_desde)
+    d_hasta = _parse_mes_arg(periodo, mes_hasta)
+    if d_hasta < d_desde:
+        raise AsignacionesError("VENTANA_INVALIDA", "mes_hasta es anterior a mes_desde", 400)
+    col_desde = _fecha_a_columna(d_desde)
+    col_hasta = _fecha_a_columna(d_hasta)
+    i, j = MESES_ORDEN.index(col_desde), MESES_ORDEN.index(col_hasta)
+    return MESES_ORDEN[i:j + 1]
+
+
+def _meses_reasignables(periodo: str, ventana_desde) -> list:
+    """Meses anteriores a ventana_desde, dentro del periodo, excluyendo may/jun/jul."""
+    d_desde = _parse_mes_arg(periodo, ventana_desde)
+    col_desde = _fecha_a_columna(d_desde)
+    tope = MESES_ORDEN.index(col_desde)
+    return [m for m in MESES_ORDEN[:tope] if m not in MESES_DESPACHADOS]
+
+
+def _migrar_esquema_reservas(cursor) -> list:
+    """Adapta importacion_asignaciones/movimientos al modelo de reservas por mes.
+
+    Idempotente: introspecciona information_schema y solo aplica lo que falta.
+    Se invoca desde POST /importaciones/asignaciones/inicializar-tablas.
+    Devuelve la lista de pasos aplicados (para logging/tests).
+    """
+    aplicados = []
+
+    def _col_existe(tabla, col):
+        cursor.execute(
+            "SELECT 1 FROM information_schema.COLUMNS "
+            "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = %s AND COLUMN_NAME = %s",
+            (tabla, col),
+        )
+        return cursor.fetchone() is not None
+
+    def _col_tipo(tabla, col):
+        cursor.execute(
+            "SELECT COLUMN_TYPE FROM information_schema.COLUMNS "
+            "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = %s AND COLUMN_NAME = %s",
+            (tabla, col),
+        )
+        row = cursor.fetchone()
+        return (row[0] if row else "") or ""
+
+    def _indice_existe(tabla, nombre):
+        cursor.execute(
+            "SELECT 1 FROM information_schema.STATISTICS "
+            "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = %s AND INDEX_NAME = %s LIMIT 1",
+            (tabla, nombre),
+        )
+        return cursor.fetchone() is not None
+
+    T = "importacion_asignaciones"
+
+    if not _col_existe(T, "mes_objetivo"):
+        cursor.execute(f"ALTER TABLE {T} ADD COLUMN mes_objetivo DATE NULL AFTER clave_cliente")
+        aplicados.append("add mes_objetivo")
+    if not _col_existe(T, "origen"):
+        cursor.execute(
+            f"ALTER TABLE {T} ADD COLUMN origen ENUM('INICIAL','REASIGNACION') "
+            f"NOT NULL DEFAULT 'INICIAL' AFTER mes_objetivo"
+        )
+        aplicados.append("add origen")
+    if not _col_existe(T, "confirmada_at"):
+        cursor.execute(f"ALTER TABLE {T} ADD COLUMN confirmada_at DATETIME NULL AFTER usuario_id")
+        aplicados.append("add confirmada_at")
+    if not _col_existe(T, "confirmada_por"):
+        cursor.execute(f"ALTER TABLE {T} ADD COLUMN confirmada_por INT NULL AFTER confirmada_at")
+        aplicados.append("add confirmada_por")
+
+    tipo_estado = _col_tipo(T, "estado").lower()
+    if "reservada" not in tipo_estado:
+        # Paso 1: enum ampliado que aún admite 'ACTIVA'
+        cursor.execute(
+            f"ALTER TABLE {T} MODIFY estado "
+            f"ENUM('ACTIVA','RESERVADA','PENDIENTE_CONFIRMACION','CONFIRMADA','RECHAZADA','CANCELADA') "
+            f"NOT NULL DEFAULT 'RESERVADA'"
+        )
+        cursor.execute(f"UPDATE {T} SET estado = 'RESERVADA' WHERE estado = 'ACTIVA'")
+        # Paso 2: enum final sin 'ACTIVA'
+        cursor.execute(
+            f"ALTER TABLE {T} MODIFY estado "
+            f"ENUM('RESERVADA','PENDIENTE_CONFIRMACION','CONFIRMADA','RECHAZADA','CANCELADA') "
+            f"NOT NULL DEFAULT 'RESERVADA'"
+        )
+        aplicados.append("estado enum -> reservas")
+
+    # El índice viejo cubre la FK sobre importacion_producto_id: hay que crear el
+    # nuevo (que también lidera con esa columna) ANTES de poder soltar el viejo.
+    if not _indice_existe(T, "uq_reserva"):
+        cursor.execute(
+            f"ALTER TABLE {T} ADD UNIQUE KEY uq_reserva "
+            f"(importacion_producto_id, clave_cliente, mes_objetivo, origen)"
+        )
+        aplicados.append("add uq_reserva")
+    if not _indice_existe(T, "idx_asig_mes"):
+        cursor.execute(f"ALTER TABLE {T} ADD KEY idx_asig_mes (mes_objetivo)")
+        aplicados.append("add idx_asig_mes")
+    if _indice_existe(T, "uq_asignacion_producto_cliente"):
+        cursor.execute(f"ALTER TABLE {T} DROP INDEX uq_asignacion_producto_cliente")
+        aplicados.append("drop uq_asignacion_producto_cliente")
+
+    tipo_mov = _col_tipo("importacion_movimientos", "tipo_movimiento").lower()
+    if "'reserva'" not in tipo_mov or "reasignacion" not in tipo_mov or "rechazo_reserva" not in tipo_mov:
+        cursor.execute(
+            "ALTER TABLE importacion_movimientos MODIFY tipo_movimiento "
+            "ENUM('ENTRADA','ASIGNACION','LIBERACION','SOBRANTE','RESERVA_SOBRANTE',"
+            "'VENTA_SOBRANTE','CANCELACION','AJUSTE','RESERVA','REASIGNACION','RECHAZO_RESERVA') NOT NULL"
+        )
+        aplicados.append("movimientos enum +RESERVA/REASIGNACION/RECHAZO_RESERVA")
+
+    return aplicados
 
 
 def _disponible_producto(cursor, producto_id: int) -> int:
@@ -238,7 +427,7 @@ def listar_productos(importacion_id: int) -> list:
             disponible = _disponible_producto(cursor, p["id"])
             cursor.execute(
                 "SELECT COALESCE(SUM(cantidad_asignada), 0) AS total FROM importacion_asignaciones "
-                "WHERE importacion_producto_id = %s AND estado = 'ACTIVA'",
+                f"WHERE importacion_producto_id = %s AND estado IN {_SQL_ESTADOS_VIGENTES}",
                 (p["id"],),
             )
             asignado = int(cursor.fetchone()["total"])
@@ -280,7 +469,7 @@ def actualizar_producto(producto_id: int, cantidad_embarcada=None, descripcion: 
                 raise AsignacionesError("AJUSTE_INVALIDO", "La cantidad embarcada debe ser un entero >= 0")
             cursor.execute(
                 "SELECT COALESCE(SUM(cantidad_asignada), 0) AS total FROM importacion_asignaciones "
-                "WHERE importacion_producto_id = %s AND estado = 'ACTIVA'",
+                f"WHERE importacion_producto_id = %s AND estado IN {_SQL_ESTADOS_VIGENTES}",
                 (producto_id,),
             )
             asignado = cursor.fetchone()["total"]
@@ -525,25 +714,26 @@ def asignar(producto_id: int, asignaciones: list, usuario_id: int = None,
                 if cantidad_proyectada is not None:
                     cursor.execute(
                         "UPDATE importacion_asignaciones SET cantidad_asignada = cantidad_asignada + %s, "
-                        "cantidad_proyectada = %s, estado = 'ACTIVA', usuario_id = %s, prioridad = %s "
+                        "cantidad_proyectada = %s, estado = 'RESERVADA', usuario_id = %s, prioridad = %s "
                         "WHERE id = %s",
                         (cantidad, cantidad_proyectada, usuario_id, prio_info[0], existente["id"]),
                     )
                 else:
                     cursor.execute(
                         "UPDATE importacion_asignaciones SET cantidad_asignada = cantidad_asignada + %s, "
-                        "estado = 'ACTIVA', usuario_id = %s, prioridad = %s WHERE id = %s",
+                        "estado = 'RESERVADA', usuario_id = %s, prioridad = %s WHERE id = %s",
                         (cantidad, usuario_id, prio_info[0], existente["id"]),
                     )
             else:
                 cursor.execute(
                     "INSERT INTO importacion_asignaciones "
                     "(importacion_producto_id, clave_cliente, cantidad_proyectada, cantidad_asignada, "
-                    "prioridad, estado, usuario_id) VALUES (%s, %s, %s, %s, %s, 'ACTIVA', %s)",
+                    "prioridad, estado, origen, usuario_id) "
+                    "VALUES (%s, %s, %s, %s, %s, 'RESERVADA', 'INICIAL', %s)",
                     (producto_id, clave, cantidad_proyectada if cantidad_proyectada is not None else 0,
                      cantidad, prio_info[0], usuario_id),
                 )
-            _registrar_movimiento(cursor, producto_id, "ASIGNACION", -cantidad, clave_cliente=clave,
+            _registrar_movimiento(cursor, producto_id, "RESERVA", -cantidad, clave_cliente=clave,
                                    usuario_id=usuario_id)
 
         conn.commit()
@@ -1050,7 +1240,7 @@ def _filtros_embarque(f: dict):
 #  - disponible: Σ cantidad del ledger de movimientos (es un saldo con signo)
 _SUB_ASIGNADO = (
     "(SELECT COALESCE(SUM(a.cantidad_asignada), 0) FROM importacion_asignaciones a "
-    "WHERE a.importacion_producto_id = p.id AND a.estado = 'ACTIVA')"
+    f"WHERE a.importacion_producto_id = p.id AND a.estado IN {_SQL_ESTADOS_VIGENTES})"
 )
 _SUB_VENDIDO = (
     "(SELECT COALESCE(SUM(v.cantidad), 0) FROM importacion_sobrantes_ventas v "
