@@ -136,10 +136,10 @@ def test_crear_producto_exitoso_normaliza_sku_y_registra_entrada(mocker):
 def test_listar_productos_calcula_disponible_asignado_sobrante_vendido(mocker):
     cursor = MagicMock()
     cursor.fetchone.side_effect = [
-        {"id": 1},                                   # importacion existe
-        {"disponible": 7},                            # _disponible_producto
-        {"total": 3},                                 # asignado
-        {"total": 0},                                 # vendido
+        {"id": 1},                                            # importacion existe
+        {"disponible": 7},                                    # _disponible_producto
+        {"inicial": 3, "pendiente": 0, "confirmada": 0},      # _kpis_reserva_producto
+        {"total": 0},                                         # vendido
     ]
     cursor.fetchall.return_value = [
         {"id": 10, "importacion_id": 1, "sku": "SKU-1", "sku_norm": "SKU1",
@@ -152,7 +152,9 @@ def test_listar_productos_calcula_disponible_asignado_sobrante_vendido(mocker):
     assert len(resultado) == 1
     assert resultado[0]["cantidad_disponible"] == 7
     assert resultado[0]["cantidad_asignada"] == 3
-    assert resultado[0]["cantidad_sobrante"] == 7  # 10 embarcado - 3 asignado
+    assert resultado[0]["reservado_total"] == 3
+    assert resultado[0]["reservado_inicial"] == 3
+    assert resultado[0]["cantidad_sobrante"] == 7  # 10 embarcado - 3 reservado
     assert resultado[0]["cantidad_vendida"] == 0
     consultas_vendido = [
         c for c in cursor.execute.call_args_list
@@ -166,10 +168,10 @@ def test_listar_productos_calcula_disponible_asignado_sobrante_vendido(mocker):
 def test_listar_productos_cuenta_ventas_pendientes_de_validacion_como_vendidas(mocker):
     cursor = MagicMock()
     cursor.fetchone.side_effect = [
-        {"id": 1},            # importacion existe
-        {"disponible": 8},     # _disponible_producto (10 embarcadas - 2 vendidas pendientes)
-        {"total": 0},          # asignado
-        {"total": 2},          # vendido: 2 unidades en PENDIENTE_VALIDACION
+        {"id": 1},                                           # importacion existe
+        {"disponible": 8},                                   # _disponible_producto
+        {"inicial": 0, "pendiente": 0, "confirmada": 0},     # _kpis_reserva_producto
+        {"total": 2},                                        # vendido: 2 en PENDIENTE_VALIDACION
     ]
     cursor.fetchall.return_value = [
         {"id": 10, "importacion_id": 1, "sku": "SKU-1", "sku_norm": "SKU1",
@@ -1103,7 +1105,9 @@ def _detalle_producto_mocks(mocker, producto_calculado=None):
         "cantidad_embarcada": 10,
     }
     cursor.fetchall.side_effect = [
-        [{"id": 1, "clave_cliente": "LC657", "cantidad_asignada": 3}],  # asignaciones
+        [{"id": 1, "clave_cliente": "LC657", "cantidad_asignada": 3,
+          "cantidad_proyectada": 5, "mes_objetivo": None, "origen": "INICIAL",
+          "estado": "RESERVADA"}],                                        # reservas
         [{"id": 1, "clave_cliente": "MC677", "cantidad": 1, "estado": "VALIDADO"}],  # ventas
     ]
     _mock_conn(mocker, cursor)
@@ -1115,22 +1119,21 @@ def _detalle_producto_mocks(mocker, producto_calculado=None):
             "cantidad_sobrante": 7, "cantidad_disponible": 6,
         }],
     )
-    mocker.patch(
-        "services.asignaciones_service.recalcular_propuesta",
-        return_value=[{"producto_id": 10, "propuesta": [{"clave_cliente": "LC657", "cantidad_sugerida": 3}]}],
-    )
     return cursor
 
 
-def test_obtener_detalle_producto_incluye_los_3_bloques(mocker):
+def test_obtener_detalle_producto_incluye_los_bloques(mocker):
     _detalle_producto_mocks(mocker)
 
     detalle = obtener_detalle_producto(10)
 
     assert detalle["producto"]["id"] == 10
-    assert len(detalle["asignaciones"]) == 1
+    assert len(detalle["reservas"]) == 1 and detalle["asignaciones"] is detalle["reservas"]
     assert len(detalle["sobrantes_ventas"]) == 1
-    assert detalle["proyecciones"][0]["clave_cliente"] == "LC657"
+    assert detalle["proyecciones"] == []           # la propuesta se pide aparte
+    # reserva enriquecida con Proyectado / Reservado / Faltante
+    r = detalle["reservas"][0]
+    assert r["proyectado"] == 5 and r["reservado"] == 3 and r["faltante"] == 2
 
 
 def test_obtener_detalle_producto_incluye_las_cantidades_calculadas(mocker):
@@ -1161,18 +1164,21 @@ def test_resumen_embarque_suma_kpis_de_todos_los_productos(mocker):
     mocker.patch(
         "services.asignaciones_service.listar_productos",
         return_value=[
-            {"cantidad_embarcada": 10, "cantidad_asignada": 6, "cantidad_sobrante": 4,
-             "cantidad_vendida": 1, "cantidad_disponible": 3},
-            {"cantidad_embarcada": 5, "cantidad_asignada": 5, "cantidad_sobrante": 0,
-             "cantidad_vendida": 0, "cantidad_disponible": 0},
+            {"cantidad_embarcada": 10, "cantidad_sobrante": 4, "cantidad_vendida": 1,
+             "cantidad_disponible": 3, "reservado_total": 6, "reservado_inicial": 4,
+             "reservado_reasignacion_pendiente": 1, "reservado_confirmado": 1},
+            {"cantidad_embarcada": 5, "cantidad_sobrante": 0, "cantidad_vendida": 0,
+             "cantidad_disponible": 0, "reservado_total": 5, "reservado_inicial": 5,
+             "reservado_reasignacion_pendiente": 0, "reservado_confirmado": 0},
         ],
     )
 
     resumen = resumen_embarque(1)
 
     assert resumen["kpis"] == {
-        "unidades_embarcadas": 15, "unidades_asignadas": 11, "unidades_sobrantes": 4,
-        "unidades_vendidas": 1, "unidades_disponibles": 3,
+        "unidades_embarcadas": 15, "unidades_reservadas": 11, "unidades_asignadas": 11,
+        "reservado_inicial": 9, "reservado_reasignacion_pendiente": 1, "reservado_confirmado": 1,
+        "unidades_sobrantes": 4, "unidades_vendidas": 1, "unidades_disponibles": 3,
     }
 
 
@@ -1506,11 +1512,11 @@ def test_resumen_global_arma_kpis_y_totales_por_embarque(mocker):
     cursor = MagicMock()
     cursor.fetchall.return_value = [
         {"id": 12, "referencia": "IMP-012", "nombre": "Scott", "estado": "activo",
-         "n_productos": 2, "n_periodos": 1, "embarcadas": 30, "asignadas": 18,
+         "n_productos": 2, "n_periodos": 1, "embarcadas": 30, "asignadas": 18, "pendientes": 6,
          "vendidas": 2, "sobrantes": 12, "disponibles": 10,
          "ultima_actividad": datetime(2026, 9, 9, 15, 30)},
         {"id": 7, "referencia": "IMP-007", "nombre": "Megamo", "estado": "cerrado",
-         "n_productos": 1, "n_periodos": 1, "embarcadas": 5, "asignadas": 5,
+         "n_productos": 1, "n_periodos": 1, "embarcadas": 5, "asignadas": 5, "pendientes": 0,
          "vendidas": 0, "sobrantes": 0, "disponibles": 0, "ultima_actividad": None},
     ]
     _mock_conn(mocker, cursor)
@@ -1519,12 +1525,13 @@ def test_resumen_global_arma_kpis_y_totales_por_embarque(mocker):
 
     assert [e["id"] for e in res["embarques"]] == [12, 7]
     assert res["embarques"][0]["kpis"] == {
-        "embarcadas": 30, "asignadas": 18, "sobrantes": 12, "vendidas": 2, "disponibles": 10,
+        "embarcadas": 30, "asignadas": 18, "pendientes": 6, "sobrantes": 12,
+        "vendidas": 2, "disponibles": 10,
     }
     assert res["embarques"][0]["ultima_actividad"] == "2026-09-09 15:30:00"
     assert res["embarques"][1]["ultima_actividad"] is None
     assert res["totales"] == {
-        "embarcadas": 35, "asignadas": 23, "sobrantes": 12, "vendidas": 2,
+        "embarcadas": 35, "asignadas": 23, "pendientes": 6, "sobrantes": 12, "vendidas": 2,
         "disponibles": 10, "n_embarques": 2,
     }
 
@@ -1547,11 +1554,13 @@ def test_listar_productos_global_calcula_sobrante_y_totales(mocker):
         {"importacion_id": 12, "referencia": "IMP-012", "embarque_nombre": "Scott",
          "embarque_estado": "activo", "producto_id": 100, "sku": "AB-1", "sku_norm": "AB1",
          "descripcion": "Bici", "periodo": "2026-2027", "cantidad_embarcada": 20,
-         "cantidad_asignada": 15, "cantidad_vendida": 1, "cantidad_disponible": 4},
+         "cantidad_asignada": 15, "cantidad_pendiente": 4, "cantidad_vendida": 1,
+         "cantidad_disponible": 4},
         {"importacion_id": 7, "referencia": "IMP-007", "embarque_nombre": "Megamo",
          "embarque_estado": "cerrado", "producto_id": 55, "sku": "CD-2", "sku_norm": "CD2",
          "descripcion": None, "periodo": "2026-2027", "cantidad_embarcada": 5,
-         "cantidad_asignada": 8, "cantidad_vendida": 0, "cantidad_disponible": 0},
+         "cantidad_asignada": 8, "cantidad_pendiente": 0, "cantidad_vendida": 0,
+         "cantidad_disponible": 0},
     ]
     _mock_conn(mocker, cursor)
 
@@ -1561,7 +1570,8 @@ def test_listar_productos_global_calcula_sobrante_y_totales(mocker):
     assert res["productos"][0]["cantidad_sobrante"] == 5   # 20 - 15
     assert res["productos"][1]["cantidad_sobrante"] == 0   # 5 - 8 -> clamp a 0
     assert res["totales"] == {
-        "embarcadas": 25, "asignadas": 23, "sobrantes": 5, "vendidas": 1, "disponibles": 4,
+        "embarcadas": 25, "asignadas": 23, "pendientes": 4, "sobrantes": 5,
+        "vendidas": 1, "disponibles": 4,
     }
 
 

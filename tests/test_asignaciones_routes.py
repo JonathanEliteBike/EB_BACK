@@ -286,7 +286,7 @@ def test_asignaciones_embarques_end_to_end():
     if data["embarques"]:
         e = data["embarques"][0]
         assert {"id", "referencia", "nombre", "estado", "n_productos", "kpis"} <= set(e)
-        assert set(e["kpis"]) == {"embarcadas", "asignadas", "sobrantes", "vendidas", "disponibles"}
+        assert set(e["kpis"]) == {"embarcadas", "asignadas", "pendientes", "sobrantes", "vendidas", "disponibles"}
 
 
 def test_asignaciones_productos_global_end_to_end():
@@ -529,3 +529,55 @@ def test_resolver_reserva_rechazada_end_to_end():
     )
     assert r2.status_code == 409
     assert r2.get_json()["error"]["code"] == "RESERVA_NO_PENDIENTE"
+
+
+def test_detalle_y_kpis_de_reserva_end_to_end():
+    """GET .../detalle responde 200 (ya no llama a recalcular con firma vieja) y
+    la reserva trae Proyectado/Reservado/Faltante; el resumen del embarque trae
+    el desglose reservado_inicial/pendiente/confirmado."""
+    import time
+    conn = obtener_conexion()
+    if not conn:
+        import pytest
+        pytest.skip("Sin conexión a BD local para este test")
+    cur = conn.cursor(dictionary=True)
+    cur.execute("SELECT id FROM importaciones LIMIT 1")
+    emb = cur.fetchone()
+    cur.execute("SELECT clave FROM clientes LIMIT 1")
+    cli = cur.fetchone()
+    conn.close()
+    if not emb or not cli:
+        import pytest
+        pytest.skip("Se necesita 1 embarque y 1 cliente en la BD local")
+
+    client = _cliente_test()
+    headers = {"Authorization": f"Bearer {_token_valido(rol=1)}"}
+    sku = f"KPI-{int(time.time())}"
+
+    pid = client.post(
+        f"/importaciones/{emb['id']}/asignaciones/productos",
+        json={"sku": sku, "cantidad_embarcada": 10, "periodo": "2026-2027"},
+        headers=headers,
+    ).get_json()["data"]["id"]
+    client.post(
+        f"/importaciones/{emb['id']}/asignaciones/productos/{pid}/reservar",
+        json={"reservas": [{"clave_cliente": cli["clave"], "mes_objetivo": "2026-10",
+                            "cantidad": 4, "proyectado": 7}]},
+        headers=headers,
+    )
+
+    d = client.get(
+        f"/importaciones/{emb['id']}/asignaciones/productos/{pid}/detalle", headers=headers
+    )
+    assert d.status_code == 200, d.get_json()
+    data = d.get_json()["data"]
+    assert data["proyecciones"] == []
+    r = next(x for x in data["reservas"] if x["mes_objetivo"] == "2026-10")
+    assert (r["proyectado"], r["reservado"], r["faltante"], r["origen"], r["estado"]) == \
+        (7, 4, 3, "INICIAL", "RESERVADA")
+
+    resumen = client.get(f"/importaciones/{emb['id']}/asignaciones", headers=headers).get_json()["data"]
+    k = resumen["kpis"]
+    assert {"reservado_inicial", "reservado_reasignacion_pendiente", "reservado_confirmado",
+            "unidades_reservadas"} <= set(k)
+    assert k["reservado_inicial"] >= 4

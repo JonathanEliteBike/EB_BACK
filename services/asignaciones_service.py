@@ -412,6 +412,26 @@ def crear_producto(importacion_id: int, sku: str, cantidad_embarcada, periodo: s
         conn.close()
 
 
+def _kpis_reserva_producto(cursor, producto_id: int) -> dict:
+    """Desglose de lo reservado de un producto por estado de reserva (spec §6)."""
+    cursor.execute(
+        "SELECT "
+        "COALESCE(SUM(CASE WHEN estado = 'RESERVADA' THEN cantidad_asignada END), 0) AS inicial, "
+        "COALESCE(SUM(CASE WHEN estado = 'PENDIENTE_CONFIRMACION' THEN cantidad_asignada END), 0) AS pendiente, "
+        "COALESCE(SUM(CASE WHEN estado = 'CONFIRMADA' THEN cantidad_asignada END), 0) AS confirmada "
+        "FROM importacion_asignaciones WHERE importacion_producto_id = %s",
+        (producto_id,),
+    )
+    r = cursor.fetchone()
+    inicial, pendiente, confirmada = int(r["inicial"]), int(r["pendiente"]), int(r["confirmada"])
+    return {
+        "reservado_inicial": inicial,
+        "reservado_reasignacion_pendiente": pendiente,
+        "reservado_confirmado": confirmada,
+        "reservado_total": inicial + pendiente + confirmada,
+    }
+
+
 def listar_productos(importacion_id: int) -> list:
     conn = obtener_conexion()
     if not conn:
@@ -430,12 +450,8 @@ def listar_productos(importacion_id: int) -> list:
         resultado = []
         for p in productos:
             disponible = _disponible_producto(cursor, p["id"])
-            cursor.execute(
-                "SELECT COALESCE(SUM(cantidad_asignada), 0) AS total FROM importacion_asignaciones "
-                f"WHERE importacion_producto_id = %s AND estado IN {_SQL_ESTADOS_VIGENTES}",
-                (p["id"],),
-            )
-            asignado = int(cursor.fetchone()["total"])
+            kpi = _kpis_reserva_producto(cursor, p["id"])
+            reservado = kpi["reservado_total"]
             # PENDIENTE_VALIDACION cuenta igual que VALIDADO: la venta ya descontó del
             # disponible (movimiento VENTA_SOBRANTE) en el momento de crearse.
             cursor.execute(
@@ -446,9 +462,11 @@ def listar_productos(importacion_id: int) -> list:
             vendido = int(cursor.fetchone()["total"])
             resultado.append({
                 **p,
-                "cantidad_asignada": asignado,
+                **kpi,
+                "cantidad_asignada": reservado,          # compat: = reservado_total
+                "cantidad_reservada": reservado,
                 "cantidad_vendida": vendido,
-                "cantidad_sobrante": max(p["cantidad_embarcada"] - asignado, 0),
+                "cantidad_sobrante": max(p["cantidad_embarcada"] - reservado, 0),
                 "cantidad_disponible": int(disponible),
             })
         return resultado
@@ -1371,10 +1389,11 @@ def obtener_detalle_producto(producto_id: int, importacion_id: int = None) -> di
         _verificar_pertenencia(producto, importacion_id)
 
         cursor.execute(
-            "SELECT * FROM importacion_asignaciones WHERE importacion_producto_id = %s ORDER BY prioridad",
+            "SELECT * FROM importacion_asignaciones WHERE importacion_producto_id = %s "
+            "ORDER BY origen, mes_objetivo, prioridad",
             (producto_id,),
         )
-        asignaciones = cursor.fetchall()
+        reservas = cursor.fetchall()
 
         cursor.execute(
             "SELECT * FROM importacion_sobrantes_ventas WHERE importacion_producto_id = %s "
@@ -1385,18 +1404,24 @@ def obtener_detalle_producto(producto_id: int, importacion_id: int = None) -> di
     finally:
         conn.close()
 
-    # Reusa el cálculo de listar_productos para no duplicar la lógica de
-    # cantidad_asignada/vendida/sobrante/disponible.
+    # Enriquecer cada reserva con Proyectado / Reservado / Faltante (spec §6).
+    for r in reservas:
+        r["mes_objetivo"] = _fecha_a_ym(r["mes_objetivo"]) if r.get("mes_objetivo") else None
+        proyectado = int(r.get("cantidad_proyectada") or 0)
+        reservado = int(r.get("cantidad_asignada") or 0)
+        r["proyectado"] = proyectado
+        r["reservado"] = reservado
+        r["faltante"] = max(0, proyectado - reservado)
+
+    # Reusa el cálculo de listar_productos para las cantidades del producto.
     productos = listar_productos(producto["importacion_id"])
     producto_calculado = next((p for p in productos if p["id"] == producto_id), producto)
 
-    propuesta = recalcular_propuesta(producto["importacion_id"], producto["periodo"])
-    fila = next((p for p in propuesta if p["producto_id"] == producto_id), None)
-
     return {
         "producto": producto_calculado,
-        "proyecciones": fila["propuesta"] if fila else [],
-        "asignaciones": asignaciones,
+        "proyecciones": [],          # la propuesta se pide aparte con POST .../recalcular (ventana de meses)
+        "asignaciones": reservas,    # clave conservada por compatibilidad; son las reservas
+        "reservas": reservas,
         "sobrantes_ventas": ventas,
     }
 
@@ -1417,9 +1442,14 @@ def resumen_embarque(importacion_id: int) -> dict:
         conn.close()
 
     productos = listar_productos(importacion_id)
+    reservadas = sum(p["reservado_total"] for p in productos)
     kpis = {
         "unidades_embarcadas": sum(p["cantidad_embarcada"] for p in productos),
-        "unidades_asignadas": sum(p["cantidad_asignada"] for p in productos),
+        "unidades_reservadas": reservadas,
+        "unidades_asignadas": reservadas,   # compat con el frontend actual
+        "reservado_inicial": sum(p["reservado_inicial"] for p in productos),
+        "reservado_reasignacion_pendiente": sum(p["reservado_reasignacion_pendiente"] for p in productos),
+        "reservado_confirmado": sum(p["reservado_confirmado"] for p in productos),
         "unidades_sobrantes": sum(p["cantidad_sobrante"] for p in productos),
         "unidades_vendidas": sum(p["cantidad_vendida"] for p in productos),
         "unidades_disponibles": sum(p["cantidad_disponible"] for p in productos),
@@ -1468,6 +1498,10 @@ _SUB_ASIGNADO = (
     "(SELECT COALESCE(SUM(a.cantidad_asignada), 0) FROM importacion_asignaciones a "
     f"WHERE a.importacion_producto_id = p.id AND a.estado IN {_SQL_ESTADOS_VIGENTES})"
 )
+_SUB_PENDIENTE = (
+    "(SELECT COALESCE(SUM(a.cantidad_asignada), 0) FROM importacion_asignaciones a "
+    "WHERE a.importacion_producto_id = p.id AND a.estado = 'PENDIENTE_CONFIRMACION')"
+)
 _SUB_VENDIDO = (
     "(SELECT COALESCE(SUM(v.cantidad), 0) FROM importacion_sobrantes_ventas v "
     "WHERE v.importacion_producto_id = p.id AND v.estado IN ('VALIDADO', 'PENDIENTE_VALIDACION'))"
@@ -1497,6 +1531,7 @@ def resumen_global(filtros: dict = None) -> dict:
               COUNT(DISTINCT pa.periodo)                AS n_periodos,
               COALESCE(SUM(pa.cantidad_embarcada), 0)   AS embarcadas,
               COALESCE(SUM(pa.asignado), 0)             AS asignadas,
+              COALESCE(SUM(pa.pendiente), 0)            AS pendientes,
               COALESCE(SUM(pa.vendido), 0)              AS vendidas,
               COALESCE(SUM(GREATEST(pa.cantidad_embarcada - pa.asignado, 0)), 0) AS sobrantes,
               COALESCE(SUM(pa.disponible), 0)           AS disponibles,
@@ -1506,6 +1541,7 @@ def resumen_global(filtros: dict = None) -> dict:
               SELECT
                 p.id, p.importacion_id, p.periodo, p.cantidad_embarcada,
                 {_SUB_ASIGNADO}  AS asignado,
+                {_SUB_PENDIENTE} AS pendiente,
                 {_SUB_VENDIDO}   AS vendido,
                 {_SUB_DISPONIBLE} AS disponible,
                 (SELECT MAX(m.created_at) FROM importacion_movimientos m
@@ -1524,9 +1560,10 @@ def resumen_global(filtros: dict = None) -> dict:
         conn.close()
 
     embarques = []
-    tot = {"embarcadas": 0, "asignadas": 0, "sobrantes": 0, "vendidas": 0, "disponibles": 0}
+    tot = {"embarcadas": 0, "asignadas": 0, "pendientes": 0, "sobrantes": 0, "vendidas": 0, "disponibles": 0}
     for r in filas:
-        kpis = {k: int(r[k]) for k in ("embarcadas", "asignadas", "sobrantes", "vendidas", "disponibles")}
+        kpis = {k: int(r[k]) for k in
+                ("embarcadas", "asignadas", "pendientes", "sobrantes", "vendidas", "disponibles")}
         ua = r["ultima_actividad"]
         embarques.append({
             "id": r["id"],
@@ -1608,6 +1645,7 @@ def listar_productos_global(filtros: dict = None, limite: int = 200, offset: int
               p.id AS producto_id, p.sku, p.sku_norm, p.descripcion, p.periodo,
               p.cantidad_embarcada,
               {_SUB_ASIGNADO}   AS cantidad_asignada,
+              {_SUB_PENDIENTE}  AS cantidad_pendiente,
               {_SUB_VENDIDO}    AS cantidad_vendida,
               {_SUB_DISPONIBLE} AS cantidad_disponible
             {base_from}
@@ -1621,10 +1659,11 @@ def listar_productos_global(filtros: dict = None, limite: int = 200, offset: int
         conn.close()
 
     productos = []
-    tot = {"embarcadas": 0, "asignadas": 0, "sobrantes": 0, "vendidas": 0, "disponibles": 0}
+    tot = {"embarcadas": 0, "asignadas": 0, "pendientes": 0, "sobrantes": 0, "vendidas": 0, "disponibles": 0}
     for r in rows:
         embarcada = int(r["cantidad_embarcada"])
         asignada = int(r["cantidad_asignada"])
+        pendiente = int(r["cantidad_pendiente"])
         vendida = int(r["cantidad_vendida"])
         disponible = int(r["cantidad_disponible"])
         sobrante = max(embarcada - asignada, 0)
@@ -1639,12 +1678,14 @@ def listar_productos_global(filtros: dict = None, limite: int = 200, offset: int
             "periodo": r["periodo"],
             "cantidad_embarcada": embarcada,
             "cantidad_asignada": asignada,
+            "cantidad_pendiente": pendiente,
             "cantidad_sobrante": sobrante,
             "cantidad_vendida": vendida,
             "cantidad_disponible": disponible,
         })
         tot["embarcadas"] += embarcada
         tot["asignadas"] += asignada
+        tot["pendientes"] += pendiente
         tot["sobrantes"] += sobrante
         tot["vendidas"] += vendida
         tot["disponibles"] += disponible
