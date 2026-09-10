@@ -157,6 +157,34 @@ def asignar_ruta(importacion_id, producto_id):
     return jsonify({"ok": True, "data": data}), 200
 
 
+@asignaciones_bp.route("/<int:importacion_id>/asignaciones/reasignar", methods=["POST"])
+@token_required
+@_requiere_rol_importaciones
+def reasignar_ruta(importacion_id):
+    body = request.get_json(silent=True) or {}
+    data = svc.proponer_reasignacion(
+        importacion_id, body.get("ventana_desde"), body.get("periodo")
+    )
+    return jsonify({"ok": True, "data": data}), 200
+
+
+@asignaciones_bp.route(
+    "/<int:importacion_id>/asignaciones/productos/<int:producto_id>/reasignar", methods=["POST"]
+)
+@token_required
+@_requiere_rol_importaciones
+def confirmar_reasignacion_ruta(importacion_id, producto_id):
+    body = request.get_json(silent=True) or {}
+    payload = getattr(request, "cliente_data", {}) or {}
+    data = svc.confirmar_reasignacion(
+        producto_id,
+        body.get("reservas") or [],
+        usuario_id=payload.get("id"),
+        importacion_id=importacion_id,
+    )
+    return jsonify({"ok": True, "data": data}), 200
+
+
 @asignaciones_bp.route(
     "/<int:importacion_id>/asignaciones/productos/<int:producto_id>/venta-sobrante", methods=["POST"]
 )

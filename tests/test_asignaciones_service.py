@@ -8,6 +8,7 @@ from services.asignaciones_service import (
     AsignacionesError, actualizar_producto, crear_producto, listar_productos, recalcular_propuesta,
 )
 from services.asignaciones_service import asignar
+from services.asignaciones_service import proponer_reasignacion, confirmar_reasignacion
 from services.asignaciones_service import crear_venta_sobrante
 from services.asignaciones_service import validar_venta_odoo
 from services.asignaciones_service import cancelar_venta
@@ -312,6 +313,108 @@ def test_recalcular_exige_ventana():
     with pytest.raises(AsignacionesError) as exc:
         recalcular_propuesta(1, None, "octubre")
     assert exc.value.code == "VENTANA_REQUERIDA"
+
+
+# ── proponer_reasignacion (meses anteriores, prioridad -> cronologico) ────────
+
+def test_reasignacion_prioridad_absoluta_cliente_llena_sus_meses_antes_del_siguiente(mocker):
+    _recalc_setup(
+        mocker, producto=_PROD_SKU1, disponible=8,
+        demanda_mensual={
+            "LC657": {"agosto": 5, "septiembre": 5},   # prioridad 1: 10 de necesidad
+            "MC677": {"agosto": 6},                     # prioridad 2, necesidad en agosto
+        },
+    )
+    props = proponer_reasignacion(1, "diciembre")
+
+    assert props[0]["origen"] == "REASIGNACION"
+    fila_lc = next(c for c in props[0]["propuesta"] if c["clave_cliente"] == "LC657")
+    # LC657 (P1) se lleva ago 5 + sep 3 (se acaba el stock) antes de tocar a MC677 (P2)
+    assert {m["mes"]: m["sugerido"] for m in fila_lc["meses"]} == {"2026-08": 5, "2026-09": 3}
+    assert fila_lc["faltante_total"] == 2
+    assert all(c["clave_cliente"] != "MC677" or c["sugerido_total"] == 0
+               for c in props[0]["propuesta"])
+    assert props[0]["sobrante_estimado"] == 0
+
+
+def test_reasignacion_excluye_may_jun_jul_y_la_ventana(mocker):
+    _recalc_setup(
+        mocker, producto=_PROD_SKU1, disponible=100,
+        demanda_mensual={"LC657": {"mayo": 5, "junio": 5, "julio": 5,
+                                   "agosto": 3, "diciembre": 9}},
+    )
+    props = proponer_reasignacion(1, "diciembre")   # reasignable = ago..nov
+
+    meses = [m["mes"] for c in props[0]["propuesta"] for m in c["meses"]]
+    assert meses == ["2026-08"]        # may/jun/jul excluidos; diciembre fuera del rango
+
+
+def test_reasignacion_netea_reservas_vigentes_de_otros_embarques(mocker):
+    import datetime as _d
+    _recalc_setup(
+        mocker, producto=_PROD_SKU1, disponible=10,
+        demanda_mensual={"LC657": {"noviembre": 10}},
+        vigentes_rows=[{"clave_cliente": "LC657", "mes_objetivo": _d.date(2026, 11, 1), "total": 4}],
+    )
+    props = proponer_reasignacion(1, "diciembre")
+
+    mes = props[0]["propuesta"][0]["meses"][0]
+    assert mes == {"mes": "2026-11", "proyectado": 10, "vigente": 4, "sugerido": 6}
+    assert props[0]["sobrante_estimado"] == 4
+
+
+def test_reasignacion_salta_productos_sin_disponible(mocker):
+    _recalc_setup(
+        mocker, producto=_PROD_SKU1, disponible=0,
+        demanda_mensual={"LC657": {"agosto": 5}},
+    )
+    assert proponer_reasignacion(1, "diciembre") == []
+
+
+def test_reasignacion_exige_ventana_desde():
+    with pytest.raises(AsignacionesError) as exc:
+        proponer_reasignacion(1, None)
+    assert exc.value.code == "VENTANA_REQUERIDA"
+
+
+# ── confirmar_reasignacion ──────────────────────────────────────────────────
+
+def test_confirmar_reasignacion_crea_fila_pendiente_y_movimiento_reasignacion(mocker):
+    cursor = MagicMock()
+    cursor.fetchone.side_effect = [
+        {"id": 10, "importacion_id": 1, "periodo": "2026-2027", "sku_norm": "SKU1"},
+        {"clave": "LC657"},   # cliente existe
+        None,                 # no hay reserva REASIGNACION previa
+    ]
+    _mock_conn(mocker, cursor)
+    mocker.patch("services.asignaciones_service._disponible_producto", return_value=10)
+
+    res = confirmar_reasignacion(
+        10, [{"clave_cliente": "LC657", "mes_objetivo": "2026-11", "cantidad": 6, "proyectado": 6}],
+        importacion_id=1,
+    )
+
+    assert res == {"producto_id": 10, "disponible_restante": 4}
+    inserts = [c for c in cursor.execute.call_args_list if "INSERT INTO importacion_asignaciones" in c.args[0]]
+    assert len(inserts) == 1
+    assert "'REASIGNACION'" in inserts[0].args[0] and "'PENDIENTE_CONFIRMACION'" in inserts[0].args[0]
+    movs = [c for c in cursor.execute.call_args_list if "INSERT INTO importacion_movimientos" in c.args[0]]
+    assert movs[0].args[1][1] == "REASIGNACION"
+    assert movs[0].args[1][2] == -6
+
+
+def test_confirmar_reasignacion_rechaza_sobre_stock(mocker):
+    cursor = MagicMock()
+    cursor.fetchone.side_effect = [
+        {"id": 10, "importacion_id": 1, "periodo": "2026-2027", "sku_norm": "SKU1"},
+        {"clave": "LC657"},
+    ]
+    _mock_conn(mocker, cursor)
+    mocker.patch("services.asignaciones_service._disponible_producto", return_value=3)
+
+    with pytest.raises(AsignacionesError) as exc:
+        confirmar_reasignacion(10, [{"clave_cliente": "LC657", "cantidad": 6}], importacion_id=1)
+    assert exc.value.code == "STOCK_INSUFICIENTE"
 
 
 def test_asignar_rechaza_lista_vacia():
