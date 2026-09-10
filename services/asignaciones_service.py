@@ -1093,6 +1093,9 @@ def cancelar_venta(venta_id: int, usuario_id: int = None, importacion_id: int = 
 
 
 def cancelar_asignacion(asignacion_id: int, usuario_id: int = None, importacion_id: int = None) -> dict:
+    """Cancela una reserva vigente (`RESERVADA` / `PENDIENTE_CONFIRMACION` /
+    `CONFIRMADA`) → `CANCELADA` + movimiento `LIBERACION` (devuelve el stock a
+    disponible). Rechaza las ya terminales (`CANCELADA`, `RECHAZADA`)."""
     conn = obtener_conexion()
     if not conn:
         raise AsignacionesError("DB_NO_DISPONIBLE", "Sin conexión a BD", 500)
@@ -1101,10 +1104,13 @@ def cancelar_asignacion(asignacion_id: int, usuario_id: int = None, importacion_
         cursor.execute("SELECT * FROM importacion_asignaciones WHERE id = %s FOR UPDATE", (asignacion_id,))
         asignacion = cursor.fetchone()
         if not asignacion:
-            raise AsignacionesError("ASIGNACION_NO_EXISTE", "La asignación no existe", 404)
+            raise AsignacionesError("ASIGNACION_NO_EXISTE", "La reserva no existe", 404)
         _verificar_pertenencia_asignacion(cursor, asignacion, importacion_id)
-        if asignacion["estado"] == "CANCELADA":
-            raise AsignacionesError("ASIGNACION_YA_CANCELADA", "La asignación ya estaba cancelada", 409)
+        if asignacion["estado"] in ("CANCELADA", "RECHAZADA"):
+            raise AsignacionesError(
+                "RESERVA_YA_CERRADA",
+                f"La reserva ya está {asignacion['estado'].lower()}", 409,
+            )
 
         cursor.execute(
             "UPDATE importacion_asignaciones SET estado = 'CANCELADA' WHERE id = %s", (asignacion_id,)
@@ -1112,9 +1118,73 @@ def cancelar_asignacion(asignacion_id: int, usuario_id: int = None, importacion_
         _registrar_movimiento(
             cursor, asignacion["importacion_producto_id"], "LIBERACION", asignacion["cantidad_asignada"],
             clave_cliente=asignacion["clave_cliente"], usuario_id=usuario_id,
+            metadata={"cancela_reserva": asignacion_id, "origen": asignacion.get("origen")},
         )
         conn.commit()
         cursor.execute("SELECT * FROM importacion_asignaciones WHERE id = %s", (asignacion_id,))
+        return cursor.fetchone()
+    except AsignacionesError:
+        conn.rollback()
+        raise
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def resolver_reserva(reserva_id: int, decision: str, usuario_id: int = None,
+                     importacion_id: int = None) -> dict:
+    """Cierra una reserva de REASIGNACION tras hablar con el cliente.
+
+    - `ACEPTADA` → `estado=CONFIRMADA`, `confirmada_at/por`. **Sin movimiento**
+      (el stock ya estaba apartado por el `REASIGNACION` previo).
+    - `RECHAZADA` → `estado=RECHAZADA` + movimiento `RECHAZO_RESERVA (+cantidad)`;
+      las unidades vuelven a disponible (sobrante). Fila histórica, no se borra.
+
+    Solo aplica a reservas en `PENDIENTE_CONFIRMACION` (si no: `RESERVA_NO_PENDIENTE`).
+    """
+    dec = (decision or "").strip().upper()
+    if dec not in ("ACEPTADA", "RECHAZADA"):
+        raise AsignacionesError("DECISION_INVALIDA", "decision debe ser 'ACEPTADA' o 'RECHAZADA'", 400)
+
+    conn = obtener_conexion()
+    if not conn:
+        raise AsignacionesError("DB_NO_DISPONIBLE", "Sin conexión a BD", 500)
+    try:
+        cursor = conn.cursor(dictionary=True)
+        cursor.execute("SELECT * FROM importacion_asignaciones WHERE id = %s FOR UPDATE", (reserva_id,))
+        reserva = cursor.fetchone()
+        if not reserva:
+            raise AsignacionesError("RESERVA_NO_EXISTE", "La reserva no existe", 404)
+        _verificar_pertenencia_asignacion(cursor, reserva, importacion_id)
+        if reserva["estado"] != "PENDIENTE_CONFIRMACION":
+            raise AsignacionesError(
+                "RESERVA_NO_PENDIENTE",
+                f"Solo se pueden resolver reservas pendientes de confirmación (está {reserva['estado'].lower()})",
+                409,
+            )
+
+        if dec == "ACEPTADA":
+            cursor.execute(
+                "UPDATE importacion_asignaciones SET estado = 'CONFIRMADA', "
+                "confirmada_at = NOW(), confirmada_por = %s WHERE id = %s",
+                (usuario_id, reserva_id),
+            )
+        else:  # RECHAZADA
+            cursor.execute(
+                "UPDATE importacion_asignaciones SET estado = 'RECHAZADA', "
+                "confirmada_at = NOW(), confirmada_por = %s WHERE id = %s",
+                (usuario_id, reserva_id),
+            )
+            _registrar_movimiento(
+                cursor, reserva["importacion_producto_id"], "RECHAZO_RESERVA",
+                reserva["cantidad_asignada"], clave_cliente=reserva["clave_cliente"],
+                usuario_id=usuario_id, metadata={"rechaza_reserva": reserva_id},
+            )
+
+        conn.commit()
+        cursor.execute("SELECT * FROM importacion_asignaciones WHERE id = %s", (reserva_id,))
         return cursor.fetchone()
     except AsignacionesError:
         conn.rollback()

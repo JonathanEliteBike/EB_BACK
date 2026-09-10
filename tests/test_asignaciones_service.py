@@ -13,6 +13,7 @@ from services.asignaciones_service import crear_venta_sobrante
 from services.asignaciones_service import validar_venta_odoo
 from services.asignaciones_service import cancelar_venta
 from services.asignaciones_service import cancelar_asignacion
+from services.asignaciones_service import resolver_reserva
 from services.asignaciones_service import obtener_detalle_producto, resumen_embarque, listar_movimientos
 from services.asignaciones_service import resumen_global, listar_productos_global
 from services.asignaciones_service import (
@@ -960,14 +961,111 @@ def test_cancelar_asignacion_ya_cancelada_no_se_puede_cancelar_dos_veces(mocker)
     cursor = MagicMock()
     cursor.fetchone.return_value = {
         "id": 1, "estado": "CANCELADA", "importacion_producto_id": 10,
-        "clave_cliente": "LC657", "cantidad_asignada": 5,
+        "clave_cliente": "LC657", "cantidad_asignada": 5, "origen": "INICIAL",
     }
     _mock_conn(mocker, cursor)
 
     with pytest.raises(AsignacionesError) as exc:
         cancelar_asignacion(1)
-    assert exc.value.code == "ASIGNACION_YA_CANCELADA"
+    assert exc.value.code == "RESERVA_YA_CERRADA"
     assert exc.value.status == 409
+
+
+def test_cancelar_asignacion_rechaza_una_reserva_ya_rechazada(mocker):
+    cursor = MagicMock()
+    cursor.fetchone.return_value = {
+        "id": 1, "estado": "RECHAZADA", "importacion_producto_id": 10,
+        "clave_cliente": "LC657", "cantidad_asignada": 5, "origen": "REASIGNACION",
+    }
+    _mock_conn(mocker, cursor)
+
+    with pytest.raises(AsignacionesError) as exc:
+        cancelar_asignacion(1)
+    assert exc.value.code == "RESERVA_YA_CERRADA"
+
+
+def test_cancelar_asignacion_acepta_pendiente_de_confirmacion(mocker):
+    cursor = MagicMock()
+    cursor.fetchone.side_effect = [
+        {"id": 1, "estado": "PENDIENTE_CONFIRMACION", "importacion_producto_id": 10,
+         "clave_cliente": "LC657", "cantidad_asignada": 6, "origen": "REASIGNACION"},
+        {"id": 1, "estado": "CANCELADA", "importacion_producto_id": 10,
+         "clave_cliente": "LC657", "cantidad_asignada": 6, "origen": "REASIGNACION"},
+    ]
+    _mock_conn(mocker, cursor)
+
+    resultado = cancelar_asignacion(1, usuario_id=7)
+
+    assert resultado["estado"] == "CANCELADA"
+    movs = [c for c in cursor.execute.call_args_list if "INSERT INTO importacion_movimientos" in c.args[0]]
+    assert movs[0].args[1][1] == "LIBERACION" and movs[0].args[1][2] == 6
+
+
+def test_resolver_reserva_aceptada_confirma_sin_movimiento(mocker):
+    cursor = MagicMock()
+    cursor.fetchone.side_effect = [
+        {"id": 5, "estado": "PENDIENTE_CONFIRMACION", "importacion_producto_id": 10,
+         "clave_cliente": "LC657", "cantidad_asignada": 6, "origen": "REASIGNACION"},
+        {"id": 5, "estado": "CONFIRMADA", "importacion_producto_id": 10,
+         "clave_cliente": "LC657", "cantidad_asignada": 6},
+    ]
+    _mock_conn(mocker, cursor)
+
+    res = resolver_reserva(5, "ACEPTADA", usuario_id=7)
+
+    assert res["estado"] == "CONFIRMADA"
+    updates = [c for c in cursor.execute.call_args_list if "SET estado = 'CONFIRMADA'" in c.args[0]]
+    assert len(updates) == 1
+    movs = [c for c in cursor.execute.call_args_list if "INSERT INTO importacion_movimientos" in c.args[0]]
+    assert movs == []                     # ACEPTADA no genera movimiento
+
+
+def test_resolver_reserva_rechazada_libera_a_sobrante(mocker):
+    cursor = MagicMock()
+    cursor.fetchone.side_effect = [
+        {"id": 5, "estado": "PENDIENTE_CONFIRMACION", "importacion_producto_id": 10,
+         "clave_cliente": "LC657", "cantidad_asignada": 6, "origen": "REASIGNACION"},
+        {"id": 5, "estado": "RECHAZADA", "importacion_producto_id": 10,
+         "clave_cliente": "LC657", "cantidad_asignada": 6},
+    ]
+    _mock_conn(mocker, cursor)
+
+    res = resolver_reserva(5, "rechazada", usuario_id=7)
+
+    assert res["estado"] == "RECHAZADA"
+    movs = [c for c in cursor.execute.call_args_list if "INSERT INTO importacion_movimientos" in c.args[0]]
+    assert movs[0].args[1][1] == "RECHAZO_RESERVA"
+    assert movs[0].args[1][2] == 6        # positivo: vuelve a disponible
+
+
+def test_resolver_reserva_solo_sobre_pendiente(mocker):
+    cursor = MagicMock()
+    cursor.fetchone.return_value = {
+        "id": 5, "estado": "RESERVADA", "importacion_producto_id": 10,
+        "clave_cliente": "LC657", "cantidad_asignada": 6, "origen": "INICIAL",
+    }
+    _mock_conn(mocker, cursor)
+
+    with pytest.raises(AsignacionesError) as exc:
+        resolver_reserva(5, "ACEPTADA")
+    assert exc.value.code == "RESERVA_NO_PENDIENTE"
+    assert exc.value.status == 409
+
+
+def test_resolver_reserva_decision_invalida():
+    with pytest.raises(AsignacionesError) as exc:
+        resolver_reserva(5, "quiza")
+    assert exc.value.code == "DECISION_INVALIDA"
+
+
+def test_resolver_reserva_no_existe(mocker):
+    cursor = MagicMock()
+    cursor.fetchone.return_value = None
+    _mock_conn(mocker, cursor)
+
+    with pytest.raises(AsignacionesError) as exc:
+        resolver_reserva(999, "ACEPTADA")
+    assert exc.value.code == "RESERVA_NO_EXISTE"
 
 
 def test_cancelar_asignacion_restaura_disponibilidad_con_movimiento_positivo(mocker):

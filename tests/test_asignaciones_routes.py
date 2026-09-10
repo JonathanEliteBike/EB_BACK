@@ -460,3 +460,72 @@ def test_confirmar_reasignacion_por_mes_end_to_end():
     assert fila["estado"] == "PENDIENTE_CONFIRMACION"
     assert fila["cantidad_asignada"] == 3
     assert ("REASIGNACION", -3) in [(m["tipo_movimiento"], m["cantidad"]) for m in movs]
+
+
+def test_resolver_reserva_rechazada_end_to_end():
+    """Flujo real: producto -> confirmar reasignación (PENDIENTE_CONFIRMACION) ->
+    resolver RECHAZADA -> la fila queda RECHAZADA y el stock vuelve a disponible."""
+    import time
+    conn = obtener_conexion()
+    if not conn:
+        import pytest
+        pytest.skip("Sin conexión a BD local para este test")
+    cur = conn.cursor(dictionary=True)
+    cur.execute("SELECT id FROM importaciones LIMIT 1")
+    emb = cur.fetchone()
+    cur.execute("SELECT clave FROM clientes LIMIT 1")
+    cli = cur.fetchone()
+    conn.close()
+    if not emb or not cli:
+        import pytest
+        pytest.skip("Se necesita 1 embarque y 1 cliente en la BD local")
+
+    client = _cliente_test()
+    headers = {"Authorization": f"Bearer {_token_valido(rol=1)}"}
+    sku = f"RESOLV-{int(time.time())}"
+
+    pid = client.post(
+        f"/importaciones/{emb['id']}/asignaciones/productos",
+        json={"sku": sku, "cantidad_embarcada": 10, "periodo": "2026-2027"},
+        headers=headers,
+    ).get_json()["data"]["id"]
+
+    client.post(
+        f"/importaciones/{emb['id']}/asignaciones/productos/{pid}/reasignar",
+        json={"reservas": [{"clave_cliente": cli["clave"], "mes_objetivo": "2026-11", "cantidad": 4}]},
+        headers=headers,
+    )
+
+    conn = obtener_conexion()
+    cur = conn.cursor(dictionary=True)
+    cur.execute("SELECT id FROM importacion_asignaciones WHERE importacion_producto_id = %s", (pid,))
+    rid = cur.fetchone()["id"]
+    conn.close()
+
+    # rechazo
+    r = client.post(
+        f"/importaciones/{emb['id']}/asignaciones/reservas/{rid}/resolver",
+        json={"decision": "RECHAZADA"}, headers=headers,
+    )
+    assert r.status_code == 200, r.get_json()
+    assert r.get_json()["data"]["estado"] == "RECHAZADA"
+
+    conn = obtener_conexion()
+    cur = conn.cursor(dictionary=True)
+    cur.execute(
+        "SELECT tipo_movimiento, cantidad FROM importacion_movimientos "
+        "WHERE importacion_producto_id = %s", (pid,),
+    )
+    movs = [(m["tipo_movimiento"], m["cantidad"]) for m in cur.fetchall()]
+    conn.close()
+    assert ("REASIGNACION", -4) in movs        # se conserva
+    assert ("RECHAZO_RESERVA", 4) in movs      # se agrega, devuelve el stock
+    assert sum(c for _, c in movs) == 10       # disponible neto = embarcado
+
+    # segundo resolver sobre la misma reserva ya cerrada -> 409
+    r2 = client.post(
+        f"/importaciones/{emb['id']}/asignaciones/reservas/{rid}/resolver",
+        json={"decision": "ACEPTADA"}, headers=headers,
+    )
+    assert r2.status_code == 409
+    assert r2.get_json()["error"]["code"] == "RESERVA_NO_PENDIENTE"

@@ -219,6 +219,21 @@ def cancelar_asignacion_ruta(importacion_id, producto_id, asignacion_id):
 
 
 @asignaciones_bp.route(
+    "/<int:importacion_id>/asignaciones/reservas/<int:reserva_id>/resolver", methods=["POST"]
+)
+@token_required
+@_requiere_rol_importaciones
+def resolver_reserva_ruta(importacion_id, reserva_id):
+    body = request.get_json(silent=True) or {}
+    payload = getattr(request, "cliente_data", {}) or {}
+    data = svc.resolver_reserva(
+        reserva_id, body.get("decision"),
+        usuario_id=payload.get("id"), importacion_id=importacion_id,
+    )
+    return jsonify({"ok": True, "data": data}), 200
+
+
+@asignaciones_bp.route(
     "/<int:importacion_id>/asignaciones/ventas/<int:venta_id>/validar-odoo", methods=["POST"]
 )
 @token_required
