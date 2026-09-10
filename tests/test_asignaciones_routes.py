@@ -309,3 +309,79 @@ def test_asignaciones_productos_global_end_to_end():
     for p in data["productos"]:
         assert p["cantidad_disponible"] > 0
         assert p["cantidad_sobrante"] == max(p["cantidad_embarcada"] - p["cantidad_asignada"], 0)
+
+
+def test_recalcular_exige_ventana_end_to_end():
+    conn = obtener_conexion()
+    if not conn:
+        import pytest
+        pytest.skip("Sin conexión a BD local para este test")
+    conn.close()
+
+    client = _cliente_test()
+    headers = {"Authorization": f"Bearer {_token_valido(rol=1)}"}
+    resp = client.post("/importaciones/1/asignaciones/recalcular", json={}, headers=headers)
+    assert resp.status_code == 400
+    assert resp.get_json()["error"]["code"] == "VENTANA_REQUERIDA"
+
+
+def test_reservar_por_mes_end_to_end():
+    """Crea producto, reserva por la ruta /reservar con mes_objetivo y verifica
+    la fila de reserva + el movimiento RESERVA + el disponible contra la BD real."""
+    import time
+    conn = obtener_conexion()
+    if not conn:
+        import pytest
+        pytest.skip("Sin conexión a BD local para este test")
+    cur = conn.cursor(dictionary=True)
+    cur.execute("SELECT id FROM importaciones LIMIT 1")
+    emb = cur.fetchone()
+    cur.execute("SELECT clave FROM clientes LIMIT 1")
+    cli = cur.fetchone()
+    conn.close()
+    if not emb or not cli:
+        import pytest
+        pytest.skip("Se necesita 1 embarque y 1 cliente en la BD local")
+
+    client = _cliente_test()
+    headers = {"Authorization": f"Bearer {_token_valido(rol=1)}"}
+    sku = f"RESV-{int(time.time())}"
+
+    r1 = client.post(
+        f"/importaciones/{emb['id']}/asignaciones/productos",
+        json={"sku": sku, "cantidad_embarcada": 10, "periodo": "2026-2027"},
+        headers=headers,
+    )
+    assert r1.status_code == 201
+    pid = r1.get_json()["data"]["id"]
+
+    r2 = client.post(
+        f"/importaciones/{emb['id']}/asignaciones/productos/{pid}/reservar",
+        json={"reservas": [
+            {"clave_cliente": cli["clave"], "mes_objetivo": "2026-10", "cantidad": 4, "proyectado": 6},
+        ]},
+        headers=headers,
+    )
+    assert r2.status_code == 200, r2.get_json()
+    assert r2.get_json()["data"]["disponible_restante"] == 6
+
+    conn = obtener_conexion()
+    cur = conn.cursor(dictionary=True)
+    cur.execute(
+        "SELECT mes_objetivo, origen, estado, cantidad_asignada, cantidad_proyectada "
+        "FROM importacion_asignaciones WHERE importacion_producto_id = %s", (pid,),
+    )
+    fila = cur.fetchone()
+    cur.execute(
+        "SELECT tipo_movimiento, cantidad FROM importacion_movimientos "
+        "WHERE importacion_producto_id = %s ORDER BY id", (pid,),
+    )
+    movs = cur.fetchall()
+    conn.close()
+
+    assert str(fila["mes_objetivo"]) == "2026-10-01"
+    assert fila["origen"] == "INICIAL"
+    assert fila["estado"] == "RESERVADA"
+    assert fila["cantidad_asignada"] == 4 and fila["cantidad_proyectada"] == 6
+    assert ("ENTRADA", 10) in [(m["tipo_movimiento"], m["cantidad"]) for m in movs]
+    assert ("RESERVA", -4) in [(m["tipo_movimiento"], m["cantidad"]) for m in movs]

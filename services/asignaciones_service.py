@@ -161,6 +161,11 @@ def _fecha_a_columna(fecha) -> str:
     return _NUM_MES[fecha.month]
 
 
+def _fecha_a_ym(fecha) -> str:
+    """date/datetime -> 'YYYY-MM' (formato de mes en la API)."""
+    return f"{fecha.year:04d}-{fecha.month:02d}"
+
+
 def _parse_mes_arg(periodo: str, valor: str):
     """Acepta 'octubre' | '2026-10' | '2026-10-01' -> date día 1 dentro del periodo."""
     import datetime as _dt
@@ -648,26 +653,26 @@ def importar_productos(importacion_id: int, periodo: str, filas: list, usuario_i
     }
 
 
-def asignar(producto_id: int, asignaciones: list, usuario_id: int = None,
+def asignar(producto_id: int, reservas: list, usuario_id: int = None,
             importacion_id: int = None) -> dict:
-    """Cada item admite un `cantidad_proyectada` opcional: la demanda proyectada para ese
-    cliente en el momento de esta decisión (típicamente lo que `recalcular_propuesta` reportó
-    para él). Es un snapshot, no un total: al insertar se guarda tal cual (0 si se omite); al
-    actualizar una asignación ya existente se SOBRESCRIBE con el nuevo valor si se envía, y se
-    deja intacta si se omite — nunca se suma."""
-    if not asignaciones:
-        raise AsignacionesError("ASIGNACION_INVALIDA", "Debes enviar al menos una asignación")
-    for item in asignaciones:
+    """Crea/incrementa reservas INICIAL para la ventana objetivo.
+
+    Cada item: `clave_cliente`, `cantidad` (entero > 0), `mes_objetivo` opcional
+    ('YYYY-MM' o nombre de mes; NULL si se omite) y `proyectado`/`cantidad_proyectada`
+    opcional (snapshot de la demanda neta del cliente para ese mes: al insertar se
+    guarda tal cual, al actualizar se sobrescribe si se envía, nunca se suma).
+    La clave de upsert es (producto, cliente, mes_objetivo, origen='INICIAL')."""
+    if not reservas:
+        raise AsignacionesError("ASIGNACION_INVALIDA", "Debes enviar al menos una reserva")
+    for item in reservas:
         cantidad = item.get("cantidad")
         if not isinstance(cantidad, int) or cantidad <= 0:
-            raise AsignacionesError("ASIGNACION_INVALIDA", "La cantidad de cada asignación debe ser un entero > 0")
+            raise AsignacionesError("ASIGNACION_INVALIDA", "La cantidad de cada reserva debe ser un entero > 0")
         if not item.get("clave_cliente"):
-            raise AsignacionesError("CLIENTE_NO_EXISTE", "Falta clave_cliente en una de las asignaciones")
-        cantidad_proyectada = item.get("cantidad_proyectada")
-        if cantidad_proyectada is not None and (not isinstance(cantidad_proyectada, int) or cantidad_proyectada < 0):
-            raise AsignacionesError(
-                "ASIGNACION_INVALIDA", "cantidad_proyectada debe ser un entero >= 0"
-            )
+            raise AsignacionesError("CLIENTE_NO_EXISTE", "Falta clave_cliente en una de las reservas")
+        proyectado = item.get("proyectado", item.get("cantidad_proyectada"))
+        if proyectado is not None and (not isinstance(proyectado, int) or proyectado < 0):
+            raise AsignacionesError("ASIGNACION_INVALIDA", "proyectado debe ser un entero >= 0")
 
     conn = obtener_conexion()
     if not conn:
@@ -675,7 +680,8 @@ def asignar(producto_id: int, asignaciones: list, usuario_id: int = None,
     try:
         cursor = conn.cursor(dictionary=True)
         cursor.execute(
-            "SELECT id, importacion_id FROM importacion_productos WHERE id = %s FOR UPDATE",
+            "SELECT id, importacion_id, periodo, sku_norm FROM importacion_productos "
+            "WHERE id = %s FOR UPDATE",
             (producto_id,),
         )
         producto = cursor.fetchone()
@@ -683,14 +689,17 @@ def asignar(producto_id: int, asignaciones: list, usuario_id: int = None,
             raise AsignacionesError("PRODUCTO_NO_EXISTE", "El producto no existe", 404)
         _verificar_pertenencia(producto, importacion_id)
 
-        for item in asignaciones:
+        # Normaliza mes_objetivo (dentro del periodo del producto) por item.
+        for item in reservas:
+            mv = item.get("mes_objetivo")
+            item["_mes_fecha"] = _parse_mes_arg(producto["periodo"], mv) if mv else None
             clave = item["clave_cliente"].strip().upper()
             cursor.execute("SELECT clave FROM clientes WHERE clave = %s", (clave,))
             if not cursor.fetchone():
                 raise AsignacionesError("CLIENTE_NO_EXISTE", f"El cliente {clave} no existe", 404)
 
         disponible = _disponible_producto(cursor, producto_id)
-        total_solicitado = sum(item["cantidad"] for item in asignaciones)
+        total_solicitado = sum(item["cantidad"] for item in reservas)
         if total_solicitado > disponible:
             raise AsignacionesError(
                 "STOCK_INSUFICIENTE",
@@ -698,25 +707,27 @@ def asignar(producto_id: int, asignaciones: list, usuario_id: int = None,
                 409,
             )
 
-        for item in asignaciones:
+        for item in reservas:
             clave = item["clave_cliente"].strip().upper()
             cantidad = item["cantidad"]
-            cantidad_proyectada = item.get("cantidad_proyectada")
+            mes_fecha = item["_mes_fecha"]
+            proyectado = item.get("proyectado", item.get("cantidad_proyectada"))
             prio_info = _PRIORIDAD_MAP.get(clave, (999, clave))
 
             cursor.execute(
                 "SELECT id FROM importacion_asignaciones "
-                "WHERE importacion_producto_id = %s AND clave_cliente = %s FOR UPDATE",
-                (producto_id, clave),
+                "WHERE importacion_producto_id = %s AND clave_cliente = %s "
+                "AND (mes_objetivo <=> %s) AND origen = 'INICIAL' FOR UPDATE",
+                (producto_id, clave, mes_fecha),
             )
             existente = cursor.fetchone()
             if existente:
-                if cantidad_proyectada is not None:
+                if proyectado is not None:
                     cursor.execute(
                         "UPDATE importacion_asignaciones SET cantidad_asignada = cantidad_asignada + %s, "
                         "cantidad_proyectada = %s, estado = 'RESERVADA', usuario_id = %s, prioridad = %s "
                         "WHERE id = %s",
-                        (cantidad, cantidad_proyectada, usuario_id, prio_info[0], existente["id"]),
+                        (cantidad, proyectado, usuario_id, prio_info[0], existente["id"]),
                     )
                 else:
                     cursor.execute(
@@ -727,14 +738,17 @@ def asignar(producto_id: int, asignaciones: list, usuario_id: int = None,
             else:
                 cursor.execute(
                     "INSERT INTO importacion_asignaciones "
-                    "(importacion_producto_id, clave_cliente, cantidad_proyectada, cantidad_asignada, "
-                    "prioridad, estado, origen, usuario_id) "
-                    "VALUES (%s, %s, %s, %s, %s, 'RESERVADA', 'INICIAL', %s)",
-                    (producto_id, clave, cantidad_proyectada if cantidad_proyectada is not None else 0,
+                    "(importacion_producto_id, clave_cliente, mes_objetivo, origen, "
+                    "cantidad_proyectada, cantidad_asignada, prioridad, estado, usuario_id) "
+                    "VALUES (%s, %s, %s, 'INICIAL', %s, %s, %s, 'RESERVADA', %s)",
+                    (producto_id, clave, mes_fecha, proyectado if proyectado is not None else 0,
                      cantidad, prio_info[0], usuario_id),
                 )
-            _registrar_movimiento(cursor, producto_id, "RESERVA", -cantidad, clave_cliente=clave,
-                                   usuario_id=usuario_id)
+            _registrar_movimiento(
+                cursor, producto_id, "RESERVA", -cantidad, clave_cliente=clave,
+                usuario_id=usuario_id,
+                metadata={"mes_objetivo": _fecha_a_ym(mes_fecha)} if mes_fecha else None,
+            )
 
         conn.commit()
         return {"producto_id": producto_id, "disponible_restante": disponible - total_solicitado}
@@ -827,7 +841,42 @@ def crear_venta_sobrante(producto_id: int, clave_cliente: str, cantidad, numero_
         conn.close()
 
 
-def recalcular_propuesta(importacion_id: int, periodo_filtro: str = None) -> list:
+def _reservas_vigentes_por_mes(cursor, sku_norm: str, periodo: str) -> dict:
+    """{(clave_cliente_MAYUS, mes_objetivo:date): unidades} de TODOS los embarques
+    del mismo SKU+periodo cuyas reservas siguen vigentes. Fuente para netear la
+    necesidad real de un cliente (spec §5.5)."""
+    cursor.execute(
+        "SELECT a.clave_cliente, a.mes_objetivo, COALESCE(SUM(a.cantidad_asignada), 0) AS total "
+        "FROM importacion_asignaciones a "
+        "JOIN importacion_productos p ON p.id = a.importacion_producto_id "
+        "WHERE p.sku_norm = %s AND p.periodo = %s AND a.mes_objetivo IS NOT NULL "
+        f"AND a.estado IN {_SQL_ESTADOS_VIGENTES} "
+        "GROUP BY a.clave_cliente, a.mes_objetivo",
+        (sku_norm, periodo),
+    )
+    return {
+        (r["clave_cliente"].strip().upper(), r["mes_objetivo"]): int(r["total"])
+        for r in cursor.fetchall()
+    }
+
+
+def _ordenar_clientes_por_prioridad(claves):
+    """Orden de prioridad absoluta: (prioridad asc, clave asc). Clientes fuera de
+    la lista centralizada caen al lugar 999."""
+    return sorted(claves, key=lambda c: (_PRIORIDAD_MAP.get(c.strip().upper(), (999, ""))[0], c))
+
+
+def recalcular_propuesta(importacion_id: int, mes_desde, mes_hasta, periodo_filtro: str = None) -> list:
+    """Propuesta de reserva inicial para la ventana [mes_desde .. mes_hasta].
+
+    Reparto CLIENTE-MAYOR (prioridad absoluta): se atiende por completo al cliente
+    de prioridad 1 —recorriendo sus meses en orden cronológico— antes de pasar al
+    siguiente. La necesidad de cada cliente/mes se netea contra las reservas
+    vigentes de todos los embarques del mismo SKU+periodo (spec §5.3).
+    """
+    if not mes_desde or not mes_hasta:
+        raise AsignacionesError("VENTANA_REQUERIDA", "Indica mes_desde y mes_hasta", 400)
+
     conn = obtener_conexion()
     if not conn:
         raise AsignacionesError("DB_NO_DISPONIBLE", "Sin conexión a BD", 500)
@@ -846,6 +895,10 @@ def recalcular_propuesta(importacion_id: int, periodo_filtro: str = None) -> lis
         productos = cursor.fetchall()
 
         disponibles = {p["id"]: _disponible_producto(cursor, p["id"]) for p in productos}
+        vigentes_por_sku = {
+            (p["sku_norm"], p["periodo"]): _reservas_vigentes_por_mes(cursor, p["sku_norm"], p["periodo"])
+            for p in productos
+        }
     finally:
         conn.close()
 
@@ -858,9 +911,13 @@ def recalcular_propuesta(importacion_id: int, periodo_filtro: str = None) -> lis
 
     propuestas = []
     for periodo, prods in por_periodo.items():
+        ventana = _meses_en_ventana(periodo, mes_desde, mes_hasta)
+        ventana_ym = {m: _fecha_a_ym(_columna_a_fecha(periodo, m)) for m in ventana}
+        ventana_fecha = {m: _columna_a_fecha(periodo, m) for m in ventana}
+
         skus_norm = [p["sku_norm"] for p in prods]
         try:
-            demanda = demanda_neta_por_cliente(periodo, skus_norm)
+            demanda = demanda_neta_por_cliente_mensual(periodo, skus_norm)
             proyecciones_disponibles = True
         except Exception:
             logging.exception("Proyecciones no disponibles al recalcular embarque %s", importacion_id)
@@ -868,34 +925,59 @@ def recalcular_propuesta(importacion_id: int, periodo_filtro: str = None) -> lis
             proyecciones_disponibles = False
 
         for p in prods:
-            demanda_sku = demanda.get(p["sku_norm"], {})
-            clientes_ordenados = sorted(
-                demanda_sku.items(),
-                key=lambda item: (_PRIORIDAD_MAP.get(item[0].strip().upper(), (999, ""))[0], item[0]),
+            neta = demanda.get(p["sku_norm"], {})           # {clave: {mes_col: neta}}
+            vigentes = vigentes_por_sku.get((p["sku_norm"], p["periodo"]), {})
+            restante = disponibles[p["id"]]
+
+            clientes = _ordenar_clientes_por_prioridad(
+                [c for c in neta if sum(neta[c].get(m, 0) for m in ventana) > 0]
             )
-            disponible = disponibles[p["id"]]
-            restante = disponible
-            sugerido = []
-            for clave, cantidad_neta in clientes_ordenados:
-                asignar_cant = min(cantidad_neta, restante)
-                if asignar_cant <= 0:
+
+            filas = []
+            for clave in clientes:
+                cu = clave.strip().upper()
+                prio, nombre = _PRIORIDAD_MAP.get(cu, (999, clave))
+                meses_fila = []
+                proyectado_total = vigente_total = sugerido_total = 0
+                for m in ventana:
+                    proy = neta[clave].get(m, 0)
+                    if proy <= 0:
+                        continue
+                    ya = vigentes.get((cu, ventana_fecha[m]), 0)
+                    faltante_real = max(0, proy - ya)
+                    alloc = min(faltante_real, restante) if restante > 0 else 0
+                    restante -= alloc
+                    proyectado_total += proy
+                    vigente_total += ya
+                    sugerido_total += alloc
+                    meses_fila.append({
+                        "mes": ventana_ym[m],
+                        "proyectado": proy,
+                        "vigente": ya,
+                        "sugerido": alloc,
+                    })
+                if not meses_fila:
                     continue
-                prio_info = _PRIORIDAD_MAP.get(clave.strip().upper(), (999, clave))
-                sugerido.append({
-                    "clave_cliente": clave,
-                    "prioridad": prio_info[0],
-                    "cantidad_proyectada": cantidad_neta,
-                    "cantidad_sugerida": asignar_cant,
+                filas.append({
+                    "clave_cliente": cu,
+                    "nombre_cliente": nombre,
+                    "prioridad": prio,
+                    "meses": meses_fila,
+                    "proyectado_total": proyectado_total,
+                    "sugerido_total": sugerido_total,
+                    "faltante_total": max(0, proyectado_total - vigente_total - sugerido_total),
                 })
-                restante -= asignar_cant
+
             propuestas.append({
                 "producto_id": p["id"],
                 "sku": p["sku"],
+                "descripcion": p.get("descripcion"),
                 "periodo": periodo,
                 "cantidad_embarcada": p["cantidad_embarcada"],
-                "disponible": disponible,
+                "disponible": disponibles[p["id"]],
                 "proyecciones_disponibles": proyecciones_disponibles,
-                "propuesta": sugerido,
+                "ventana": {"desde": ventana_ym[ventana[0]], "hasta": ventana_ym[ventana[-1]]},
+                "propuesta": filas,
                 "sobrante_estimado": restante,
             })
     return propuestas

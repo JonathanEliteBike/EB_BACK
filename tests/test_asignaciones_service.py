@@ -30,6 +30,28 @@ def _mock_conn(mocker, cursor):
     return conn
 
 
+def _recalc_setup(mocker, *, producto, demanda_mensual, disponible, vigentes_rows=None):
+    """Prepara mocks para recalcular_propuesta (un solo producto).
+
+    demanda_mensual: {clave_cliente: {mes_col: neta}}  para el sku del producto.
+    vigentes_rows:   filas de _reservas_vigentes_por_mes (list de dict clave_cliente/mes_objetivo/total).
+    """
+    cursor = MagicMock()
+    cursor.fetchone.side_effect = [{"id": 1}]                       # importacion existe
+    cursor.fetchall.side_effect = [[producto], list(vigentes_rows or [])]
+    _mock_conn(mocker, cursor)
+    mocker.patch("services.asignaciones_service._disponible_producto", return_value=disponible)
+    mocker.patch(
+        "services.asignaciones_service.demanda_neta_por_cliente_mensual",
+        return_value={producto["sku_norm"]: demanda_mensual},
+    )
+    return cursor
+
+
+_PROD_SKU1 = {"id": 10, "sku": "SKU-1", "sku_norm": "SKU1", "periodo": "2026-2027",
+              "cantidad_embarcada": 10, "importacion_id": 1, "descripcion": None}
+
+
 def test_crear_producto_rechaza_cantidad_negativa():
     with pytest.raises(AsignacionesError) as exc:
         crear_producto(1, "SKU-1", -1, "2026-2027")
@@ -203,67 +225,93 @@ def test_actualizar_producto_registra_movimiento_ajuste(mocker):
 
 
 def test_recalcular_reparte_por_prioridad_hasta_agotar_disponible(mocker):
-    cursor = MagicMock()
-    cursor.fetchone.side_effect = [{"id": 1}]  # importacion existe
-    cursor.fetchall.return_value = [
-        {"id": 10, "sku": "SKU-1", "sku_norm": "SKU1", "periodo": "2026-2027",
-         "cantidad_embarcada": 10, "importacion_id": 1},
-    ]
-    _mock_conn(mocker, cursor)
-    mocker.patch("services.asignaciones_service._disponible_producto", return_value=10)
-    mocker.patch(
-        "services.asignaciones_service.demanda_neta_por_cliente",
-        return_value={"SKU1": {"MC677": 2, "LC657": 3}},  # LC657 tiene mayor prioridad (1 vs 2)
+    _recalc_setup(
+        mocker, producto=_PROD_SKU1, disponible=10,
+        demanda_mensual={"MC677": {"octubre": 2}, "LC657": {"octubre": 3}},  # LC657 prioridad 1
     )
-
-    propuestas = recalcular_propuesta(1)
+    propuestas = recalcular_propuesta(1, "octubre", "octubre")
 
     assert len(propuestas) == 1
     orden = [c["clave_cliente"] for c in propuestas[0]["propuesta"]]
-    assert orden == ["LC657", "MC677"]  # prioridad 1 antes que prioridad 2
-    assert propuestas[0]["sobrante_estimado"] == 5  # 10 - 3 - 2
+    assert orden == ["LC657", "MC677"]                    # prioridad absoluta
+    assert propuestas[0]["sobrante_estimado"] == 5        # 10 - 3 - 2
+    assert propuestas[0]["ventana"] == {"desde": "2026-10", "hasta": "2026-10"}
+
+
+def test_recalcular_cliente_mayor_recorre_meses_cronologicos(mocker):
+    _recalc_setup(
+        mocker, producto=_PROD_SKU1, disponible=8,
+        demanda_mensual={
+            "LC657": {"octubre": 5, "noviembre": 5},   # prioridad 1: 10 de necesidad
+            "MC677": {"octubre": 5},                    # prioridad 2
+        },
+    )
+    propuestas = recalcular_propuesta(1, "octubre", "noviembre")
+
+    fila_lc = next(c for c in propuestas[0]["propuesta"] if c["clave_cliente"] == "LC657")
+    # cliente-mayor: LC657 se lleva oct 5 + nov 3 (se acaba el stock) antes de tocar a MC677
+    assert {m["mes"]: m["sugerido"] for m in fila_lc["meses"]} == {"2026-10": 5, "2026-11": 3}
+    assert fila_lc["faltante_total"] == 2
+    assert all(c["clave_cliente"] != "MC677" or c["sugerido_total"] == 0
+               for c in propuestas[0]["propuesta"])
+    assert propuestas[0]["sobrante_estimado"] == 0
+
+
+def test_recalcular_netea_reservas_vigentes_de_otros_embarques(mocker):
+    import datetime as _d
+    _recalc_setup(
+        mocker, producto=_PROD_SKU1, disponible=10,
+        demanda_mensual={"LC657": {"noviembre": 10}},
+        vigentes_rows=[
+            {"clave_cliente": "LC657", "mes_objetivo": _d.date(2026, 11, 1), "total": 4},
+        ],
+    )
+    propuestas = recalcular_propuesta(1, "noviembre", "noviembre")
+
+    fila = propuestas[0]["propuesta"][0]
+    mes = fila["meses"][0]
+    assert mes == {"mes": "2026-11", "proyectado": 10, "vigente": 4, "sugerido": 6}
+    assert fila["faltante_total"] == 0        # 10 - 4 vigente - 6 sugerido
+    assert propuestas[0]["sobrante_estimado"] == 4
 
 
 def test_recalcular_no_sobreasigna_cuando_demanda_supera_disponible(mocker):
-    cursor = MagicMock()
-    cursor.fetchone.side_effect = [{"id": 1}]
-    cursor.fetchall.return_value = [
-        {"id": 10, "sku": "SKU-1", "sku_norm": "SKU1", "periodo": "2026-2027",
-         "cantidad_embarcada": 4, "importacion_id": 1},
-    ]
-    _mock_conn(mocker, cursor)
-    mocker.patch("services.asignaciones_service._disponible_producto", return_value=4)
-    mocker.patch(
-        "services.asignaciones_service.demanda_neta_por_cliente",
-        return_value={"SKU1": {"LC657": 3, "MC677": 3}},  # demanda total 6 > disponible 4
+    _recalc_setup(
+        mocker, producto={**_PROD_SKU1, "cantidad_embarcada": 4}, disponible=4,
+        demanda_mensual={"LC657": {"octubre": 3}, "MC677": {"octubre": 3}},  # total 6 > 4
     )
+    propuestas = recalcular_propuesta(1, "octubre", "octubre")
 
-    propuestas = recalcular_propuesta(1)
-
-    total_sugerido = sum(c["cantidad_sugerida"] for c in propuestas[0]["propuesta"])
-    assert total_sugerido == 4  # nunca más que el disponible
+    total_sugerido = sum(m["sugerido"] for c in propuestas[0]["propuesta"] for m in c["meses"])
+    assert total_sugerido == 4
     assert propuestas[0]["sobrante_estimado"] == 0
 
 
 def test_recalcular_degrada_sin_romper_si_proyecciones_falla(mocker):
     cursor = MagicMock()
     cursor.fetchone.side_effect = [{"id": 1}]
-    cursor.fetchall.return_value = [
-        {"id": 10, "sku": "SKU-1", "sku_norm": "SKU1", "periodo": "2026-2027",
-         "cantidad_embarcada": 4, "importacion_id": 1},
+    cursor.fetchall.side_effect = [
+        [{**_PROD_SKU1, "cantidad_embarcada": 4}],
+        [],   # _reservas_vigentes_por_mes
     ]
     _mock_conn(mocker, cursor)
     mocker.patch("services.asignaciones_service._disponible_producto", return_value=4)
     mocker.patch(
-        "services.asignaciones_service.demanda_neta_por_cliente",
+        "services.asignaciones_service.demanda_neta_por_cliente_mensual",
         side_effect=RuntimeError("Sin conexión a BD para consultar forecast_proyecciones"),
     )
 
-    propuestas = recalcular_propuesta(1)
+    propuestas = recalcular_propuesta(1, "octubre", "octubre")
 
     assert propuestas[0]["proyecciones_disponibles"] is False
     assert propuestas[0]["propuesta"] == []
     assert propuestas[0]["sobrante_estimado"] == 4
+
+
+def test_recalcular_exige_ventana():
+    with pytest.raises(AsignacionesError) as exc:
+        recalcular_propuesta(1, None, "octubre")
+    assert exc.value.code == "VENTANA_REQUERIDA"
 
 
 def test_asignar_rechaza_lista_vacia():
@@ -326,7 +374,8 @@ def test_asignar_exitoso_inserta_asignacion_y_movimiento(mocker):
     inserts = [c for c in cursor.execute.call_args_list if "INSERT INTO importacion_asignaciones" in c.args[0]]
     assert len(inserts) == 1
     assert inserts[0].args[1][1] == "LC657"  # clave normalizada a mayúsculas
-    assert inserts[0].args[1][2] == 0  # cantidad_proyectada omitida -> default 0, no duplica cantidad
+    assert inserts[0].args[1][2] is None     # mes_objetivo omitido -> NULL
+    assert inserts[0].args[1][3] == 0        # proyectado omitido -> default 0
     movimientos = [c for c in cursor.execute.call_args_list if "INSERT INTO importacion_movimientos" in c.args[0]]
     assert movimientos[0].args[1][1] == "RESERVA"
     assert movimientos[0].args[1][2] == -3
@@ -352,7 +401,7 @@ def test_asignar_guarda_cantidad_proyectada_provista_en_insert(mocker):
 
     inserts = [c for c in cursor.execute.call_args_list if "INSERT INTO importacion_asignaciones" in c.args[0]]
     assert len(inserts) == 1
-    assert inserts[0].args[1][2] == 8  # se guarda tal cual, no igual a la cantidad asignada (3)
+    assert inserts[0].args[1][3] == 8  # proyectado se guarda tal cual, no igual a la cantidad (3)
 
 
 def test_asignar_sobrescribe_cantidad_proyectada_en_update_no_suma(mocker):
@@ -949,89 +998,54 @@ def test_listar_movimientos_devuelve_los_del_embarque(mocker):
 
 
 def test_caso_10_embarcadas_8_proyectadas_deja_2_sobrantes(mocker):
-    cursor = MagicMock()
-    cursor.fetchone.side_effect = [{"id": 1}]
-    cursor.fetchall.return_value = [
-        {"id": 10, "sku": "SKU-1", "sku_norm": "SKU1", "periodo": "2026-2027",
-         "cantidad_embarcada": 10, "importacion_id": 1},
-    ]
-    _mock_conn(mocker, cursor)
-    mocker.patch("services.asignaciones_service._disponible_producto", return_value=10)
-    mocker.patch(
-        "services.asignaciones_service.demanda_neta_por_cliente",
-        return_value={"SKU1": {"LC657": 3, "MC677": 2, "HE420": 1, "JC539": 2}},  # total 8
+    _recalc_setup(
+        mocker, producto=_PROD_SKU1, disponible=10,
+        demanda_mensual={"LC657": {"octubre": 3}, "MC677": {"octubre": 2},
+                         "HE420": {"octubre": 1}, "JC539": {"octubre": 2}},  # total 8
     )
+    propuestas = recalcular_propuesta(1, "octubre", "octubre")
 
-    propuestas = recalcular_propuesta(1)
-
-    assert sum(c["cantidad_sugerida"] for c in propuestas[0]["propuesta"]) == 8
+    total = sum(m["sugerido"] for c in propuestas[0]["propuesta"] for m in c["meses"])
+    assert total == 8
     assert propuestas[0]["sobrante_estimado"] == 2
 
 
 def test_caso_10_embarcadas_15_proyectadas_asigna_10_deja_0_sobrante_5_faltan(mocker):
-    cursor = MagicMock()
-    cursor.fetchone.side_effect = [{"id": 1}]
-    cursor.fetchall.return_value = [
-        {"id": 10, "sku": "SKU-1", "sku_norm": "SKU1", "periodo": "2026-2027",
-         "cantidad_embarcada": 10, "importacion_id": 1},
-    ]
-    _mock_conn(mocker, cursor)
-    mocker.patch("services.asignaciones_service._disponible_producto", return_value=10)
-    mocker.patch(
-        "services.asignaciones_service.demanda_neta_por_cliente",
-        return_value={"SKU1": {"LC657": 8, "MC677": 7}},  # total 15 > 10 embarcado
+    _recalc_setup(
+        mocker, producto=_PROD_SKU1, disponible=10,
+        demanda_mensual={"LC657": {"octubre": 8}, "MC677": {"octubre": 7}},  # total 15 > 10
     )
+    propuestas = recalcular_propuesta(1, "octubre", "octubre")
 
-    propuestas = recalcular_propuesta(1)
-
-    total_asignado = sum(c["cantidad_sugerida"] for c in propuestas[0]["propuesta"])
-    assert total_asignado == 10  # nunca más de lo embarcado
+    total_asignado = sum(m["sugerido"] for c in propuestas[0]["propuesta"] for m in c["meses"])
+    assert total_asignado == 10
     assert propuestas[0]["sobrante_estimado"] == 0
-    faltante = sum(c["cantidad_proyectada"] for c in propuestas[0]["propuesta"]) - total_asignado
-    assert faltante == 5  # 15 proyectado - 10 asignado
+    faltante = sum(c["faltante_total"] for c in propuestas[0]["propuesta"])
+    assert faltante == 5  # 15 proyectado - 10 sugerido
 
 
 def test_caso_10_embarcadas_10_proyectadas_deja_0_sobrante(mocker):
-    cursor = MagicMock()
-    cursor.fetchone.side_effect = [{"id": 1}]
-    cursor.fetchall.return_value = [
-        {"id": 10, "sku": "SKU-1", "sku_norm": "SKU1", "periodo": "2026-2027",
-         "cantidad_embarcada": 10, "importacion_id": 1},
-    ]
-    _mock_conn(mocker, cursor)
-    mocker.patch("services.asignaciones_service._disponible_producto", return_value=10)
-    mocker.patch(
-        "services.asignaciones_service.demanda_neta_por_cliente",
-        return_value={"SKU1": {"LC657": 10}},
+    _recalc_setup(
+        mocker, producto=_PROD_SKU1, disponible=10,
+        demanda_mensual={"LC657": {"octubre": 10}},
     )
-
-    propuestas = recalcular_propuesta(1)
-
+    propuestas = recalcular_propuesta(1, "octubre", "octubre")
     assert propuestas[0]["sobrante_estimado"] == 0
 
 
 def test_caso_cliente_sin_prioridad_usa_fallback_999_y_orden_alfabetico(mocker):
-    cursor = MagicMock()
-    cursor.fetchone.side_effect = [{"id": 1}]
-    cursor.fetchall.return_value = [
-        {"id": 10, "sku": "SKU-1", "sku_norm": "SKU1", "periodo": "2026-2027",
-         "cantidad_embarcada": 100, "importacion_id": 1},
-    ]
-    _mock_conn(mocker, cursor)
-    mocker.patch("services.asignaciones_service._disponible_producto", return_value=100)
-    mocker.patch(
-        "services.asignaciones_service.demanda_neta_por_cliente",
-        return_value={"SKU1": {
-            "ZZ999": 5,    # no está en PRIORIDAD_CLIENTES -> 999
-            "AA111": 5,    # tampoco está -> 999, pero alfabéticamente antes que ZZ999
-            "LC657": 5,    # prioridad real 1
-        }},
+    _recalc_setup(
+        mocker, producto={**_PROD_SKU1, "cantidad_embarcada": 100}, disponible=100,
+        demanda_mensual={
+            "ZZ999": {"octubre": 5},   # fuera de PRIORIDAD_CLIENTES -> 999
+            "AA111": {"octubre": 5},   # fuera -> 999, alfabéticamente antes que ZZ999
+            "LC657": {"octubre": 5},   # prioridad real 1
+        },
     )
-
-    propuestas = recalcular_propuesta(1)
+    propuestas = recalcular_propuesta(1, "octubre", "octubre")
 
     orden = [c["clave_cliente"] for c in propuestas[0]["propuesta"]]
-    assert orden == ["LC657", "AA111", "ZZ999"]  # prioridad real primero, luego alfabético entre los 999
+    assert orden == ["LC657", "AA111", "ZZ999"]
     assert next(c["prioridad"] for c in propuestas[0]["propuesta"] if c["clave_cliente"] == "AA111") == 999
 
 
