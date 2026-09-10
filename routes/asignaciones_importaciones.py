@@ -81,6 +81,30 @@ def crear_producto_ruta(importacion_id):
     return jsonify({"ok": True, "data": data}), 201
 
 
+@asignaciones_bp.route("/<int:importacion_id>/asignaciones/productos/importar", methods=["POST"])
+@token_required
+@_requiere_rol_importaciones
+def importar_productos_ruta(importacion_id):
+    payload = getattr(request, "cliente_data", {}) or {}
+    f = request.files.get("file")
+    if not f or not (f.filename or "").lower().endswith((".xlsx", ".xls")):
+        return jsonify({
+            "ok": False,
+            "error": {"code": "ARCHIVO_INVALIDO", "message": "Se requiere un archivo .xlsx o .xls en el campo 'file'"},
+        }), 400
+    periodo = (request.form.get("periodo") or "").strip()
+    parseado = svc.parsear_excel_productos(f.read())
+    resultado = svc.importar_productos(
+        importacion_id=importacion_id,
+        periodo=periodo,
+        filas=parseado["filas"],
+        usuario_id=payload.get("id"),
+    )
+    # Errores de parseo (cantidad no numérica, etc.) se suman a los de negocio.
+    resultado["errores"] = parseado["errores"] + resultado["errores"]
+    return jsonify({"ok": True, "data": resultado}), 200
+
+
 @asignaciones_bp.route("/<int:importacion_id>/asignaciones/productos/<int:producto_id>", methods=["PUT"])
 @token_required
 @_requiere_rol_importaciones

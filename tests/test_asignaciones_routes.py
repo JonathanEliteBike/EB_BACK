@@ -175,3 +175,72 @@ def test_asignar_concurrente_nunca_deja_disponible_negativo():
         assert False, "Ambas asignaciones se completaron pese a que la demanda (3) excede el disponible (2)"
     assert len(errores) >= 1  # al menos una de las dos debe haber sido rechazada por STOCK_INSUFICIENTE
     assert all(e.code == "STOCK_INSUFICIENTE" for e in errores)
+
+
+def test_importar_productos_sin_archivo_devuelve_400():
+    client = _cliente_test()
+    token = _token_valido(rol=1)
+    resp = client.post(
+        "/importaciones/1/asignaciones/productos/importar",
+        headers={"Authorization": f"Bearer {token}"},
+        data={"periodo": "2026-2027"},
+    )
+    assert resp.status_code == 400
+    assert resp.get_json()["error"]["code"] == "ARCHIVO_INVALIDO"
+
+
+def test_importar_productos_xlsx_real_end_to_end():
+    """Sube un .xlsx armado en memoria contra la BD local y verifica el resumen."""
+    import io
+    import time
+    import openpyxl
+
+    conn = obtener_conexion()
+    if not conn:
+        import pytest
+        pytest.skip("Sin conexión a BD local para este test")
+    cur = conn.cursor(dictionary=True)
+    cur.execute("SELECT id FROM importaciones LIMIT 1")
+    emb = cur.fetchone()
+    conn.close()
+    if not emb:
+        import pytest
+        pytest.skip("No hay embarques en la BD local")
+
+    sufijo = int(time.time())
+
+    def _archivo():
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.append(["SKU", "CANTIDAD", "DESCRIPCION"])
+        ws.append([f"IMPORT-{sufijo}-1", 5, "prueba import 1"])
+        ws.append([f"IMPORT-{sufijo}-2", 8, None])
+        b = io.BytesIO()
+        wb.save(b)
+        b.seek(0)
+        return b
+
+    client = _cliente_test()
+    token = _token_valido(rol=1)
+    resp = client.post(
+        f"/importaciones/{emb['id']}/asignaciones/productos/importar",
+        headers={"Authorization": f"Bearer {token}"},
+        data={"periodo": "2026-2027", "file": (_archivo(), "carga.xlsx")},
+        content_type="multipart/form-data",
+    )
+    assert resp.status_code == 200
+    data = resp.get_json()["data"]
+    assert data["insertados"] == 2
+    assert data["actualizados"] == 0
+    assert data["errores"] == []
+
+    # Re-subir el mismo archivo: ahora los 2 SKUs existen -> se actualizan
+    resp2 = client.post(
+        f"/importaciones/{emb['id']}/asignaciones/productos/importar",
+        headers={"Authorization": f"Bearer {token}"},
+        data={"periodo": "2026-2027", "file": (_archivo(), "carga.xlsx")},
+        content_type="multipart/form-data",
+    )
+    data2 = resp2.get_json()["data"]
+    assert data2["insertados"] == 0
+    assert data2["actualizados"] == 2

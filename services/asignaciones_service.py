@@ -317,6 +317,148 @@ def actualizar_producto(producto_id: int, cantidad_embarcada=None, descripcion: 
         conn.close()
 
 
+_COLS_SKU = ("SKU",)
+_COLS_CANT = ("CANTIDAD", "CANT", "QTY", "UNIDADES", "PIEZAS", "CANTIDAD EMBARCADA",
+              "CANTIDAD ENTRANTE", "ENTRANTE")
+_COLS_DESC = ("DESCRIPCION", "DESCRIPCIÓN", "NOMBRE", "PRODUCTO")
+
+
+def parsear_excel_productos(file_bytes: bytes) -> dict:
+    """Parsea un .xlsx/.xls de productos de embarque. Mismo enfoque que
+    `subir_inventario_megamo`: busca la fila de encabezados en las primeras
+    filas y mapea columnas SKU / CANTIDAD / DESCRIPCION.
+
+    Devuelve {"filas": [{"fila", "sku", "cantidad", "descripcion"}], "errores": [str]}.
+    Lanza AsignacionesError(400) si el archivo no se puede leer o no tiene columna SKU.
+    """
+    import io
+    import openpyxl
+
+    try:
+        wb = openpyxl.load_workbook(io.BytesIO(file_bytes), data_only=True)
+    except Exception as e:
+        raise AsignacionesError("EXCEL_INVALIDO", f"No se pudo leer el archivo: {e}", 400)
+
+    ws = wb.active
+    if ws is None or ws.max_row < 1:
+        raise AsignacionesError("EXCEL_VACIO", "El archivo no tiene datos", 400)
+
+    header_row = None
+    col_sku = col_cant = None
+    col_desc = None
+    for ri in range(1, min(ws.max_row, 6) + 1):
+        row_upper = [str(ws.cell(ri, ci).value).strip().upper() if ws.cell(ri, ci).value is not None else ""
+                     for ci in range(1, ws.max_column + 1)]
+        if any(k in row_upper for k in _COLS_SKU):
+            header_row = ri
+            col_sku = next(row_upper.index(k) + 1 for k in _COLS_SKU if k in row_upper)
+            for k in _COLS_CANT:
+                if k in row_upper:
+                    col_cant = row_upper.index(k) + 1
+                    break
+            for k in _COLS_DESC:
+                if k in row_upper:
+                    col_desc = row_upper.index(k) + 1
+                    break
+            break
+
+    if header_row is None or col_cant is None:
+        raise AsignacionesError(
+            "EXCEL_SIN_COLUMNAS",
+            "El archivo debe tener una fila de encabezados con al menos las columnas 'SKU' y 'CANTIDAD'",
+            400,
+        )
+
+    filas = []
+    errores = []
+    for ri in range(header_row + 1, ws.max_row + 1):
+        sku_val = ws.cell(ri, col_sku).value
+        if sku_val is None or not str(sku_val).strip():
+            continue
+        sku = str(sku_val).strip()
+        cant_val = ws.cell(ri, col_cant).value
+        try:
+            cantidad = int(float(str(cant_val).replace(",", "").strip()))
+        except (TypeError, ValueError):
+            errores.append(f"Fila {ri}: cantidad inválida para SKU {sku} ({cant_val!r})")
+            continue
+        if cantidad <= 0:
+            errores.append(f"Fila {ri}: cantidad debe ser mayor a 0 para SKU {sku} ({cantidad})")
+            continue
+        desc_val = ws.cell(ri, col_desc).value if col_desc else None
+        descripcion = str(desc_val).strip()[:255] if desc_val is not None and str(desc_val).strip() else None
+        filas.append({"fila": ri, "sku": sku, "cantidad": cantidad, "descripcion": descripcion})
+
+    return {"filas": filas, "errores": errores}
+
+
+def importar_productos(importacion_id: int, periodo: str, filas: list, usuario_id: int = None) -> dict:
+    """Alta/actualización masiva de productos del embarque desde filas ya parseadas.
+
+    Reutiliza `crear_producto` (INSERT + movimiento ENTRADA) para SKUs nuevos y
+    `actualizar_producto` (UPDATE + movimiento AJUSTE) para los que ya existen en el
+    embarque. Cada fila que falle (p. ej. bajar la cantidad por debajo de lo ya
+    asignado) se salta y se reporta; el resto se procesa.
+    """
+    periodo = (periodo or "").strip()
+    if not periodo:
+        raise AsignacionesError("PERIODO_REQUERIDO", "El periodo es obligatorio", 400)
+
+    conn = obtener_conexion()
+    if not conn:
+        raise AsignacionesError("DB_NO_DISPONIBLE", "Sin conexión a BD", 500)
+    try:
+        cur = conn.cursor(dictionary=True)
+        cur.execute("SELECT id FROM importaciones WHERE id = %s", (importacion_id,))
+        if not cur.fetchone():
+            raise AsignacionesError("IMPORTACION_NO_EXISTE", "El embarque no existe", 404)
+        cur.execute(
+            "SELECT id, sku_norm FROM importacion_productos WHERE importacion_id = %s",
+            (importacion_id,),
+        )
+        existentes = {r["sku_norm"]: r["id"] for r in cur.fetchall()}
+    finally:
+        conn.close()
+
+    insertados = 0
+    actualizados = 0
+    errores = []
+    for f in filas:
+        sku = (f.get("sku") or "").strip()
+        if not sku:
+            continue
+        sku_norm = _norm_sku(sku)
+        cantidad = f.get("cantidad")
+        descripcion = f.get("descripcion") or None
+        num_fila = f.get("fila")
+        try:
+            if sku_norm in existentes:
+                actualizar_producto(
+                    existentes[sku_norm],
+                    cantidad_embarcada=cantidad,
+                    descripcion=descripcion,
+                    usuario_id=usuario_id,
+                    importacion_id=importacion_id,
+                )
+                actualizados += 1
+            else:
+                nuevo = crear_producto(
+                    importacion_id, sku, cantidad, periodo,
+                    descripcion=descripcion, usuario_id=usuario_id,
+                )
+                existentes[sku_norm] = nuevo["id"]
+                insertados += 1
+        except AsignacionesError as e:
+            errores.append({"fila": num_fila, "sku": sku, "motivo": e.message})
+
+    return {
+        "insertados": insertados,
+        "actualizados": actualizados,
+        "total_filas": len(filas),
+        "errores": errores,
+    }
+
+
 def asignar(producto_id: int, asignaciones: list, usuario_id: int = None,
             importacion_id: int = None) -> dict:
     """Cada item admite un `cantidad_proyectada` opcional: la demanda proyectada para ese

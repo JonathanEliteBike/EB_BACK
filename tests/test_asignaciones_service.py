@@ -1136,3 +1136,140 @@ def test_validar_odoo_de_venta_de_otro_embarque_se_ve_como_inexistente(mocker):
     assert exc.value.status == 404
     assert not odoo.called  # ni siquiera se consulta Odoo
     assert [c for c in cursor.execute.call_args_list if c.args[0].startswith("UPDATE")] == []
+
+
+# ---------------------------------------------------------------------------
+# Importación desde Excel
+# ---------------------------------------------------------------------------
+import io as _io
+
+from services.asignaciones_service import parsear_excel_productos, importar_productos
+
+
+def _xlsx(rows):
+    import openpyxl
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    for r in rows:
+        ws.append(r)
+    buf = _io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+
+
+def test_parsear_excel_detecta_headers_y_filas_validas():
+    data = _xlsx([
+        ["SKU", "CANTIDAD", "DESCRIPCION"],
+        ["427102-0001004", 10, "Scott R24"],
+        ["427102-0001005", "20", None],
+        [None, 5, "sin sku, se ignora"],
+    ])
+    res = parsear_excel_productos(data)
+    assert [f["sku"] for f in res["filas"]] == ["427102-0001004", "427102-0001005"]
+    assert res["filas"][0] == {"fila": 2, "sku": "427102-0001004", "cantidad": 10, "descripcion": "Scott R24"}
+    assert res["filas"][1]["cantidad"] == 20 and res["filas"][1]["descripcion"] is None
+    assert res["errores"] == []
+
+
+def test_parsear_excel_reporta_cantidad_invalida_sin_abortar():
+    data = _xlsx([
+        ["SKU", "CANT"],
+        ["A-1", "diez"],
+        ["A-2", 0],
+        ["A-3", 7],
+    ])
+    res = parsear_excel_productos(data)
+    assert [f["sku"] for f in res["filas"]] == ["A-3"]
+    assert len(res["errores"]) == 2
+    assert "A-1" in res["errores"][0] and "A-2" in res["errores"][1]
+
+
+def test_parsear_excel_sin_columna_sku_es_400():
+    data = _xlsx([["CODIGO", "CANTIDAD"], ["A-1", 5]])
+    with pytest.raises(AsignacionesError) as exc:
+        parsear_excel_productos(data)
+    assert exc.value.code == "EXCEL_SIN_COLUMNAS"
+    assert exc.value.status == 400
+
+
+def test_parsear_excel_archivo_corrupto_es_400():
+    with pytest.raises(AsignacionesError) as exc:
+        parsear_excel_productos(b"esto no es un xlsx")
+    assert exc.value.code == "EXCEL_INVALIDO"
+    assert exc.value.status == 400
+
+
+def test_importar_productos_rechaza_periodo_vacio():
+    with pytest.raises(AsignacionesError) as exc:
+        importar_productos(1, "  ", [{"fila": 2, "sku": "A", "cantidad": 5}])
+    assert exc.value.code == "PERIODO_REQUERIDO"
+
+
+def test_importar_productos_importacion_no_existe(mocker):
+    cursor = MagicMock()
+    cursor.fetchone.return_value = None
+    _mock_conn(mocker, cursor)
+    with pytest.raises(AsignacionesError) as exc:
+        importar_productos(999, "2026-2027", [{"fila": 2, "sku": "A", "cantidad": 5}])
+    assert exc.value.code == "IMPORTACION_NO_EXISTE"
+
+
+def test_importar_productos_inserta_nuevos_y_actualiza_existentes(mocker):
+    cursor = MagicMock()
+    cursor.fetchone.return_value = {"id": 1}  # el embarque existe
+    cursor.fetchall.return_value = [{"id": 10, "sku_norm": "AA1"}]  # AA-1 ya existe
+    _mock_conn(mocker, cursor)
+    crear = mocker.patch("services.asignaciones_service.crear_producto",
+                         return_value={"id": 99})
+    actualizar = mocker.patch("services.asignaciones_service.actualizar_producto")
+
+    res = importar_productos(1, "2026-2027", [
+        {"fila": 2, "sku": "AA-1", "cantidad": 12, "descripcion": "existente"},
+        {"fila": 3, "sku": "BB-2", "cantidad": 8, "descripcion": None},
+    ], usuario_id=7)
+
+    assert res["insertados"] == 1 and res["actualizados"] == 1 and res["total_filas"] == 2
+    assert res["errores"] == []
+    actualizar.assert_called_once()
+    assert actualizar.call_args.kwargs["cantidad_embarcada"] == 12
+    assert actualizar.call_args.kwargs["importacion_id"] == 1
+    crear.assert_called_once()
+    assert crear.call_args.args[1] == "BB-2" and crear.call_args.args[2] == 8
+
+
+def test_importar_productos_fila_que_falla_va_a_errores_y_el_resto_se_procesa(mocker):
+    cursor = MagicMock()
+    cursor.fetchone.return_value = {"id": 1}
+    cursor.fetchall.return_value = [{"id": 10, "sku_norm": "AA1"}]
+    _mock_conn(mocker, cursor)
+    mocker.patch("services.asignaciones_service.actualizar_producto",
+                 side_effect=AsignacionesError("AJUSTE_INVALIDO", "No puedes bajar la cantidad", 400))
+    crear = mocker.patch("services.asignaciones_service.crear_producto", return_value={"id": 99})
+
+    res = importar_productos(1, "2026-2027", [
+        {"fila": 2, "sku": "AA-1", "cantidad": 1},   # falla: por debajo de lo asignado
+        {"fila": 3, "sku": "CC-3", "cantidad": 5},   # ok
+    ])
+
+    assert res["insertados"] == 1 and res["actualizados"] == 0
+    assert res["errores"] == [{"fila": 2, "sku": "AA-1", "motivo": "No puedes bajar la cantidad"}]
+    crear.assert_called_once()
+
+
+def test_importar_productos_mismo_sku_repetido_en_la_hoja_se_actualiza_la_segunda_vez(mocker):
+    cursor = MagicMock()
+    cursor.fetchone.return_value = {"id": 1}
+    cursor.fetchall.return_value = []  # nada preexistente
+    _mock_conn(mocker, cursor)
+    crear = mocker.patch("services.asignaciones_service.crear_producto", return_value={"id": 50})
+    actualizar = mocker.patch("services.asignaciones_service.actualizar_producto")
+
+    res = importar_productos(1, "2026-2027", [
+        {"fila": 2, "sku": "DD-4", "cantidad": 3},
+        {"fila": 5, "sku": "DD 4", "cantidad": 9},  # mismo sku_norm que la fila 2
+    ])
+
+    assert res["insertados"] == 1 and res["actualizados"] == 1
+    crear.assert_called_once()
+    actualizar.assert_called_once_with(50, cantidad_embarcada=9, descripcion=None,
+                                       usuario_id=None, importacion_id=1)
