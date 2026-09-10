@@ -617,11 +617,17 @@ def obtener(id_imp):
 @importaciones_bp.route("/dashboard", methods=["GET"])
 def dashboard():
     import unicodedata as _ud
-    _ORIGEN_CANON = {"ESPANA": "ESPAÑA", "BELGICA": "BÉLGICA"}
+    _ORIGEN_CANON = {
+        "ESPANA": "ESPAÑA", "ESPAA": "ESPAÑA",
+        "BELGICA": "BÉLGICA", "BLGICA": "BÉLGICA",
+    }
     def _norm_origen(s):
         if not s:
             return ""
         key = "".join(c for c in _ud.normalize("NFD", s.strip().upper()) if _ud.category(c) != "Mn")
+        # Datos historicos con bytes mal codificados guardaron el acento como
+        # U+FFFD (caracter de reemplazo); se descarta para colapsar las variantes.
+        key = key.replace("�", "").strip()
         return _ORIGEN_CANON.get(key, key)
 
     via    = request.args.get("via",    "").strip()
