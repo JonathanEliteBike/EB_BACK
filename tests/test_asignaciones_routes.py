@@ -581,3 +581,195 @@ def test_detalle_y_kpis_de_reserva_end_to_end():
     assert {"reservado_inicial", "reservado_reasignacion_pendiente", "reservado_confirmado",
             "unidades_reservadas"} <= set(k)
     assert k["reservado_inicial"] >= 4
+
+
+def test_ciclo_completo_reservas_dos_embarques_mismo_sku_end_to_end(monkeypatch):
+    """Reproduce los ejemplos §9 del spec contra la BD real:
+    recalcular (ventana) -> reservar -> (2o embarque) recalcular -> reservar ->
+    reasignar -> confirmar_reasignacion -> resolver (ACEPTADA y RECHAZADA)."""
+    import time
+    from services.proyecciones_service import _norm_sku
+
+    conn = obtener_conexion()
+    if not conn:
+        import pytest
+        pytest.skip("Sin conexion a BD local para este test")
+    cur = conn.cursor(dictionary=True)
+    cur.execute("SELECT id FROM importaciones WHERE estado <> 'eliminado' ORDER BY id LIMIT 2")
+    embs = cur.fetchall()
+    if len(embs) < 2:
+        conn.close()
+        import pytest
+        pytest.skip("Se necesitan 2 embarques en la BD local")
+    imp1, imp2 = embs[0]["id"], embs[1]["id"]
+
+    sku = f"CICLO-{int(time.time())}"
+    sn = _norm_sku(sku)
+    periodo = "2026-2027"
+    A, B, C, E = "LC657", "MC677", "MC679", "GC411"   # prioridades 1,2,3,4
+
+    def _fp(clave, oct_, nov_, dic_):
+        cur.execute(
+            "INSERT INTO forecast_proyecciones (clave_cliente, periodo, sku, octubre, noviembre, diciembre) "
+            "VALUES (%s,%s,%s,%s,%s,%s)", (clave, periodo, sku, oct_, nov_, dic_),
+        )
+    _fp(A, 5, 4, 3); _fp(B, 6, 0, 2); _fp(C, 0, 10, 0); _fp(E, 2, 2, 6)
+    conn.commit()
+    conn.close()
+
+    monkeypatch.setattr(
+        "services.proyecciones_service._get_ordenes_my27",
+        lambda _p: {A: {sn: 4}, E: {sn: 8}},
+    )
+
+    client = _cliente_test()
+    headers = {"Authorization": f"Bearer {_token_valido(rol=1)}"}
+    pid1 = pid2 = None
+    try:
+        # 9.1  IMP-1 embarcada=20, ventana oct-dic
+        pid1 = client.post(
+            f"/importaciones/{imp1}/asignaciones/productos",
+            json={"sku": sku, "cantidad_embarcada": 20, "periodo": periodo}, headers=headers,
+        ).get_json()["data"]["id"]
+
+        prop = client.post(
+            f"/importaciones/{imp1}/asignaciones/recalcular",
+            json={"mes_desde": "octubre", "mes_hasta": "diciembre"}, headers=headers,
+        ).get_json()["data"]
+        fila = next(p for p in prop if p["producto_id"] == pid1)
+        suger = {c["clave_cliente"]: {m["mes"]: m["sugerido"] for m in c["meses"]}
+                 for c in fila["propuesta"]}
+        assert suger[A] == {"2026-10": 1, "2026-11": 4, "2026-12": 3}   # Odoo tapa oct 5->1
+        assert suger[B] == {"2026-10": 6, "2026-12": 2}
+        assert suger[C] == {"2026-11": 4}                               # 10 proyectado, 4 caben
+        assert fila["sobrante_estimado"] == 0
+        c_row = next(c for c in fila["propuesta"] if c["clave_cliente"] == C)
+        assert c_row["faltante_total"] == 6
+
+        reservas = [
+            {"clave_cliente": c["clave_cliente"], "mes_objetivo": m["mes"],
+             "cantidad": m["sugerido"], "proyectado": m["proyectado"]}
+            for c in fila["propuesta"] for m in c["meses"] if m["sugerido"] > 0
+        ]
+        r = client.post(
+            f"/importaciones/{imp1}/asignaciones/productos/{pid1}/reservar",
+            json={"reservas": reservas}, headers=headers,
+        )
+        assert r.status_code == 200 and r.get_json()["data"]["disponible_restante"] == 0
+
+        k1 = client.get(f"/importaciones/{imp1}/asignaciones", headers=headers).get_json()["data"]["kpis"]
+        assert k1["unidades_reservadas"] >= 20 and k1["reservado_inicial"] >= 20
+
+        # 9.3  IMP-2 embarcada=15, ventana dic-abr
+        pid2 = client.post(
+            f"/importaciones/{imp2}/asignaciones/productos",
+            json={"sku": sku, "cantidad_embarcada": 15, "periodo": periodo}, headers=headers,
+        ).get_json()["data"]["id"]
+
+        prop2 = client.post(
+            f"/importaciones/{imp2}/asignaciones/recalcular",
+            json={"mes_desde": "diciembre", "mes_hasta": "abril"}, headers=headers,
+        ).get_json()["data"]
+        fila2 = next(p for p in prop2 if p["producto_id"] == pid2)
+        suger2 = {c["clave_cliente"]: {m["mes"]: m["sugerido"] for m in c["meses"]}
+                  for c in fila2["propuesta"]}
+        falt2 = {c["clave_cliente"]: c["faltante_total"] for c in fila2["propuesta"]}
+        assert suger2.get(E) == {"2026-12": 2}
+        # A y B ya estaban cubiertos por IMP-1: aparecen con sugerido 0 y faltante 0
+        assert suger2.get(A) == {"2026-12": 0} and falt2.get(A) == 0
+        assert suger2.get(B) == {"2026-12": 0} and falt2.get(B) == 0
+        assert fila2["sobrante_estimado"] == 13
+
+        client.post(
+            f"/importaciones/{imp2}/asignaciones/productos/{pid2}/reservar",
+            json={"reservas": [{"clave_cliente": E, "mes_objetivo": "2026-12", "cantidad": 2, "proyectado": 2}]},
+            headers=headers,
+        )
+
+        # reasignar sobrante de IMP-2 a meses anteriores a diciembre
+        reas = client.post(
+            f"/importaciones/{imp2}/asignaciones/reasignar",
+            json={"ventana_desde": "diciembre"}, headers=headers,
+        ).get_json()["data"]
+        fila_r = next(p for p in reas if p["producto_id"] == pid2)
+        assert fila_r["origen"] == "REASIGNACION"
+        # solo lo efectivamente sugerido: MC679 en noviembre = faltante real 10 - 4(IMP-1)
+        suger_r = {
+            c["clave_cliente"]: {m["mes"]: m["sugerido"] for m in c["meses"] if m["sugerido"] > 0}
+            for c in fila_r["propuesta"] if c["sugerido_total"] > 0
+        }
+        assert suger_r == {C: {"2026-11": 6}}
+        assert fila_r["sobrante_estimado"] == 7
+
+        cr = client.post(
+            f"/importaciones/{imp2}/asignaciones/productos/{pid2}/reasignar",
+            json={"reservas": [{"clave_cliente": C, "mes_objetivo": "2026-11", "cantidad": 6, "proyectado": 6}]},
+            headers=headers,
+        )
+        assert cr.status_code == 200 and cr.get_json()["data"]["disponible_restante"] == 7
+
+        conn = obtener_conexion(); cur = conn.cursor(dictionary=True)
+        cur.execute(
+            "SELECT id FROM importacion_asignaciones WHERE importacion_producto_id = %s AND origen = 'REASIGNACION'",
+            (pid2,),
+        )
+        rid = cur.fetchone()["id"]
+        conn.close()
+
+        acc = client.post(
+            f"/importaciones/{imp2}/asignaciones/reservas/{rid}/resolver",
+            json={"decision": "ACEPTADA"}, headers=headers,
+        )
+        assert acc.status_code == 200 and acc.get_json()["data"]["estado"] == "CONFIRMADA"
+
+        conn = obtener_conexion(); cur = conn.cursor(dictionary=True)
+        cur.execute(
+            "SELECT tipo_movimiento, cantidad FROM importacion_movimientos WHERE importacion_producto_id = %s",
+            (pid2,),
+        )
+        movs = [(m["tipo_movimiento"], m["cantidad"]) for m in cur.fetchall()]
+        conn.close()
+        assert movs.count(("REASIGNACION", -6)) == 1
+        assert ("RECHAZO_RESERVA", 6) not in movs           # ACEPTADA no genera movimiento
+        assert sum(c for _, c in movs) == 15 - 2 - 6         # disponible IMP-2 = 7
+
+        k2 = client.get(f"/importaciones/{imp2}/asignaciones", headers=headers).get_json()["data"]["kpis"]
+        assert k2["reservado_confirmado"] >= 6
+
+        # RECHAZO en frio sobre una reasignacion nueva
+        client.post(
+            f"/importaciones/{imp2}/asignaciones/productos/{pid2}/reasignar",
+            json={"reservas": [{"clave_cliente": C, "mes_objetivo": "2026-10", "cantidad": 1}]},
+            headers=headers,
+        )
+        conn = obtener_conexion(); cur = conn.cursor(dictionary=True)
+        cur.execute(
+            "SELECT id FROM importacion_asignaciones WHERE importacion_producto_id = %s "
+            "AND origen = 'REASIGNACION' AND estado = 'PENDIENTE_CONFIRMACION'", (pid2,),
+        )
+        rid2 = cur.fetchone()["id"]
+        conn.close()
+        rej = client.post(
+            f"/importaciones/{imp2}/asignaciones/reservas/{rid2}/resolver",
+            json={"decision": "RECHAZADA"}, headers=headers,
+        )
+        assert rej.status_code == 200 and rej.get_json()["data"]["estado"] == "RECHAZADA"
+
+        conn = obtener_conexion(); cur = conn.cursor(dictionary=True)
+        cur.execute(
+            "SELECT tipo_movimiento, cantidad FROM importacion_movimientos WHERE importacion_producto_id = %s",
+            (pid2,),
+        )
+        movs2 = [(m["tipo_movimiento"], m["cantidad"]) for m in cur.fetchall()]
+        conn.close()
+        assert ("REASIGNACION", -1) in movs2 and ("RECHAZO_RESERVA", 1) in movs2
+        assert sum(c for _, c in movs2) == 7          # el rechazo devolvio la unidad
+    finally:
+        conn = obtener_conexion(); cur = conn.cursor()
+        for pid in (pid1, pid2):
+            if pid:
+                cur.execute("DELETE FROM importacion_movimientos WHERE importacion_producto_id = %s", (pid,))
+                cur.execute("DELETE FROM importacion_asignaciones WHERE importacion_producto_id = %s", (pid,))
+                cur.execute("DELETE FROM importacion_productos WHERE id = %s", (pid,))
+        cur.execute("DELETE FROM forecast_proyecciones WHERE sku = %s", (sku,))
+        conn.commit(); conn.close()
