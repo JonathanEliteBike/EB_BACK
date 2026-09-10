@@ -244,3 +244,68 @@ def test_importar_productos_xlsx_real_end_to_end():
     data2 = resp2.get_json()["data"]
     assert data2["insertados"] == 0
     assert data2["actualizados"] == 2
+
+
+# ── Vistas consolidadas ───────────────────────────────────────────────────────
+
+def test_asignaciones_embarques_sin_token_401():
+    client = _cliente_test()
+    resp = client.get("/importaciones/asignaciones/embarques")
+    assert resp.status_code == 401
+
+
+def test_asignaciones_embarques_rol_no_permitido_403():
+    client = _cliente_test()
+    token = _token_valido(rol=2)
+    resp = client.get(
+        "/importaciones/asignaciones/embarques",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert resp.status_code == 403
+    assert resp.get_json()["error"]["code"] == "NO_AUTORIZADO"
+
+
+def test_asignaciones_embarques_end_to_end():
+    conn = obtener_conexion()
+    if not conn:
+        import pytest
+        pytest.skip("Sin conexión a BD local para este test")
+    conn.close()
+
+    client = _cliente_test()
+    headers = {"Authorization": f"Bearer {_token_valido(rol=1)}"}
+    resp = client.get("/importaciones/asignaciones/embarques", headers=headers)
+
+    assert resp.status_code == 200
+    body = resp.get_json()
+    assert body["ok"] is True
+    data = body["data"]
+    assert set(data.keys()) == {"embarques", "totales"}
+    assert isinstance(data["embarques"], list)
+    assert {"n_embarques", "embarcadas", "asignadas", "sobrantes", "vendidas", "disponibles"} <= set(data["totales"])
+    if data["embarques"]:
+        e = data["embarques"][0]
+        assert {"id", "referencia", "nombre", "estado", "n_productos", "kpis"} <= set(e)
+        assert set(e["kpis"]) == {"embarcadas", "asignadas", "sobrantes", "vendidas", "disponibles"}
+
+
+def test_asignaciones_productos_global_end_to_end():
+    conn = obtener_conexion()
+    if not conn:
+        import pytest
+        pytest.skip("Sin conexión a BD local para este test")
+    conn.close()
+
+    client = _cliente_test()
+    headers = {"Authorization": f"Bearer {_token_valido(rol=1)}"}
+    resp = client.get(
+        "/importaciones/asignaciones/productos?limite=5&solo_disponible=1", headers=headers
+    )
+
+    assert resp.status_code == 200
+    data = resp.get_json()["data"]
+    assert set(data.keys()) == {"productos", "totales", "total_filas", "limite", "offset"}
+    assert data["limite"] == 5
+    for p in data["productos"]:
+        assert p["cantidad_disponible"] > 0
+        assert p["cantidad_sobrante"] == max(p["cantidad_embarcada"] - p["cantidad_asignada"], 0)

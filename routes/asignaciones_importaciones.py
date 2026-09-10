@@ -224,3 +224,43 @@ def detalle_producto_ruta(importacion_id, producto_id):
 def movimientos_ruta(importacion_id):
     data = svc.listar_movimientos(importacion_id)
     return jsonify({"ok": True, "data": data}), 200
+
+
+# ── Vistas consolidadas (dashboard) ───────────────────────────────────────────
+# Rutas estáticas: "asignaciones" nunca calza con <int:importacion_id>.
+
+@asignaciones_bp.route("/asignaciones/embarques", methods=["GET"])
+@token_required
+@_requiere_rol_importaciones
+def resumen_global_ruta():
+    filtros = {
+        "estado": request.args.get("estado"),
+        "origen": request.args.get("origen"),
+        "anio": request.args.get("anio"),
+        "q": request.args.get("q"),
+        "solo_con_disponible": request.args.get("solo_con_disponible"),
+    }
+    data = svc.resumen_global(filtros)
+    return jsonify({"ok": True, "data": data}), 200
+
+
+@asignaciones_bp.route("/asignaciones/productos", methods=["GET"])
+@token_required
+@_requiere_rol_importaciones
+def listar_productos_global_ruta():
+    filtros = {
+        "estado": request.args.get("estado"),
+        "origen": request.args.get("origen"),
+        "anio": request.args.get("anio"),
+        "importacion_id": request.args.get("importacion_id"),
+        "periodo": request.args.get("periodo"),
+        "sku": request.args.get("sku"),
+        "q": request.args.get("q"),
+        "solo_disponible": request.args.get("solo_disponible"),
+    }
+    data = svc.listar_productos_global(
+        filtros,
+        limite=request.args.get("limite", 200),
+        offset=request.args.get("offset", 0),
+    )
+    return jsonify({"ok": True, "data": data}), 200

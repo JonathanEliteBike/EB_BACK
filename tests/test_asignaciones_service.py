@@ -13,6 +13,7 @@ from services.asignaciones_service import validar_venta_odoo
 from services.asignaciones_service import cancelar_venta
 from services.asignaciones_service import cancelar_asignacion
 from services.asignaciones_service import obtener_detalle_producto, resumen_embarque, listar_movimientos
+from services.asignaciones_service import resumen_global, listar_productos_global
 
 
 def _mock_conn(mocker, cursor):
@@ -1274,3 +1275,93 @@ def test_importar_productos_mismo_sku_repetido_en_la_hoja_se_actualiza_la_segund
     crear.assert_called_once()
     actualizar.assert_called_once_with(50, cantidad_embarcada=9, descripcion=None,
                                        usuario_id=None, importacion_id=1)
+
+
+# ── Vistas consolidadas ───────────────────────────────────────────────────────
+
+def test_resumen_global_arma_kpis_y_totales_por_embarque(mocker):
+    from datetime import datetime
+    cursor = MagicMock()
+    cursor.fetchall.return_value = [
+        {"id": 12, "referencia": "IMP-012", "nombre": "Scott", "estado": "activo",
+         "n_productos": 2, "n_periodos": 1, "embarcadas": 30, "asignadas": 18,
+         "vendidas": 2, "sobrantes": 12, "disponibles": 10,
+         "ultima_actividad": datetime(2026, 9, 9, 15, 30)},
+        {"id": 7, "referencia": "IMP-007", "nombre": "Megamo", "estado": "cerrado",
+         "n_productos": 1, "n_periodos": 1, "embarcadas": 5, "asignadas": 5,
+         "vendidas": 0, "sobrantes": 0, "disponibles": 0, "ultima_actividad": None},
+    ]
+    _mock_conn(mocker, cursor)
+
+    res = resumen_global({})
+
+    assert [e["id"] for e in res["embarques"]] == [12, 7]
+    assert res["embarques"][0]["kpis"] == {
+        "embarcadas": 30, "asignadas": 18, "sobrantes": 12, "vendidas": 2, "disponibles": 10,
+    }
+    assert res["embarques"][0]["ultima_actividad"] == "2026-09-09 15:30:00"
+    assert res["embarques"][1]["ultima_actividad"] is None
+    assert res["totales"] == {
+        "embarcadas": 35, "asignadas": 23, "sobrantes": 12, "vendidas": 2,
+        "disponibles": 10, "n_embarques": 2,
+    }
+
+
+def test_resumen_global_solo_con_disponible_agrega_having(mocker):
+    cursor = MagicMock()
+    cursor.fetchall.return_value = []
+    _mock_conn(mocker, cursor)
+
+    resumen_global({"solo_con_disponible": "1"})
+
+    sql = cursor.execute.call_args[0][0]
+    assert "HAVING disponibles > 0" in sql
+
+
+def test_listar_productos_global_calcula_sobrante_y_totales(mocker):
+    cursor = MagicMock()
+    cursor.fetchone.return_value = {"n": 2}
+    cursor.fetchall.return_value = [
+        {"importacion_id": 12, "referencia": "IMP-012", "embarque_nombre": "Scott",
+         "embarque_estado": "activo", "producto_id": 100, "sku": "AB-1", "sku_norm": "AB1",
+         "descripcion": "Bici", "periodo": "2026-2027", "cantidad_embarcada": 20,
+         "cantidad_asignada": 15, "cantidad_vendida": 1, "cantidad_disponible": 4},
+        {"importacion_id": 7, "referencia": "IMP-007", "embarque_nombre": "Megamo",
+         "embarque_estado": "cerrado", "producto_id": 55, "sku": "CD-2", "sku_norm": "CD2",
+         "descripcion": None, "periodo": "2026-2027", "cantidad_embarcada": 5,
+         "cantidad_asignada": 8, "cantidad_vendida": 0, "cantidad_disponible": 0},
+    ]
+    _mock_conn(mocker, cursor)
+
+    res = listar_productos_global({}, limite=200, offset=0)
+
+    assert res["total_filas"] == 2
+    assert res["productos"][0]["cantidad_sobrante"] == 5   # 20 - 15
+    assert res["productos"][1]["cantidad_sobrante"] == 0   # 5 - 8 -> clamp a 0
+    assert res["totales"] == {
+        "embarcadas": 25, "asignadas": 23, "sobrantes": 5, "vendidas": 1, "disponibles": 4,
+    }
+
+
+def test_listar_productos_global_filtra_sku_normalizado(mocker):
+    cursor = MagicMock()
+    cursor.fetchone.return_value = {"n": 0}
+    cursor.fetchall.return_value = []
+    _mock_conn(mocker, cursor)
+
+    listar_productos_global({"sku": "ab 1"})
+
+    count_params = cursor.execute.call_args_list[0][0][1]
+    assert "%AB1%" in count_params
+
+
+def test_listar_productos_global_solo_disponible_filtra_en_sql(mocker):
+    cursor = MagicMock()
+    cursor.fetchone.return_value = {"n": 0}
+    cursor.fetchall.return_value = []
+    _mock_conn(mocker, cursor)
+
+    listar_productos_global({"solo_disponible": "true"})
+
+    count_sql = cursor.execute.call_args_list[0][0][0]
+    assert "importacion_movimientos m" in count_sql and "> 0" in count_sql

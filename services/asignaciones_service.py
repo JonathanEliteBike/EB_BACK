@@ -1011,6 +1011,236 @@ def resumen_embarque(importacion_id: int) -> dict:
     return {"embarque": embarque, "kpis": kpis, "productos": productos}
 
 
+# ── Vistas consolidadas (todos los embarques) ──────────────────────────────────
+
+_TRUES = ("1", "true", "si", "sí", "on")
+
+
+def _es_true(v) -> bool:
+    return str(v).strip().lower() in _TRUES
+
+
+def _filtros_embarque(f: dict):
+    """WHERE + params comunes sobre la tabla `importaciones` (alias i)."""
+    where = ["i.estado <> 'eliminado'"]
+    params: list = []
+    f = f or {}
+    if f.get("estado"):
+        where.append("i.estado = %s")
+        params.append(f["estado"])
+    if f.get("origen"):
+        where.append("i.log_origen LIKE %s")
+        params.append(f"%{f['origen']}%")
+    if f.get("anio"):
+        try:
+            params.append(int(f["anio"]))
+            where.append("YEAR(COALESCE(i.log_fecha_booking, i.created_at)) = %s")
+        except (TypeError, ValueError):
+            pass
+    if f.get("q"):
+        where.append("(i.referencia LIKE %s OR i.nombre LIKE %s)")
+        like = f"%{f['q']}%"
+        params += [like, like]
+    return " AND ".join(where), params
+
+
+# Expresiones que replican el cálculo por producto de listar_productos():
+#  - asignado : Σ cantidad_asignada de asignaciones ACTIVA
+#  - vendido  : Σ cantidad de ventas VALIDADO/PENDIENTE_VALIDACION
+#  - disponible: Σ cantidad del ledger de movimientos (es un saldo con signo)
+_SUB_ASIGNADO = (
+    "(SELECT COALESCE(SUM(a.cantidad_asignada), 0) FROM importacion_asignaciones a "
+    "WHERE a.importacion_producto_id = p.id AND a.estado = 'ACTIVA')"
+)
+_SUB_VENDIDO = (
+    "(SELECT COALESCE(SUM(v.cantidad), 0) FROM importacion_sobrantes_ventas v "
+    "WHERE v.importacion_producto_id = p.id AND v.estado IN ('VALIDADO', 'PENDIENTE_VALIDACION'))"
+)
+_SUB_DISPONIBLE = (
+    "(SELECT COALESCE(SUM(m.cantidad), 0) FROM importacion_movimientos m "
+    "WHERE m.importacion_producto_id = p.id)"
+)
+
+
+def resumen_global(filtros: dict = None) -> dict:
+    """Un renglón por embarque con al menos un producto registrado, con sus KPIs
+    de asignación agregados. Alimenta el panel consolidado del dashboard."""
+    conn = obtener_conexion()
+    if not conn:
+        raise AsignacionesError("DB_NO_DISPONIBLE", "Sin conexión a BD", 500)
+    filtros = filtros or {}
+    where_sql, params = _filtros_embarque(filtros)
+    having = "HAVING disponibles > 0" if _es_true(filtros.get("solo_con_disponible")) else ""
+    try:
+        cursor = conn.cursor(dictionary=True)
+        cursor.execute(
+            f"""
+            SELECT
+              i.id, i.referencia, i.nombre, i.estado,
+              COUNT(pa.id)                              AS n_productos,
+              COUNT(DISTINCT pa.periodo)                AS n_periodos,
+              COALESCE(SUM(pa.cantidad_embarcada), 0)   AS embarcadas,
+              COALESCE(SUM(pa.asignado), 0)             AS asignadas,
+              COALESCE(SUM(pa.vendido), 0)              AS vendidas,
+              COALESCE(SUM(GREATEST(pa.cantidad_embarcada - pa.asignado, 0)), 0) AS sobrantes,
+              COALESCE(SUM(pa.disponible), 0)           AS disponibles,
+              MAX(pa.ultima_actividad)                  AS ultima_actividad
+            FROM importaciones i
+            JOIN (
+              SELECT
+                p.id, p.importacion_id, p.periodo, p.cantidad_embarcada,
+                {_SUB_ASIGNADO}  AS asignado,
+                {_SUB_VENDIDO}   AS vendido,
+                {_SUB_DISPONIBLE} AS disponible,
+                (SELECT MAX(m.created_at) FROM importacion_movimientos m
+                   WHERE m.importacion_producto_id = p.id) AS ultima_actividad
+              FROM importacion_productos p
+            ) pa ON pa.importacion_id = i.id
+            WHERE {where_sql}
+            GROUP BY i.id, i.referencia, i.nombre, i.estado
+            {having}
+            ORDER BY i.id DESC
+            """,
+            params,
+        )
+        filas = cursor.fetchall()
+    finally:
+        conn.close()
+
+    embarques = []
+    tot = {"embarcadas": 0, "asignadas": 0, "sobrantes": 0, "vendidas": 0, "disponibles": 0}
+    for r in filas:
+        kpis = {k: int(r[k]) for k in ("embarcadas", "asignadas", "sobrantes", "vendidas", "disponibles")}
+        ua = r["ultima_actividad"]
+        embarques.append({
+            "id": r["id"],
+            "referencia": r["referencia"],
+            "nombre": r["nombre"],
+            "estado": r["estado"],
+            "n_productos": int(r["n_productos"]),
+            "n_periodos": int(r["n_periodos"]),
+            "kpis": kpis,
+            "ultima_actividad": ua.isoformat(sep=" ") if hasattr(ua, "isoformat") else ua,
+        })
+        for k in tot:
+            tot[k] += kpis[k]
+    tot["n_embarques"] = len(embarques)
+    return {"embarques": embarques, "totales": tot}
+
+
+def listar_productos_global(filtros: dict = None, limite: int = 200, offset: int = 0) -> dict:
+    """Lista plana de productos cruzando todos los embarques (vista por SKU)."""
+    conn = obtener_conexion()
+    if not conn:
+        raise AsignacionesError("DB_NO_DISPONIBLE", "Sin conexión a BD", 500)
+    f = filtros or {}
+    where = ["i.estado <> 'eliminado'"]
+    params: list = []
+    if f.get("estado"):
+        where.append("i.estado = %s")
+        params.append(f["estado"])
+    if f.get("origen"):
+        where.append("i.log_origen LIKE %s")
+        params.append(f"%{f['origen']}%")
+    if f.get("anio"):
+        try:
+            params.append(int(f["anio"]))
+            where.append("YEAR(COALESCE(i.log_fecha_booking, i.created_at)) = %s")
+        except (TypeError, ValueError):
+            pass
+    if f.get("importacion_id"):
+        try:
+            params.append(int(f["importacion_id"]))
+            where.append("p.importacion_id = %s")
+        except (TypeError, ValueError):
+            pass
+    if f.get("periodo"):
+        where.append("p.periodo = %s")
+        params.append(f["periodo"])
+    if f.get("sku"):
+        where.append("p.sku_norm LIKE %s")
+        params.append(f"%{_norm_sku(f['sku'])}%")
+    if f.get("q"):
+        where.append("(p.sku LIKE %s OR p.descripcion LIKE %s OR i.referencia LIKE %s OR i.nombre LIKE %s)")
+        like = f"%{f['q']}%"
+        params += [like, like, like, like]
+    if _es_true(f.get("solo_disponible")):
+        where.append(f"{_SUB_DISPONIBLE} > 0")
+    where_sql = " AND ".join(where)
+    base_from = (
+        "FROM importacion_productos p "
+        "JOIN importaciones i ON i.id = p.importacion_id "
+        f"WHERE {where_sql}"
+    )
+    try:
+        limite = min(max(int(limite), 1), 1000)
+    except (TypeError, ValueError):
+        limite = 200
+    try:
+        offset = max(int(offset), 0)
+    except (TypeError, ValueError):
+        offset = 0
+    try:
+        cursor = conn.cursor(dictionary=True)
+        cursor.execute(f"SELECT COUNT(*) AS n {base_from}", params)
+        total = int(cursor.fetchone()["n"])
+        cursor.execute(
+            f"""
+            SELECT
+              p.importacion_id, i.referencia,
+              i.nombre AS embarque_nombre, i.estado AS embarque_estado,
+              p.id AS producto_id, p.sku, p.sku_norm, p.descripcion, p.periodo,
+              p.cantidad_embarcada,
+              {_SUB_ASIGNADO}   AS cantidad_asignada,
+              {_SUB_VENDIDO}    AS cantidad_vendida,
+              {_SUB_DISPONIBLE} AS cantidad_disponible
+            {base_from}
+            ORDER BY i.id DESC, p.sku
+            LIMIT %s OFFSET %s
+            """,
+            params + [limite, offset],
+        )
+        rows = cursor.fetchall()
+    finally:
+        conn.close()
+
+    productos = []
+    tot = {"embarcadas": 0, "asignadas": 0, "sobrantes": 0, "vendidas": 0, "disponibles": 0}
+    for r in rows:
+        embarcada = int(r["cantidad_embarcada"])
+        asignada = int(r["cantidad_asignada"])
+        vendida = int(r["cantidad_vendida"])
+        disponible = int(r["cantidad_disponible"])
+        sobrante = max(embarcada - asignada, 0)
+        productos.append({
+            "importacion_id": r["importacion_id"],
+            "referencia": r["referencia"],
+            "embarque_nombre": r["embarque_nombre"],
+            "embarque_estado": r["embarque_estado"],
+            "producto_id": r["producto_id"],
+            "sku": r["sku"],
+            "descripcion": r["descripcion"],
+            "periodo": r["periodo"],
+            "cantidad_embarcada": embarcada,
+            "cantidad_asignada": asignada,
+            "cantidad_sobrante": sobrante,
+            "cantidad_vendida": vendida,
+            "cantidad_disponible": disponible,
+        })
+        tot["embarcadas"] += embarcada
+        tot["asignadas"] += asignada
+        tot["sobrantes"] += sobrante
+        tot["vendidas"] += vendida
+        tot["disponibles"] += disponible
+    return {
+        "productos": productos,
+        "totales": tot,
+        "total_filas": total,
+        "limite": limite,
+        "offset": offset,
+    }
+
+
 def listar_movimientos(importacion_id: int) -> list:
     conn = obtener_conexion()
     if not conn:
