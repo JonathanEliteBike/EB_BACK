@@ -366,6 +366,7 @@ def crear_producto(importacion_id: int, sku: str, cantidad_embarcada, periodo: s
     periodo = (periodo or "").strip()
     if not periodo:
         raise AsignacionesError("SKU_INVALIDO", "El periodo es obligatorio")
+    _split_periodo(periodo)  # valida el formato YYYY-YYYY (lanza PERIODO_INVALIDO si no)
     sku_norm = _norm_sku(sku)
 
     conn = obtener_conexion()
@@ -615,6 +616,7 @@ def importar_productos(importacion_id: int, periodo: str, filas: list, usuario_i
     periodo = (periodo or "").strip()
     if not periodo:
         raise AsignacionesError("PERIODO_REQUERIDO", "El periodo es obligatorio", 400)
+    _split_periodo(periodo)  # valida YYYY-YYYY antes de tocar ninguna fila (evita otro "MY27")
 
     conn = obtener_conexion()
     if not conn:

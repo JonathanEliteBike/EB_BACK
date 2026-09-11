@@ -1435,6 +1435,22 @@ def test_importar_productos_rechaza_periodo_vacio():
     assert exc.value.code == "PERIODO_REQUERIDO"
 
 
+def test_importar_productos_rechaza_periodo_con_formato_invalido():
+    """Regresión del caso real: 'MY27' se guardó tal cual y rompió recalcular_propuesta
+    (necesita YYYY-YYYY para saber a qué año calendario mapear cada mes)."""
+    with pytest.raises(AsignacionesError) as exc:
+        importar_productos(1, "MY27", [{"fila": 2, "sku": "A", "cantidad": 5}])
+    assert exc.value.code == "PERIODO_INVALIDO"
+    assert exc.value.status == 400
+
+
+def test_crear_producto_rechaza_periodo_con_formato_invalido():
+    with pytest.raises(AsignacionesError) as exc:
+        crear_producto(1, "SKU-1", 10, "MY27")
+    assert exc.value.code == "PERIODO_INVALIDO"
+    assert exc.value.status == 400
+
+
 def test_importar_productos_importacion_no_existe(mocker):
     cursor = MagicMock()
     cursor.fetchone.return_value = None
