@@ -5,13 +5,19 @@ import os
 import uuid
 from datetime import date, datetime
 
-from flask import Blueprint, jsonify, request, send_file, redirect
+from flask import Blueprint, jsonify, request, send_file, redirect, g
 from services.s3_service import subir_archivo_s3, generar_url_firmada_s3, existe_archivo_s3
 from werkzeug.utils import secure_filename
 
 from db_conexion import obtener_conexion
 from services.garantias_service import exportar_pdf, get_dashboard_data, invalidar_cache
 from utils.jwt_utils import verificar_token
+from utils.auth_decorators import (
+    requiere_autenticacion,
+    requiere_rol,
+    requiere_modulo,
+    usuario_actual_tiene_modulo,
+)
 
 garantias_bp = Blueprint("garantias", __name__, url_prefix="/garantias")
 
@@ -25,9 +31,55 @@ def allowed_file(filename):
     return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
 
 
+def _usuario_actual_puede_ver_formulario(cursor, formulario_id):
+    """Restringe los detalles a los tickets visibles para la cuenta actual."""
+    cursor.execute(
+        "SELECT rol_id, correo, cliente_id FROM usuarios WHERE id = %s AND activo = 1",
+        (g.usuario_actual['id'],),
+    )
+    usuario = cursor.fetchone()
+    if not usuario:
+        return False
+    if usuario['rol_id'] == 1:
+        return True
+
+    nombre_cliente = None
+    if usuario.get('cliente_id'):
+        cursor.execute("SELECT nombre_cliente FROM clientes WHERE id = %s", (usuario['cliente_id'],))
+        cliente = cursor.fetchone()
+        nombre_cliente = cliente['nombre_cliente'] if cliente else None
+
+    if nombre_cliente:
+        cursor.execute(
+            "SELECT 1 FROM garantia_formularios WHERE id = %s AND (email = %s OR distribuidor = %s)",
+            (formulario_id, usuario['correo'], nombre_cliente),
+        )
+    else:
+        cursor.execute(
+            "SELECT 1 FROM garantia_formularios WHERE id = %s AND email = %s",
+            (formulario_id, usuario['correo']),
+        )
+    return bool(cursor.fetchone())
+
+
+def _usuario_actual_puede_descargar_archivo(cursor, nombre_archivo):
+    """Comprueba que el archivo solicitado esté ligado a un ticket visible."""
+    cursor.execute(
+        "SELECT id FROM garantia_formularios WHERE datos LIKE %s",
+        (f"%{nombre_archivo}%",),
+    )
+    formularios = cursor.fetchall()
+    return any(
+        _usuario_actual_puede_ver_formulario(cursor, formulario['id'])
+        for formulario in formularios
+    )
+
+
 # ── Dashboard (existing) ─────────────────────────────────────────────────────
 
 @garantias_bp.route("/dashboard", methods=["GET"])
+@requiere_autenticacion
+@requiere_rol(1)
 def dashboard():
     try:
         desde = request.args.get('desde') or None
@@ -40,6 +92,8 @@ def dashboard():
 
 
 @garantias_bp.route("/exportar", methods=["GET"])
+@requiere_autenticacion
+@requiere_rol(1)
 def exportar():
     try:
         distribuidor = request.args.get('distribuidor') or None
@@ -61,6 +115,8 @@ def exportar():
 
 
 @garantias_bp.route("/refrescar", methods=["POST"])
+@requiere_autenticacion
+@requiere_rol(1)
 def refrescar():
     invalidar_cache()
     return jsonify({"ok": True, "mensaje": "Cache invalidado"})
@@ -69,6 +125,8 @@ def refrescar():
 # ── DB initialization ─────────────────────────────────────────────────────────
 
 @garantias_bp.route("/inicializar-tablas", methods=["POST"])
+@requiere_autenticacion
+@requiere_rol(1)
 def inicializar_tablas():
     conn = obtener_conexion()
     if not conn:
@@ -157,6 +215,8 @@ def inicializar_tablas():
 # ── Form submissions ──────────────────────────────────────────────────────────
 
 @garantias_bp.route("/formulario/enviar", methods=["POST"])
+@requiere_autenticacion
+@requiere_modulo("usuarios_garantias")
 def enviar_formulario():
     conn = obtener_conexion()
     if not conn:
@@ -166,20 +226,14 @@ def enviar_formulario():
 
         # Determinar el email del ticket (a quién pertenece)
         email = datos.get('email', '')
-        auth_header = request.headers.get('Authorization', '')
-        if auth_header:
-            raw_token = auth_header.split(' ')[1] if ' ' in auth_header else None
-            if raw_token:
-                payload = verificar_token(raw_token)
-                if payload and payload.get('id'):
-                    cursor_u = conn.cursor(dictionary=True)
-                    cursor_u.execute("SELECT correo, rol_id FROM usuarios WHERE id = %s", (payload['id'],))
-                    user = cursor_u.fetchone()
-                    if user and user.get('correo'):
-                        email = user['correo']
-                        # Si el administrador asigna explícitamente a otro usuario, usar ese email
-                        if user.get('rol_id') == 1 and datos.get('email_asignado'):
-                            email = datos['email_asignado']
+        cursor_u = conn.cursor(dictionary=True)
+        cursor_u.execute("SELECT correo, rol_id FROM usuarios WHERE id = %s", (g.usuario_actual['id'],))
+        user = cursor_u.fetchone()
+        if user and user.get('correo'):
+            email = user['correo']
+            # Si el administrador asigna explícitamente a otro usuario, usar ese email.
+            if user.get('rol_id') == 1 and datos.get('email_asignado'):
+                email = datos['email_asignado']
 
         cursor = conn.cursor()
         fecha_ingreso = datos.get('fecha_ingreso') or None
@@ -225,6 +279,8 @@ def enviar_formulario():
 
 
 @garantias_bp.route("/formulario/lista", methods=["GET"])
+@requiere_autenticacion
+@requiere_rol(1)
 def lista_formularios():
     conn = obtener_conexion()
     if not conn:
@@ -257,22 +313,16 @@ def lista_formularios():
 
 
 @garantias_bp.route("/formulario/<int:form_id>/actualizar-dato", methods=["PUT"])
+@requiere_autenticacion
+@requiere_modulo("usuarios_garantias")
 def actualizar_dato_usuario(form_id):
     """El usuario dueño del ticket actualiza un campo rechazado y resetea su validación."""
-    auth_header = request.headers.get('Authorization', '')
-    raw_token = auth_header.split(' ')[1] if ' ' in auth_header else None
-    if not raw_token:
-        return jsonify({"error": "No autorizado"}), 401
-    payload = verificar_token(raw_token)
-    if not payload or not payload.get('id'):
-        return jsonify({"error": "Token inválido"}), 401
-
     conn = obtener_conexion()
     if not conn:
         return jsonify({"error": "Sin conexion a BD"}), 500
     try:
         cursor = conn.cursor(dictionary=True)
-        cursor.execute("SELECT correo FROM usuarios WHERE id = %s", (payload['id'],))
+        cursor.execute("SELECT correo FROM usuarios WHERE id = %s", (g.usuario_actual['id'],))
         user = cursor.fetchone()
         if not user:
             return jsonify({"error": "Usuario no encontrado"}), 404
@@ -331,6 +381,8 @@ def actualizar_dato_usuario(form_id):
 
 
 @garantias_bp.route("/mis-tickets", methods=["GET"])
+@requiere_autenticacion
+@requiere_modulo("usuarios_garantias")
 def mis_tickets():
     """Devuelve los tickets del usuario autenticado.
 
@@ -340,16 +392,7 @@ def mis_tickets():
     pruebas) y todas deben ver el mismo conjunto de garantías del cliente. Se conserva el
     match por correo como respaldo adicional (OR), no como sustituto.
     """
-    auth_header = request.headers.get('Authorization', '')
-    raw_token = auth_header.split(' ')[1] if ' ' in auth_header else None
-    if not raw_token:
-        return jsonify({"error": "No autorizado"}), 401
-    payload = verificar_token(raw_token)
-    if not payload:
-        return jsonify({"error": "Token inválido"}), 401
-    user_id = payload.get('id')
-    if not user_id:
-        return jsonify({"error": "Token inválido"}), 401
+    user_id = g.usuario_actual['id']
 
     conn = obtener_conexion()
     if not conn:
@@ -397,22 +440,16 @@ def mis_tickets():
 
 
 @garantias_bp.route("/formulario/<int:form_id>", methods=["DELETE"])
+@requiere_autenticacion
+@requiere_rol(1)
 def eliminar_formulario(form_id):
     """Elimina un ticket y renumera los folios consecutivamente. Solo admins."""
-    auth_header = request.headers.get('Authorization', '')
-    raw_token = auth_header.split(' ')[1] if ' ' in auth_header else None
-    if not raw_token:
-        return jsonify({"error": "No autorizado"}), 401
-    payload = verificar_token(raw_token)
-    if not payload or not payload.get('id'):
-        return jsonify({"error": "Token inválido"}), 401
-
     conn = obtener_conexion()
     if not conn:
         return jsonify({"error": "Sin conexion a BD"}), 500
     try:
         cursor_u = conn.cursor(dictionary=True)
-        cursor_u.execute("SELECT rol_id FROM usuarios WHERE id = %s", (payload['id'],))
+        cursor_u.execute("SELECT rol_id FROM usuarios WHERE id = %s", (g.usuario_actual['id'],))
         user = cursor_u.fetchone()
         if not user or user.get('rol_id') != 1:
             return jsonify({"error": "Solo administradores pueden eliminar tickets"}), 403
@@ -444,12 +481,16 @@ def eliminar_formulario(form_id):
 
 
 @garantias_bp.route("/formulario/<int:form_id>", methods=["GET"])
+@requiere_autenticacion
+@requiere_modulo("usuarios_garantias")
 def obtener_formulario(form_id):
     conn = obtener_conexion()
     if not conn:
         return jsonify({"error": "Sin conexion a BD"}), 500
     try:
         cursor = conn.cursor(dictionary=True)
+        if not _usuario_actual_puede_ver_formulario(cursor, form_id):
+            return jsonify({"error": "Ticket no encontrado o no autorizado"}), 403
         cursor.execute("SELECT * FROM garantia_formularios WHERE id = %s", (form_id,))
         row = cursor.fetchone()
         if not row:
@@ -475,6 +516,8 @@ def obtener_formulario(form_id):
 
 
 @garantias_bp.route("/formulario/<int:form_id>/estatus", methods=["PUT"])
+@requiere_autenticacion
+@requiere_rol(1)
 def actualizar_estatus(form_id):
     conn = obtener_conexion()
     if not conn:
@@ -502,6 +545,8 @@ def actualizar_estatus(form_id):
 
 
 @garantias_bp.route("/formulario/<int:form_id>/fecha-estatus", methods=["PUT"])
+@requiere_autenticacion
+@requiere_rol(1)
 def actualizar_fecha_estatus(form_id):
     """Edita solo la fecha del estatus actual sin cambiar el estatus."""
     conn = obtener_conexion()
@@ -529,6 +574,8 @@ def actualizar_fecha_estatus(form_id):
 
 
 @garantias_bp.route("/formulario/<int:form_id>/fecha-creacion", methods=["PUT"])
+@requiere_autenticacion
+@requiere_rol(1)
 def actualizar_fecha_creacion(form_id):
     """Corrige la fecha de alta (creación) del ticket cuando se registró mal, sin borrar y recrear."""
     conn = obtener_conexion()
@@ -556,6 +603,8 @@ def actualizar_fecha_creacion(form_id):
 
 
 @garantias_bp.route("/formulario/<int:form_id>/pieza-reemplazo", methods=["PUT"])
+@requiere_autenticacion
+@requiere_rol(1)
 def actualizar_pieza_reemplazo(form_id):
     conn = obtener_conexion()
     if not conn:
@@ -582,6 +631,8 @@ def actualizar_pieza_reemplazo(form_id):
 
 
 @garantias_bp.route("/formulario/<int:form_id>/pieza", methods=["PUT"])
+@requiere_autenticacion
+@requiere_rol(1)
 def actualizar_pieza(form_id):
     conn = obtener_conexion()
     if not conn:
@@ -609,6 +660,8 @@ def actualizar_pieza(form_id):
 
 
 @garantias_bp.route("/formulario/<int:form_id>/fecha-pieza", methods=["PUT"])
+@requiere_autenticacion
+@requiere_rol(1)
 def actualizar_fecha_pieza(form_id):
     """Edita solo la fecha del estatus de pieza sin cambiar el estatus."""
     conn = obtener_conexion()
@@ -636,6 +689,8 @@ def actualizar_fecha_pieza(form_id):
 
 
 @garantias_bp.route("/formulario/<int:form_id>/validacion-doc", methods=["PUT"])
+@requiere_autenticacion
+@requiere_rol(1)
 def actualizar_validacion_doc(form_id):
     """Valida o rechaza un documento individual. body: {campo, estado, nombre_legible}"""
     conn = obtener_conexion()
@@ -699,6 +754,8 @@ def actualizar_validacion_doc(form_id):
 
 
 @garantias_bp.route("/formulario/<int:form_id>/validacion", methods=["PUT"])
+@requiere_autenticacion
+@requiere_rol(1)
 def actualizar_validacion(form_id):
     conn = obtener_conexion()
     if not conn:
@@ -746,6 +803,8 @@ def actualizar_validacion(form_id):
 # ── Form structure (editor) ───────────────────────────────────────────────────
 
 @garantias_bp.route("/estructura", methods=["GET"])
+@requiere_autenticacion
+@requiere_modulo("usuarios_garantias")
 def obtener_estructura():
     conn = obtener_conexion()
     if not conn:
@@ -769,6 +828,8 @@ def obtener_estructura():
 
 
 @garantias_bp.route("/estructura", methods=["POST"])
+@requiere_autenticacion
+@requiere_rol(1)
 def guardar_estructura():
     conn = obtener_conexion()
     if not conn:
@@ -796,6 +857,8 @@ def guardar_estructura():
 # ── Stats (hub) ──────────────────────────────────────────────────────────────
 
 @garantias_bp.route("/stats", methods=["GET"])
+@requiere_autenticacion
+@requiere_rol(1)
 def get_stats():
     conn = obtener_conexion()
     if not conn:
@@ -831,24 +894,18 @@ def get_stats():
 # ── Comentarios de ticket ─────────────────────────────────────────────────────
 
 @garantias_bp.route("/ticket/<int:formulario_id>/comentarios", methods=["GET"])
+@requiere_autenticacion
+@requiere_modulo("usuarios_garantias")
 def get_comentarios(formulario_id):
     conn = obtener_conexion()
     if not conn:
         return jsonify({"error": "Sin conexion a BD"}), 500
     try:
-        es_admin = False
-        auth_header = request.headers.get('Authorization', '')
-        if auth_header:
-            raw_token = auth_header.split(' ')[1] if ' ' in auth_header else None
-            if raw_token:
-                payload = verificar_token(raw_token)
-                if payload and payload.get('id'):
-                    cursor_u = conn.cursor(dictionary=True)
-                    cursor_u.execute("SELECT rol_id FROM usuarios WHERE id = %s", (payload['id'],))
-                    user = cursor_u.fetchone()
-                    es_admin = bool(user and user.get('rol_id') == 1)
+        es_admin = int(g.usuario_actual.get('rol', 0)) == 1
 
         cursor = conn.cursor(dictionary=True)
+        if not _usuario_actual_puede_ver_formulario(cursor, formulario_id):
+            return jsonify({"error": "Ticket no encontrado o no autorizado"}), 403
         if es_admin:
             cursor.execute("""
                 SELECT * FROM garantia_comentarios
@@ -873,6 +930,8 @@ def get_comentarios(formulario_id):
 
 
 @garantias_bp.route("/ticket/<int:formulario_id>/comentarios", methods=["POST"])
+@requiere_autenticacion
+@requiere_modulo("usuarios_garantias")
 def add_comentario(formulario_id):
     conn = obtener_conexion()
     if not conn:
@@ -885,22 +944,19 @@ def add_comentario(formulario_id):
         tipo = datos.get('tipo', 'comentario')
 
         if tipo == 'nota_interna':
-            # Extraer nombre real del JWT — requerido para notas internas
-            auth_header = request.headers.get('Authorization', '')
-            raw_token = auth_header.split(' ')[1] if ' ' in auth_header else None
-            if not raw_token:
-                return jsonify({"error": "No autorizado"}), 401
-            tok_payload = verificar_token(raw_token)
-            if not tok_payload or not tok_payload.get('id'):
-                return jsonify({"error": "Token inválido"}), 401
+            # Solo rol 1 puede crear notas internas.
             cursor_u = conn.cursor(dictionary=True)
-            cursor_u.execute("SELECT nombre, rol_id FROM usuarios WHERE id = %s", (tok_payload['id'],))
+            cursor_u.execute("SELECT nombre, rol_id FROM usuarios WHERE id = %s", (g.usuario_actual['id'],))
             user = cursor_u.fetchone()
             if not user or user.get('rol_id') != 1:
                 return jsonify({"error": "No autorizado"}), 403
             autor = user.get('nombre') or 'Administrador'
         else:
             autor = (datos.get('autor') or 'Administrador').strip()
+
+        cursor_verificacion = conn.cursor(dictionary=True)
+        if not _usuario_actual_puede_ver_formulario(cursor_verificacion, formulario_id):
+            return jsonify({"error": "Ticket no encontrado o no autorizado"}), 403
 
         cursor = conn.cursor()
         cursor.execute("""
@@ -919,6 +975,8 @@ def add_comentario(formulario_id):
 # ── Latencias por ticket ─────────────────────────────────────────────────────
 
 @garantias_bp.route("/latencias", methods=["GET"])
+@requiere_autenticacion
+@requiere_rol(1)
 def get_latencias():
     """Devuelve latencia de atención y de cierre por ticket individual."""
     conn = obtener_conexion()
@@ -957,6 +1015,8 @@ def get_latencias():
 # ── Catálogo de piezas de reemplazo ──────────────────────────────────────────
 
 @garantias_bp.route("/piezas", methods=["GET"])
+@requiere_autenticacion
+@requiere_rol(1)
 def listar_piezas():
     conn = obtener_conexion()
     if not conn:
@@ -996,6 +1056,8 @@ def listar_piezas():
 
 
 @garantias_bp.route("/piezas", methods=["POST"])
+@requiere_autenticacion
+@requiere_rol(1)
 def agregar_pieza():
     conn = obtener_conexion()
     if not conn:
@@ -1019,6 +1081,8 @@ def agregar_pieza():
 
 
 @garantias_bp.route("/piezas/uso", methods=["GET"])
+@requiere_autenticacion
+@requiere_rol(1)
 def contar_uso_pieza():
     """Cuántos tickets tienen asignada esta pieza actualmente -- para avisar
     antes de quitarla del catálogo (no se tocan esos tickets, solo informa)."""
@@ -1044,6 +1108,8 @@ def contar_uso_pieza():
 
 
 @garantias_bp.route("/piezas", methods=["DELETE"])
+@requiere_autenticacion
+@requiere_rol(1)
 def eliminar_pieza():
     """Quita una pieza del catálogo (soft-delete via activo=0) -- para
     duplicados o nombres capturados por error (ej. 'MAUBRIO'). No afecta los
@@ -1436,7 +1502,16 @@ def importar_garantias():
 # ── File uploads ──────────────────────────────────────────────────────────────
 
 @garantias_bp.route("/archivo/subir", methods=["POST"])
+@requiere_autenticacion
 def subir_archivo():
+    accion = request.form.get('accion')
+    if accion not in {'crear', 'editar'}:
+        return jsonify({"error": "Debe indicar si el archivo corresponde a crear o editar una garantía."}), 400
+
+    permitido, error = usuario_actual_tiene_modulo('usuarios_garantias')
+    if not permitido:
+        return error
+
     if 'archivo' not in request.files:
         return jsonify({"error": "No se recibio archivo"}), 400
 
@@ -1466,8 +1541,17 @@ def subir_archivo():
 
 
 @garantias_bp.route("/archivo/<path:nombre>", methods=["GET"])
+@requiere_autenticacion
+@requiere_modulo("usuarios_garantias")
 def descargar_archivo(nombre):
+    conn = obtener_conexion()
+    if not conn:
+        return jsonify({"error": "Sin conexion a BD"}), 500
     try:
+        cursor = conn.cursor(dictionary=True)
+        if not _usuario_actual_puede_descargar_archivo(cursor, nombre):
+            return jsonify({"error": "Archivo no encontrado o no autorizado"}), 403
+
         key_s3 = nombre
 
         if not existe_archivo_s3(key_s3):
@@ -1480,3 +1564,5 @@ def descargar_archivo(nombre):
     except Exception as e:
         logging.exception("Error obteniendo archivo de garantia desde S3: %s", e)
         return jsonify({"error": "Error al obtener archivo"}), 500
+    finally:
+        conn.close()

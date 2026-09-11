@@ -23,10 +23,13 @@ class PermisosService:
                     a.identificador AS accion_id_texto
                 FROM permisos_delegables pd
                 INNER JOIN modulos m ON pd.modulo_id = m.id
+                INNER JOIN modulo_acciones ma
+                    ON ma.modulo_id = pd.modulo_id AND ma.accion_id = pd.accion_id
                 LEFT JOIN modulos p ON m.padre_id = p.id
                 INNER JOIN acciones a ON pd.accion_id = a.id
                 WHERE pd.administrador_id = %s
                   AND m.activo = 1
+                  AND m.delegable_a_hijos = 1
                   AND a.activo = 1
             """, (padre_id,))
             return cur.fetchall()
@@ -70,6 +73,8 @@ class PermisosService:
                         a.identificador AS accion_id_texto
                     FROM usuario_permisos up
                     INNER JOIN modulos m ON up.modulo_id = m.id
+                    INNER JOIN modulo_acciones ma
+                        ON ma.modulo_id = up.modulo_id AND ma.accion_id = up.accion_id
                     LEFT JOIN modulos p ON m.padre_id = p.id
                     INNER JOIN acciones a ON up.accion_id = a.id
                     WHERE up.usuario_id = %s
@@ -92,10 +97,13 @@ class PermisosService:
                     AND pd.modulo_id = up.modulo_id 
                     AND pd.accion_id = up.accion_id
                     INNER JOIN modulos m ON up.modulo_id = m.id
+                    INNER JOIN modulo_acciones ma
+                        ON ma.modulo_id = up.modulo_id AND ma.accion_id = up.accion_id
                     LEFT JOIN modulos p ON m.padre_id = p.id
                     INNER JOIN acciones a ON up.accion_id = a.id
                     WHERE up.usuario_id = %s 
                     AND m.activo = 1 
+                    AND m.delegable_a_hijos = 1
                     AND a.activo = 1
                 """
                 cur.execute(sql, (padre_id_real, hijo_id))
@@ -131,8 +139,15 @@ class PermisosService:
         cur = conn.cursor()
         try:
             cur.execute("""
-                SELECT 1 FROM permisos_delegables 
-                WHERE administrador_id = %s AND modulo_id = %s AND accion_id = %s
+                SELECT 1
+                FROM permisos_delegables pd
+                INNER JOIN modulo_acciones ma
+                    ON ma.modulo_id = pd.modulo_id AND ma.accion_id = pd.accion_id
+                INNER JOIN modulos m
+                    ON m.id = pd.modulo_id AND m.activo = 1 AND m.delegable_a_hijos = 1
+                WHERE pd.administrador_id = %s
+                  AND pd.modulo_id = %s
+                  AND pd.accion_id = %s
             """, (padre_id, modulo_id, accion_id))
             if not cur.fetchone():
                 raise Exception("Operación no permitida: No tiene autorización para delegar este permiso.")

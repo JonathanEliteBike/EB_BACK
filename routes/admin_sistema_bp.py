@@ -2,6 +2,7 @@
 
 from flask import Blueprint, request, jsonify
 from services.admin_sistema_service import AdminSistemaService
+from services.permisos_modulos_service import PermisosModulosService
 from utils.auth_decorators import requiere_autenticacion, requiere_rol
 
 admin_sistema_bp = Blueprint('admin_sistema', __name__, url_prefix='/api/admin-sistema')
@@ -101,4 +102,81 @@ def revocar_permiso_delegable():
         resultado = AdminSistemaService.revocar_permiso_delegable(admin_id, modulo_id, accion_id)
         return jsonify(resultado), 200
     except Exception as e:
+        return jsonify({"error": str(e)}), 400
+
+
+@admin_sistema_bp.route('/administradores/<int:admin_id>/modulos-delegables', methods=['GET'])
+@requiere_autenticacion
+@requiere_rol(1)
+def obtener_modulos_delegables_administrador_nuevo(admin_id):
+    """Bolsa nueva por módulo, independiente de Ver/Crear/Editar/Eliminar."""
+    try:
+        return jsonify({"modulos": PermisosModulosService.obtener_modulos_delegables(admin_id)}), 200
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+
+
+@admin_sistema_bp.route('/modulos-delegables/asignar', methods=['POST'])
+@requiere_autenticacion
+@requiere_rol(1)
+def asignar_modulo_delegable():
+    try:
+        data = request.get_json() or {}
+        admin_id, modulo_id = data.get('administrador_id'), data.get('modulo_id')
+        if not all([admin_id, modulo_id]):
+            return jsonify({"error": "administrador_id y modulo_id son requeridos."}), 400
+        return jsonify(PermisosModulosService.asignar_modulo_administrador(admin_id, modulo_id)), 201
+    except (ValueError, PermissionError) as e:
+        return jsonify({"error": str(e)}), 400
+
+
+@admin_sistema_bp.route('/modulos-delegables/revocar', methods=['DELETE'])
+@requiere_autenticacion
+@requiere_rol(1)
+def revocar_modulo_delegable():
+    try:
+        data = request.get_json() or {}
+        admin_id, modulo_id = data.get('administrador_id'), data.get('modulo_id')
+        if not all([admin_id, modulo_id]):
+            return jsonify({"error": "administrador_id y modulo_id son requeridos."}), 400
+        return jsonify(PermisosModulosService.revocar_modulo_administrador(admin_id, modulo_id)), 200
+    except (ValueError, PermissionError) as e:
+        return jsonify({"error": str(e)}), 400
+
+
+@admin_sistema_bp.route('/administradores/<int:admin_id>/capacidades-delegables', methods=['GET'])
+@requiere_autenticacion
+@requiere_rol(1)
+def obtener_capacidades_delegables_administrador(admin_id):
+    try:
+        return jsonify({"capacidades": PermisosModulosService.obtener_capacidades_delegables(admin_id)}), 200
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+
+
+@admin_sistema_bp.route('/capacidades-delegables/asignar', methods=['POST'])
+@requiere_autenticacion
+@requiere_rol(1)
+def asignar_capacidad_delegable():
+    try:
+        data = request.get_json() or {}
+        admin_id, capacidad = data.get('administrador_id'), data.get('capacidad')
+        if not admin_id or not capacidad:
+            return jsonify({"error": "administrador_id y capacidad son requeridos."}), 400
+        return jsonify(PermisosModulosService.asignar_capacidad_administrador(admin_id, capacidad)), 201
+    except (ValueError, PermissionError) as e:
+        return jsonify({"error": str(e)}), 400
+
+
+@admin_sistema_bp.route('/capacidades-delegables/revocar', methods=['DELETE'])
+@requiere_autenticacion
+@requiere_rol(1)
+def revocar_capacidad_delegable():
+    try:
+        data = request.get_json() or {}
+        admin_id, capacidad = data.get('administrador_id'), data.get('capacidad')
+        if not admin_id or not capacidad:
+            return jsonify({"error": "administrador_id y capacidad son requeridos."}), 400
+        return jsonify(PermisosModulosService.revocar_capacidad_administrador(admin_id, capacidad)), 200
+    except (ValueError, PermissionError) as e:
         return jsonify({"error": str(e)}), 400

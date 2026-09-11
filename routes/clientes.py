@@ -1,9 +1,10 @@
-from flask import Blueprint, jsonify, request
+from flask import Blueprint, jsonify, request, g
 from db_conexion import obtener_conexion
 import jwt
 from datetime import date, datetime
 
 from utils.jwt_utils import verificar_token, SECRET_KEY
+from utils.auth_decorators import requiere_autenticacion, requiere_modulo
 from functools import wraps
 
 clientes_bp = Blueprint('clientes', __name__, url_prefix='')
@@ -576,13 +577,31 @@ def obtener_facturas_cliente():
             conexion.close()
 
 @clientes_bp.route('/facturas-grupo/<int:id_grupo>', methods=['GET'])
-@token_required
+@requiere_autenticacion
+@requiere_modulo('usuarios_caratula')
 def obtener_facturas_grupo(id_grupo):
     conexion = None
     cursor = None
     try:
         conexion = obtener_conexion()
         cursor = conexion.cursor(dictionary=True)
+
+        # Roles de portal no pueden reemplazar el grupo de su cliente en la URL.
+        cursor.execute(
+            """
+            SELECT u.rol_id, c.id_grupo
+            FROM usuarios u
+            LEFT JOIN clientes c ON c.id = u.cliente_id
+            WHERE u.id = %s AND u.activo = 1
+            """,
+            (g.usuario_actual['id'],),
+        )
+        contexto = cursor.fetchone()
+        if not contexto:
+            return jsonify({'error': 'Usuario no encontrado o inactivo'}), 401
+        if contexto['rol_id'] in (2, 3):
+            if not contexto.get('id_grupo') or contexto['id_grupo'] != id_grupo:
+                return jsonify({'error': 'No puedes consultar facturas de otro grupo.'}), 403
 
         ## NUEVO: Consulta optimizada con JOIN para filtrar por fecha en una sola operación
         query_facturas = """

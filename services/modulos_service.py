@@ -11,7 +11,8 @@ class ModulosService:
         cur = conn.cursor(dictionary=True)
         try:
             cur.execute("""
-                SELECT id, padre_id, nombre, identificador, activo, creado_en
+                SELECT id, padre_id, nombre, identificador, activo,
+                       delegable_a_hijos, creado_en
                 FROM modulos
                 ORDER BY id ASC
             """)
@@ -44,13 +45,15 @@ class ModulosService:
                 raise Exception(f"El identificador '{datos['identificador']}' ya existe registrado.")
 
             sql = """
-                INSERT INTO modulos (padre_id, nombre, identificador, activo)
-                VALUES (%s, %s, %s, 1)
+            INSERT INTO modulos
+                (padre_id, nombre, identificador, activo, delegable_a_hijos)
+            VALUES (%s, %s, %s, 1, %s)
             """
             cur.execute(sql, (
                 datos.get('padre_id'),
                 datos['nombre'],
-                datos['identificador']
+                datos['identificador'],
+                1 if datos.get('delegable_a_hijos', True) else 0,
             ))
             modulo_id = cur.lastrowid
 
@@ -76,17 +79,22 @@ class ModulosService:
         conn = obtener_conexion()
         cur = conn.cursor()
         try:
-            sql = """
-                UPDATE modulos
-                SET nombre = %s, identificador = %s, padre_id = %s
-                WHERE id = %s
-            """
-            cur.execute(sql, (
+            campos = ["nombre = %s", "identificador = %s", "padre_id = %s"]
+            valores = [
                 datos['nombre'],
                 datos['identificador'],
                 datos.get('padre_id'),
-                modulo_id
-            ))
+            ]
+
+            if 'delegable_a_hijos' in datos:
+                campos.append("delegable_a_hijos = %s")
+                valores.append(1 if datos['delegable_a_hijos'] else 0)
+
+            valores.append(modulo_id)
+            cur.execute(
+                f"UPDATE modulos SET {', '.join(campos)} WHERE id = %s",
+                tuple(valores),
+            )
 
             # Actualizar acciones si vienen en la petición
             if 'acciones_ids' in datos:
@@ -132,6 +140,10 @@ class ModulosService:
             cur.execute("DELETE FROM modulo_acciones WHERE modulo_id = %s", (modulo_id,))
             cur.execute("DELETE FROM permisos_delegables WHERE modulo_id = %s", (modulo_id,))
             cur.execute("DELETE FROM usuario_permisos WHERE modulo_id = %s", (modulo_id,))
+            # Compatibilidad con la infraestructura paralela por módulo.
+            cur.execute("DELETE FROM permisos_delegables_modulos WHERE modulo_id = %s", (modulo_id,))
+            cur.execute("DELETE FROM usuario_modulos WHERE modulo_id = %s", (modulo_id,))
+            cur.execute("DELETE FROM modulos_roles_acceso WHERE modulo_id = %s", (modulo_id,))
             cur.execute("DELETE FROM modulos WHERE id = %s", (modulo_id,))
             conn.commit()
             return {"mensaje": "Módulo eliminado permanentemente."}

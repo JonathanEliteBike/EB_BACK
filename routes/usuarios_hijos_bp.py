@@ -1,7 +1,7 @@
 # routes/usuarios_hijos_bp.py
 
 from flask import Blueprint, request, jsonify, g
-from services.usuarios_hijos_service import UsuariosHijosService
+from services.usuarios_hijos_service import UsuariosHijosService, ErrorSecuenciaUsuario
 from utils.auth_decorators import requiere_autenticacion, requiere_rol
 
 usuarios_hijos_bp = Blueprint('usuarios_hijos', __name__, url_prefix='/api/usuarios-hijos')
@@ -43,7 +43,7 @@ def crear_hijo():
         data = request.get_json() or {}
         padre_id = g.usuario_actual['id']
 
-        campos_requeridos = ['nombre', 'correo', 'usuario', 'contrasena']
+        campos_requeridos = ['nombre', 'correo', 'contrasena']
         for campo in campos_requeridos:
             if not data.get(campo):
                 return jsonify({"error": f"El campo {campo} es obligatorio."}), 400
@@ -52,9 +52,23 @@ def crear_hijo():
         return jsonify(resultado), 201
 
     except ValueError as e:
-        return jsonify({"error": str(e)}), 400
+        return jsonify({"error": str(e)}), getattr(e, 'codigo_http', 400)
     except Exception:
         return jsonify({"error": "Error interno al crear el usuario hijo."}), 500
+
+
+@usuarios_hijos_bp.route('/siguiente-usuario', methods=['GET'])
+@requiere_autenticacion
+@requiere_rol(2)
+def siguiente_usuario_hijo():
+    """Previsualización no reservada; el POST siempre vuelve a calcularla."""
+    try:
+        padre_id = g.usuario_actual['id']
+        return jsonify({"usuario": UsuariosHijosService.siguiente_username_hijo(padre_id)}), 200
+    except ValueError as e:
+        return jsonify({"error": str(e)}), getattr(e, 'codigo_http', 400)
+    except Exception:
+        return jsonify({"error": "No fue posible calcular el siguiente usuario."}), 500
 
 
 @usuarios_hijos_bp.route('/<int:hijo_id>/contrasena', methods=['PUT'])

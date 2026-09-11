@@ -4,8 +4,13 @@ Forecast / Proyecciones B2B
 Gestión del forecast anual de compra por distribuidor.
 Periodo comercial: Mayo–Abril (e.g., "2026-2027")
 """
-from flask import Blueprint, jsonify, request, send_file
+from flask import Blueprint, jsonify, request, send_file, g
 from db_conexion import obtener_conexion
+from utils.auth_decorators import (
+    requiere_autenticacion,
+    requiere_modulo,
+)
+from services.politica_montos_service import PoliticaMontosService
 from services.forecast_excel_service import (
     load_excel_products,
     load_csv_apparel_products,
@@ -54,6 +59,25 @@ except Exception as _re:
 
 _avance_cache: dict   = {}   # key: (clave, periodo) → (timestamp, result_list)
 _forecast_cache: dict = {}   # key: (clave, periodo) → (timestamp, result_list)
+
+
+def _redactar_montos_forecast(rows):
+    """Devuelve una copia sin precios internos ni niveles comerciales."""
+    resultado = _json.loads(_json.dumps(rows, default=str))
+    for fila in resultado:
+        for campo in (
+            'precio', 'nivel_precio', 'precio_distribuidor', 'precio_partner',
+            'precio_partner_elite', 'precio_partner_elite_plus',
+            'ep_precio_publico',
+        ):
+            fila.pop(campo, None)
+    return resultado
+
+
+def _debe_ocultar_montos_forecast():
+    return PoliticaMontosService.debe_ocultar_montos(
+        g.usuario_actual['id'], 'proyeccion_compras'
+    )
 
 
 def _rkey_forecast(clave: str, periodo: str) -> str:
@@ -1610,6 +1634,8 @@ def _validate_periodo(periodo: str) -> bool:
 # ─────────────────────────────────────────────────────
 
 @forecast_bp.route('/forecast/template', methods=['GET'])
+@requiere_autenticacion
+@requiere_modulo('usuarios_proyeccion_compras')
 def descargar_template():
     """
     GET /forecast/template?clave=<clave_cliente>&periodo=<periodo>
@@ -1617,6 +1643,8 @@ def descargar_template():
     Columnas A-H bloqueadas. G1 = selector de nivel de distribuidor (desbloqueado).
     Cols I-T (meses) editables. Cols V-Y ocultas con los 4 precios por nivel.
     """
+    if _debe_ocultar_montos_forecast():
+        return jsonify({'error': 'No tienes autorizacion para descargar una plantilla con montos.'}), 403
     if not OPENPYXL_OK:
         return jsonify({'error': 'openpyxl no instalado en el servidor'}), 500
 
@@ -2011,12 +2039,16 @@ def descargar_template():
 
 
 @forecast_bp.route('/forecast/template-global', methods=['GET'])
+@requiere_autenticacion
+@requiere_modulo('usuarios_proyeccion_compras')
 def descargar_template_global():
     """
     GET /forecast/template-global
     Plantilla global sin cliente específico — el distribuidor ingresa su clave en B1.
     Todos los 92 SKUs del whitelist, mismo layout que template() pero portable.
     """
+    if _debe_ocultar_montos_forecast():
+        return jsonify({'error': 'No tienes autorizacion para descargar una plantilla con montos.'}), 403
     if not OPENPYXL_OK:
         return jsonify({'error': 'openpyxl no instalado en el servidor'}), 500
 
@@ -2378,12 +2410,16 @@ def descargar_template_global():
 
 
 @forecast_bp.route('/forecast/template-global-scott', methods=['GET'])
+@requiere_autenticacion
+@requiere_modulo('usuarios_proyeccion_compras')
 def descargar_template_global_scott():
     """
     GET /forecast/template-global-scott
     Plantilla global solo con las bicicletas Scott MY27 nuevas (52 SKUs),
     con disponibilidad por mes según fechas de llegada.
     """
+    if _debe_ocultar_montos_forecast():
+        return jsonify({'error': 'No tienes autorizacion para descargar una plantilla con montos.'}), 403
     if not OPENPYXL_OK:
         return jsonify({'error': 'openpyxl no instalado en el servidor'}), 500
 
@@ -3073,6 +3109,8 @@ def descargar_template_blank():
 
 
 @forecast_bp.route('/forecast/importar', methods=['POST'])
+@requiere_autenticacion
+@requiere_modulo('usuarios_proyeccion_compras')
 def importar_forecast():
     """
     POST /forecast/importar  (multipart/form-data)
@@ -3274,6 +3312,8 @@ def importar_forecast():
 
 
 @forecast_bp.route('/forecast', methods=['GET'])
+@requiere_autenticacion
+@requiere_modulo('usuarios_proyeccion_compras')
 def listar_forecast():
     """
     GET /forecast?clave=<clave_cliente>&periodo=<periodo>
@@ -3287,18 +3327,19 @@ def listar_forecast():
         return jsonify({'error': 'Faltan parámetros: clave, periodo'}), 400
 
     _update_whitelist_skus()
+    debe_ocultar_montos = _debe_ocultar_montos_forecast()
 
     # ── L1 (memoria) ──────────────────────────────────────────────────────────
     _fc_key = (clave, periodo)
     _fc_hit  = _forecast_cache.get(_fc_key)
     if _fc_hit and (_time.time() - _fc_hit[0]) < _FORECAST_TTL:
-        return jsonify(_fc_hit[1]), 200
+        return jsonify(_redactar_montos_forecast(_fc_hit[1]) if debe_ocultar_montos else _fc_hit[1]), 200
 
     # ── L2 (Redis) ────────────────────────────────────────────────────────────
     _r_hit = _redis_get(_rkey_forecast(clave, periodo))
     if _r_hit is not None:
         _forecast_cache[_fc_key] = (_time.time(), _r_hit)
-        return jsonify(_r_hit), 200
+        return jsonify(_redactar_montos_forecast(_r_hit) if debe_ocultar_montos else _r_hit), 200
 
     # MySQL nivel → TIER_NAMES key
     NIVEL_TO_TIER = {
@@ -3485,7 +3526,7 @@ def listar_forecast():
 
         _forecast_cache[_fc_key] = (_time.time(), rows)
         _redis_set(_rkey_forecast(clave, periodo), rows, _FORECAST_R_TTL)
-        return jsonify(rows), 200
+        return jsonify(_redactar_montos_forecast(rows) if debe_ocultar_montos else rows), 200
     except Exception as e:
         logging.exception('[forecast] listar_forecast error: %s', e)
         return jsonify({'error': str(e)}), 500
@@ -3495,6 +3536,8 @@ def listar_forecast():
 
 
 @forecast_bp.route('/forecast/precios-catalogo', methods=['GET'])
+@requiere_autenticacion
+@requiere_modulo('usuarios_proyeccion_compras')
 def precios_catalogo():
     """
     GET /forecast/precios-catalogo?clave=X
@@ -3503,6 +3546,7 @@ def precios_catalogo():
     Llamado al abrir el tab de proyecciones para hacer lookups instantáneos al agregar productos.
     """
     clave = request.args.get('clave', '').strip()
+    puede_ver_montos = not _debe_ocultar_montos_forecast()
 
     NIVEL_TO_TIER = {
         'Partner Elite Plus!': 'Partner Elite Plus!',
@@ -3533,7 +3577,10 @@ def precios_catalogo():
     nivel_precio = tier
 
     if not whitelist_skus:
-        return jsonify({'precios': {}, 'nivel_precio': nivel_precio}), 200
+        respuesta = {'precios': {}}
+        if puede_ver_montos:
+            respuesta['nivel_precio'] = nivel_precio
+        return jsonify(respuesta), 200
 
     # Precio público (lista 4) — un solo batch de Odoo para todos los SKUs
     try:
@@ -3544,8 +3591,9 @@ def precios_catalogo():
     except Exception as e:
         logging.warning('[precios-catalogo] precio_publico error: %s', e)
 
-    # Precio distribuidor — un solo batch de Odoo para todos los SKUs
-    try:
+    # Precio distribuidor — solo se consulta cuando el permiso lo autoriza.
+    if puede_ver_montos:
+      try:
         from utils.odoo_utils import get_odoo_models, ODOO_DB, ODOO_PASSWORD, ODOO_COMPANY_ID
         uid_pl, models_pl, _ = get_odoo_models()
         partner_pricelist_id   = None
@@ -3587,7 +3635,7 @@ def precios_catalogo():
                 if raw:
                     precios.setdefault(sku, {})['precio'] = round(raw * IVA_FACTOR, 2)
             nivel_precio = tier
-    except Exception as e:
+      except Exception as e:
         logging.warning('[precios-catalogo] precio distribuidor error: %s', e)
 
     # Incluir precios de productos apparel (forecast_excel_productos) segun tier
@@ -3611,7 +3659,7 @@ def precios_catalogo():
             ep_sku = ep_row['sku']
             if ep_sku not in precios:
                 precios[ep_sku] = {}
-            if ep_row.get('precio_dist'):
+            if puede_ver_montos and ep_row.get('precio_dist'):
                 precios[ep_sku]['precio'] = round(float(ep_row['precio_dist']) * IVA_FACTOR, 2)
             if ep_row.get('precio_publico'):
                 precios[ep_sku]['precio_publico'] = round(float(ep_row['precio_publico']) * IVA_FACTOR, 2)
@@ -3620,7 +3668,10 @@ def precios_catalogo():
     except Exception as _eep:
         logging.warning('[precios-catalogo] Excel apparel prices error: %s', _eep)
 
-    return jsonify({'precios': precios, 'nivel_precio': nivel_precio}), 200
+    respuesta = {'precios': precios}
+    if puede_ver_montos:
+        respuesta['nivel_precio'] = nivel_precio
+    return jsonify(respuesta), 200
 
 
 @forecast_bp.route('/forecast/distribuidores-precios', methods=['GET'])
@@ -3700,6 +3751,8 @@ def distribuidores_precios():
 
 
 @forecast_bp.route('/forecast/periodos', methods=['GET'])
+@requiere_autenticacion
+@requiere_modulo('usuarios_proyeccion_compras')
 def listar_periodos():
     """
     GET /forecast/periodos?clave=<clave_cliente>
@@ -3728,6 +3781,8 @@ def listar_periodos():
 
 
 @forecast_bp.route('/forecast/avance', methods=['GET'])
+@requiere_autenticacion
+@requiere_modulo('usuarios_proyeccion_compras')
 def avance_forecast():
     """
     GET /forecast/avance?clave=<clave_cliente>&periodo=<periodo>
@@ -3914,6 +3969,8 @@ def precalentar_forecast_route():
 
 
 @forecast_bp.route('/forecast/periodos/integral', methods=['GET'])
+@requiere_autenticacion
+@requiere_modulo('usuarios_proyeccion_compras')
 def listar_periodos_integral():
     """
     GET /forecast/periodos/integral?grupo_id=<id>
@@ -3944,6 +4001,8 @@ def listar_periodos_integral():
 
 
 @forecast_bp.route('/forecast/integral', methods=['GET'])
+@requiere_autenticacion
+@requiere_modulo('usuarios_proyeccion_compras')
 def listar_forecast_integral():
     """
     GET /forecast/integral?grupo_id=<id>&periodo=<periodo>
@@ -3955,6 +4014,7 @@ def listar_forecast_integral():
         return jsonify({'error': 'Faltan parámetros: grupo_id, periodo'}), 400
 
     _update_whitelist_skus()
+    debe_ocultar_montos = _debe_ocultar_montos_forecast()
 
     conn = obtener_conexion()
     cur = conn.cursor(dictionary=True)
@@ -4015,7 +4075,7 @@ def listar_forecast_integral():
             r['precio']       = round(p.get('Distribuidor', 0.0) * IVA_FACTOR, 2)
             r['nivel_precio'] = 'Grupo'
 
-        return jsonify(rows), 200
+        return jsonify(_redactar_montos_forecast(rows) if debe_ocultar_montos else rows), 200
     except Exception as e:
         logging.exception('[forecast/integral] error: %s', e)
         return jsonify({'error': str(e)}), 500
@@ -4025,6 +4085,8 @@ def listar_forecast_integral():
 
 
 @forecast_bp.route('/forecast/avance/integral', methods=['GET'])
+@requiere_autenticacion
+@requiere_modulo('usuarios_proyeccion_compras')
 def avance_forecast_integral():
     """
     GET /forecast/avance/integral?grupo_id=<id>&periodo=<periodo>
@@ -4264,6 +4326,8 @@ def debug_megamo_grupos():
 
 
 @forecast_bp.route('/forecast/<int:fid>', methods=['PUT'])
+@requiere_autenticacion
+@requiere_modulo('usuarios_proyeccion_compras')
 def actualizar_forecast(fid):
     """
     PUT /forecast/<id>
@@ -4490,6 +4554,8 @@ def _normalizar_talla(talla: str) -> str:
 
 
 @forecast_bp.route('/forecast/buscar-producto', methods=['GET'])
+@requiere_autenticacion
+@requiere_modulo('usuarios_proyeccion_compras')
 def buscar_producto():
     """
     GET /forecast/buscar-producto?q=<query>&offset=<int>
@@ -4861,6 +4927,8 @@ def buscar_producto():
 
 
 @forecast_bp.route('/forecast/<int:fid>', methods=['DELETE'])
+@requiere_autenticacion
+@requiere_modulo('usuarios_proyeccion_compras')
 def eliminar_forecast(fid):
     """DELETE /forecast/<id>"""
     conn = obtener_conexion()
@@ -4884,6 +4952,8 @@ def eliminar_forecast(fid):
 
 
 @forecast_bp.route('/forecast/guardar', methods=['POST'])
+@requiere_autenticacion
+@requiere_modulo('usuarios_proyeccion_compras')
 def guardar_forecast():
     """
     POST /forecast/guardar

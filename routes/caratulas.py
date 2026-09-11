@@ -1,5 +1,5 @@
 from __future__ import annotations
-from flask import Blueprint, jsonify, request, Response
+from flask import Blueprint, jsonify, request, Response, g
 from db_conexion import obtener_conexion
 from decimal import Decimal
 import json
@@ -11,6 +11,12 @@ from utils.odoo_utils import get_odoo_models, ODOO_DB, ODOO_PASSWORD
 from utils.temporada_utils import etiqueta_temporada
 import logging
 import traceback
+from copy import deepcopy
+from utils.auth_decorators import (
+    requiere_autenticacion,
+    requiere_modulo,
+)
+from services.politica_montos_service import PoliticaMontosService
 
 caratulas_bp = Blueprint('caratulas', __name__, url_prefix='')
 
@@ -27,6 +33,110 @@ except Exception as _re:
 
 
 _WARM_WORKERS = 4   # peticiones paralelas a Odoo (no subir de 5 para no saturar)
+
+
+def _contexto_cliente_autenticado(cursor):
+    """Obtiene el cliente real del portal para roles 2 y 3.
+
+    El cliente y su grupo son datos de la cuenta autenticada; nunca se toman
+    de los parámetros de consulta. El rol 1 conserva las consultas de
+    administración global.
+    """
+    usuario_id = g.usuario_actual["id"]
+    cursor.execute(
+        """
+        SELECT u.rol_id, c.id, c.clave, c.nombre_cliente, c.id_grupo
+        FROM usuarios u
+        LEFT JOIN clientes c ON c.id = u.cliente_id
+        WHERE u.id = %s AND u.activo = 1
+        """,
+        (usuario_id,),
+    )
+    contexto = cursor.fetchone()
+    if not contexto:
+        raise PermissionError("Usuario no encontrado o inactivo.")
+    if contexto["rol_id"] == 1:
+        return None
+    if contexto["rol_id"] not in (2, 3) or not contexto["id"] or not contexto["clave"]:
+        raise PermissionError("El usuario no tiene un cliente válido asignado.")
+    return contexto
+
+
+def _clave_resumen_contexto(contexto):
+    """Devuelve la clave segura de la carátula: grupo integral o cliente."""
+    if contexto and contexto.get("id_grupo"):
+        return f"Integral {contexto['id_grupo']}"
+    return contexto["clave"] if contexto else None
+
+
+def _redactar_montos_detalle_compras(resultado, filas, meta):
+    """Copia la respuesta sin montos internos para usuarios sin ``ver_montos``.
+
+    Redis conserva los datos completos; la redacción se aplica por respuesta,
+    después de recuperar o construir el dato bruto y antes de ``jsonify``.
+    """
+    resultado_limpio = deepcopy(resultado)
+    filas_limpias = deepcopy(filas)
+    meta_limpia = deepcopy(meta)
+
+    for pedido in resultado_limpio:
+        pedido.pop('monto_total', None)
+        for linea in pedido.get('lineas') or []:
+            linea.pop('precio_unitario', None)
+            linea.pop('total_linea', None)
+            linea.pop('total_entregado_linea', None)
+
+    for fila in filas_limpias:
+        fila.pop('precio_unitario', None)
+        fila.pop('total', None)
+        fila.pop('total_entregado', None)
+
+    meta_limpia.pop('avance_previo', None)
+    return resultado_limpio, filas_limpias, meta_limpia
+
+
+_CAMPOS_MONETARIOS_CARATULA = {
+    'compra_minima_anual', 'compra_minima_inicial', 'acumulado_anticipado',
+    'compromiso_scott', 'avance_global_scott',
+    'compromiso_apparel_syncros_vittoria', 'avance_global_apparel_syncros_vittoria',
+    'compromiso_jul_ago', 'avance_jul_ago',
+    'compromiso_sep_oct', 'avance_sep_oct',
+    'compromiso_nov_dic', 'avance_nov_dic',
+    'compromiso_ene_feb', 'avance_ene_feb',
+    'compromiso_mar_abr', 'avance_mar_abr',
+    'compromiso_may_jun', 'avance_may_jun',
+    'compromiso_jul_ago_app', 'avance_jul_ago_app',
+    'compromiso_sep_oct_app', 'avance_sep_oct_app',
+    'compromiso_nov_dic_app', 'avance_nov_dic_app',
+    'compromiso_ene_feb_app', 'avance_ene_feb_app',
+    'compromiso_mar_abr_app', 'avance_mar_abr_app',
+    'compromiso_may_jun_app', 'avance_may_jun_app',
+}
+
+
+def _redactar_montos_caratula(filas):
+    """Elimina importes de Carátula para un usuario hijo sin capacidad.
+
+    Los porcentajes se conservan porque no exponen los valores monetarios y la
+    pantalla puede seguir mostrando el avance sin recibir los montos brutos.
+    """
+    filas_limpias = deepcopy(filas)
+    for fila in filas_limpias:
+        for campo in _CAMPOS_MONETARIOS_CARATULA:
+            fila.pop(campo, None)
+    return filas_limpias
+
+
+def _debe_ocultar_montos_caratula():
+    return PoliticaMontosService.debe_ocultar_montos(
+        g.usuario_actual['id'], 'caratula_distribuidor'
+    )
+
+
+def _debe_ocultar_montos_detalle_compras():
+    return PoliticaMontosService.debe_ocultar_montos(
+        g.usuario_actual['id'], 'detalle_compras'
+    )
 
 
 def _precalentar_claves(claves: list[str], host: str = 'http://localhost:5000') -> None:
@@ -89,16 +199,22 @@ def precalentar_monitor():
 
 
 @caratulas_bp.route('/caratula_evac', methods=['GET'])
+@requiere_autenticacion
+@requiere_modulo('usuarios_caratula')
 def buscar_caratula_evac():
     try:
         clave = request.args.get('clave')
         nombre_cliente = request.args.get('nombre_cliente')
-        
-        if not clave and not nombre_cliente:
-            return jsonify({'error': 'Se requiere clave o nombre_cliente'}), 400
-
         conexion = obtener_conexion()
         cursor = conexion.cursor(dictionary=True)
+        contexto = _contexto_cliente_autenticado(cursor)
+        if contexto:
+            # Roles de portal: ignorar cualquier clave o nombre manipulados.
+            clave = _clave_resumen_contexto(contexto)
+            nombre_cliente = None
+
+        if not clave and not nombre_cliente:
+            return jsonify({'error': 'Se requiere clave o nombre_cliente'}), 400
         
         nombre_a_buscar = nombre_cliente
         columna_a_buscar = "nombre_cliente" # Por defecto buscamos en nombre_cliente
@@ -162,9 +278,14 @@ def buscar_caratula_evac():
             for key, value in fila.items():
                 if isinstance(value, Decimal):
                     fila[key] = float(value)
+
+        if _debe_ocultar_montos_caratula():
+            resultados = _redactar_montos_caratula(resultados)
         
         return jsonify(resultados), 200
 
+    except PermissionError as e:
+        return jsonify({'error': str(e)}), 403
     except Exception as e:
         logging.exception("Error en buscar_caratula_evac")
         return jsonify({'error': 'Error al procesar la solicitud'}), 500
@@ -476,6 +597,8 @@ def obtener_datos_previo():
             conexion.close()
 
 @caratulas_bp.route('/temporadas_disponibles', methods=['GET'])
+@requiere_autenticacion
+@requiere_modulo('usuarios_caratula')
 def temporadas_disponibles():
     """Devuelve las temporadas (ej. '2025-2026') que tienen snapshots guardados
     en cualquiera de las tablas de histórico, para poblar un selector en el frontend.
@@ -511,6 +634,8 @@ def temporadas_disponibles():
 
 
 @caratulas_bp.route('/datos_previo_historico', methods=['GET'])
+@requiere_autenticacion
+@requiere_modulo('usuarios_caratula')
 def obtener_datos_previo_historico():
     """Histórico de la tabla `previo`. Filtra por ?temporada=2025-2026 (opcional).
     Si no se especifica temporada, devuelve todos los snapshots guardados.
@@ -519,13 +644,28 @@ def obtener_datos_previo_historico():
     try:
         conexion = obtener_conexion()
         with conexion.cursor(dictionary=True) as cursor:
+            contexto = _contexto_cliente_autenticado(cursor)
+            if contexto and contexto.get('id_grupo'):
+                filtro_cliente = "(grupo_integral = %s AND es_integral = 1)"
+                parametros_cliente = (contexto['id_grupo'],)
+            elif contexto:
+                filtro_cliente = "LOWER(clave) = LOWER(%s)"
+                parametros_cliente = (contexto['clave'],)
+            else:
+                filtro_cliente = "1 = 1"
+                parametros_cliente = ()
+
             if temporada:
                 cursor.execute(
-                    "SELECT * FROM previo_historico WHERE temporada = %s ORDER BY fecha_snapshot DESC",
-                    (temporada,)
+                    f"SELECT * FROM previo_historico WHERE temporada = %s AND {filtro_cliente} "
+                    "ORDER BY fecha_snapshot DESC",
+                    (temporada, *parametros_cliente)
                 )
             else:
-                cursor.execute("SELECT * FROM previo_historico ORDER BY fecha_snapshot DESC")
+                cursor.execute(
+                    f"SELECT * FROM previo_historico WHERE {filtro_cliente} ORDER BY fecha_snapshot DESC",
+                    parametros_cliente,
+                )
             resultados = cursor.fetchall()
             for fila in resultados:
                 for key, value in fila.items():
@@ -533,7 +673,11 @@ def obtener_datos_previo_historico():
                         fila[key] = float(value)
                     elif hasattr(value, 'strftime'):
                         fila[key] = value.strftime('%Y-%m-%d')
+            if _debe_ocultar_montos_caratula():
+                resultados = _redactar_montos_caratula(resultados)
         return jsonify(resultados), 200
+    except PermissionError as e:
+        return jsonify({'error': str(e)}), 403
     except Exception as e:
         logging.exception("Error en obtener_datos_previo_historico")
         return jsonify({'error': str(e)}), 500
@@ -826,6 +970,8 @@ def debug_caratula_global_otros():
             conexion.close()
 
 @caratulas_bp.route('/generar-pdf', methods=['POST'])
+@requiere_autenticacion
+@requiere_modulo('usuarios_caratula')
 def generar_caratula_pdf():
     """
     Endpoint para generar un PDF de la carátula en el servidor y devolverlo.
@@ -834,10 +980,34 @@ def generar_caratula_pdf():
     cursor = conexion.cursor(dictionary=True)
     
     try:
+        contexto = _contexto_cliente_autenticado(cursor)
+        if _debe_ocultar_montos_caratula():
+            return jsonify({"error": "No tienes autorización para exportar la carátula con montos."}), 403
         # 1. Obtener los datos del cliente enviados desde Angular
         data = request.get_json()
         if not data or 'datos_caratula' not in data:
             return jsonify({"error": "No se proporcionaron datos de la carátula"}), 400
+
+        if contexto:
+            clave_recibida = str(data.get('datos_caratula', {}).get('clave') or '').strip().lower()
+            if contexto.get('id_grupo'):
+                # La clave visible del grupo puede ser "Integral N" con un N
+                # distinto al id técnico de grupo_clientes. Se valida contra
+                # la fila real que pertenece al grupo autenticado.
+                cursor.execute(
+                    """
+                    SELECT 1 FROM previo
+                    WHERE grupo_integral = %s AND es_integral = 1
+                      AND LOWER(clave) = %s
+                    LIMIT 1
+                    """,
+                    (contexto['id_grupo'], clave_recibida),
+                )
+                clave_valida = cursor.fetchone() is not None
+            else:
+                clave_valida = clave_recibida == contexto['clave'].strip().lower()
+            if not clave_valida:
+                return jsonify({"error": "No puedes exportar la carátula de otro cliente."}), 403
 
         # 2. Reutilizar la lógica para crear el HTML del PDF
         # La función crear_cuerpo_email devuelve un dict con 'html_caratula_pdf'
@@ -869,6 +1039,8 @@ def generar_caratula_pdf():
             headers={"Content-Disposition": f"attachment;filename={filename}"}
         )
 
+    except PermissionError as e:
+            return jsonify({"error": str(e)}), 403
     except Exception as e:
             logging.exception("Error al generar PDF")
             return jsonify({"error": f"Error interno al generar el PDF: {str(e)}"}), 500
@@ -879,18 +1051,20 @@ def generar_caratula_pdf():
             conexion.close()
     
 @caratulas_bp.route('/verificar_grupo_cliente', methods=['GET'])
+@requiere_autenticacion
+@requiere_modulo('usuarios_caratula')
 def verificar_grupo_cliente():
     """
     Verifica si un cliente, basado en su clave, pertenece a un grupo.
     Si pertenece, devuelve el ID y el nombre del grupo.
     """
-    clave = request.args.get('clave')
-    if not clave:
-        return jsonify({'error': 'Se requiere la clave del cliente'}), 400
-
     try:
         conexion = obtener_conexion()
         cursor = conexion.cursor(dictionary=True)
+        contexto = _contexto_cliente_autenticado(cursor)
+        clave = contexto['clave'] if contexto else request.args.get('clave')
+        if not clave:
+            return jsonify({'error': 'Se requiere la clave del cliente'}), 400
         
         query = """
             SELECT
@@ -914,6 +1088,8 @@ def verificar_grupo_cliente():
             # El cliente no pertenece a ningún grupo.
             return jsonify({'tiene_grupo': False})
 
+    except PermissionError as e:
+        return jsonify({'error': str(e)}), 403
     except Exception as e:
         return jsonify({'error': str(e)}), 500
     finally:
@@ -950,6 +1126,8 @@ def debug_odoo():
 
 
 @caratulas_bp.route('/detalle-compras-odoo', methods=['GET'])
+@requiere_autenticacion
+@requiere_modulo('usuarios_caratula')
 def detalle_compras_odoo():
     """
     Devuelve el historial completo de órdenes de venta de un cliente desde Odoo.
@@ -970,6 +1148,33 @@ def detalle_compras_odoo():
     # se acotan las órdenes al rango fijo de esa temporada en vez del f_inicio
     # actual del cliente (que ya se reseteó a la temporada abierta).
     temporada_param = request.args.get('temporada')
+
+    # Los usuarios de portal sólo pueden consultar su propio cliente o su
+    # grupo integral. Los parámetros cliente/grupo son sólo funcionales para
+    # administración (rol 1).
+    _conexion_contexto = None
+    _cursor_contexto = None
+    try:
+        _conexion_contexto = obtener_conexion()
+        _cursor_contexto = _conexion_contexto.cursor(dictionary=True)
+        contexto = _contexto_cliente_autenticado(_cursor_contexto)
+        if contexto:
+            if grupo_odoo:
+                if not contexto.get('id_grupo'):
+                    return jsonify({'error': 'Tu cuenta no pertenece a un grupo integral.'}), 403
+                grupo_odoo = str(contexto['id_grupo'])
+                cliente = None
+            else:
+                cliente = contexto['clave']
+                grupo_odoo = None
+                ref_exacta = True
+    except PermissionError as e:
+        return jsonify({'error': str(e)}), 403
+    finally:
+        if _cursor_contexto:
+            _cursor_contexto.close()
+        if _conexion_contexto and _conexion_contexto.is_connected():
+            _conexion_contexto.close()
     try:
         _limit_raw = request.args.get('limit')
         limit = int(_limit_raw) if _limit_raw is not None else None
@@ -985,10 +1190,15 @@ def detalle_compras_odoo():
     if not cliente and not grupo_odoo:
         return jsonify({'error': 'Se requiere parámetro cliente o grupo'}), 400
 
+    # "Mostrar montos" se administra como capacidad delegable, no como la
+    # acción heredada usuarios_caratula/ver_montos.
+    debe_ocultar_montos = _debe_ocultar_montos_detalle_compras()
+
     # ── Caché Redis (5 min TTL) ───────────────────────────────────────────────
     # La clave NO incluye limit/offset/estado: esos parámetros se aplican
     # en caliente sobre los datos cacheados, evitando entradas duplicadas por página.
-    _cache_key = f"monitor_pedidos:{cliente or ''}:{int(bool(ref_exacta))}:{grupo_odoo or ''}:{temporada_param or ''}"
+    # v2 invalida entradas creadas antes del respaldo de subtotal monetario.
+    _cache_key = f"monitor_pedidos:v2:{cliente or ''}:{int(bool(ref_exacta))}:{grupo_odoo or ''}:{temporada_param or ''}"
     if _redis and force_refresh:
         try:
             _redis.delete(_cache_key)
@@ -1006,6 +1216,10 @@ def detalle_compras_odoo():
                     _redis.delete(_cache_key)
                     logging.info('Cache obsoleto (sin etiquetas), forzando reconsulta: %s', _cache_key)
                 else:
+                    if debe_ocultar_montos:
+                        _c_resultado, _c_filas, _c_meta_base = _redactar_montos_detalle_compras(
+                            _c_resultado, _c_filas, _c_meta_base
+                        )
                     _c_filas_fil = [f for f in _c_filas if f.get('estatus_out') == estado_filtro] if estado_filtro else _c_filas
                     _c_total = len(_c_filas_fil)
                     _c_pag = _c_filas_fil[offset: offset + limit] if limit is not None else _c_filas_fil[offset:]
@@ -1893,13 +2107,19 @@ def detalle_compras_odoo():
                 if cantidad == 0:
                     continue
                 qty_entregada = float(l.get('qty_delivered') or 0)
-                # Usar price_total de Odoo (incluye el IVA real de cada producto)
-                # evitando el multiplicador fijo 1.16 que no aplica a todos los productos.
+                # Usar price_total de Odoo (incluye el IVA real de cada producto).
+                # Algunas líneas históricas no exponen ese campo aunque sí entregan
+                # price_subtotal; en ese caso aplicamos el mismo respaldo que ya
+                # utilizaba este endpoint para evitar convertir un importe real en 0.
                 price_total_odoo = float(l.get('price_total') or 0)
                 if price_total_odoo <= 0 and cantidad > 0:
-                    # Fallback al cálculo manual si Odoo no devuelve price_total
+                    subtotal_odoo = float(l.get('price_subtotal') or 0)
                     descuento = float(l.get('discount') or 0)
-                    price_total_odoo = round(float(l.get('price_unit') or 0) * (1 - descuento / 100) * 1.16 * cantidad, 2)
+                    precio_unitario = float(l.get('price_unit') or 0)
+                    if subtotal_odoo > 0:
+                        price_total_odoo = round(subtotal_odoo * 1.16, 2)
+                    elif precio_unitario > 0:
+                        price_total_odoo = round(precio_unitario * (1 - descuento / 100) * 1.16 * cantidad, 2)
                 precio = round(price_total_odoo / cantidad, 4) if cantidad > 0 else 0
                 total_entregado_linea = round((qty_entregada / cantidad) * price_total_odoo, 2) if cantidad > 0 else 0
                 order_obj['lineas'].append({
@@ -2085,6 +2305,11 @@ def detalle_compras_odoo():
             except Exception as _ce:
                 logging.warning('Redis cache store error: %s', _ce)
 
+        if debe_ocultar_montos:
+            resultado, filas_planas, _meta_base = _redactar_montos_detalle_compras(
+                resultado, filas_planas, _meta_base
+            )
+
         # ── Filtro opcional por estado de picking
         filas_fil = [f for f in filas_planas if f.get('estatus_out') == estado_filtro] if estado_filtro else filas_planas
         total = len(filas_fil)
@@ -2096,13 +2321,11 @@ def detalle_compras_odoo():
             'data': resultado,
             'rows': filas_pag,
             'meta': {
+                **_meta_base,
                 'total': total,
                 'limit': limit,
                 'offset': offset,
                 'returned': len(filas_pag),
-                'fecha_inicio_temporada': fecha_inicio_temporada,
-                'avance_previo': avance_previo,
-                'temporada': temporada_param,
             },
             'cliente': {
                 'nombre_cliente': _nombre_partner,

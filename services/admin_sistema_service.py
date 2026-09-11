@@ -104,7 +104,9 @@ class AdminSistemaService:
                 FROM modulo_acciones ma
                 INNER JOIN modulos m ON m.id = ma.modulo_id AND m.activo = 1
                 INNER JOIN acciones a ON a.id = ma.accion_id AND a.activo = 1
-                WHERE ma.modulo_id = %s AND ma.accion_id = %s
+                WHERE ma.modulo_id = %s
+                  AND ma.accion_id = %s
+                  AND m.delegable_a_hijos = 1
             """, (modulo_id, accion_id))
             if not cur.fetchone():
                 raise ValueError("La acción no está disponible para el módulo seleccionado.")
