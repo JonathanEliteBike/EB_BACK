@@ -205,6 +205,26 @@ def requiere_modulo(modulo_identificador):
     return decorator
 
 
+def requiere_modulos(*modulos_identificador):
+    """Exige acceso efectivo a todos los módulos indicados.
+
+    Se utiliza cuando una pantalla hija depende de su área padre. No altera
+    las asignaciones existentes: una asignación hija puede permanecer guardada
+    aunque el acceso padre sea retirado, pero no resulta utilizable hasta que
+    ambos módulos vuelvan a estar habilitados.
+    """
+    def decorator(f):
+        @wraps(f)
+        def decorated_function(*args, **kwargs):
+            for modulo_identificador in modulos_identificador:
+                permitido, error = usuario_actual_tiene_modulo(modulo_identificador)
+                if not permitido:
+                    return error
+            return f(*args, **kwargs)
+        return decorated_function
+    return decorator
+
+
 def usuario_actual_tiene_capacidad(capacidad):
     """Comprueba una capacidad global sin conceder acceso a módulos.
 

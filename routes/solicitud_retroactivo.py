@@ -10,7 +10,7 @@ from services.s3_service import generar_url_firmada_s3, subir_archivo_s3
 from services import solicitud_retroactivo_service as data
 from utils.jwt_utils import verificar_token
 from utils.auditoria_utils import verificar_codigo_auditoria
-from utils.auth_decorators import requiere_autenticacion, requiere_modulo, requiere_rol
+from utils.auth_decorators import requiere_autenticacion, requiere_modulos, requiere_rol
 from services.politica_montos_service import PoliticaMontosService
 
 solicitud_retroactivo_bp = Blueprint('solicitud-retroactivo', __name__)
@@ -141,7 +141,7 @@ def _calcular_estatus(validacion_docs, tiene_factura_xml=False):
 
 @solicitud_retroactivo_bp.route('/api/solicitud-retroactivo/registrar/venta', methods=['POST'])
 @requiere_autenticacion
-@requiere_modulo('usuarios_caratula_retroactivos')
+@requiere_modulos('usuarios_retroactivos', 'usuarios_solicitudes_retroactivos')
 def registrar_venta():
     # 1. Recuperar los campos del formulario
     campos_obligatorios = [
@@ -314,7 +314,7 @@ def registrar_venta():
 
 @solicitud_retroactivo_bp.route('/api/solicitud-retroactivo/msi', methods=['GET'])
 @requiere_autenticacion
-@requiere_modulo('usuarios_caratula_retroactivos')
+@requiere_modulos('usuarios_retroactivos', 'usuarios_solicitudes_retroactivos')
 def buscar_msi():
     conexion = obtener_conexion()
     if not conexion:
@@ -335,7 +335,7 @@ def buscar_msi():
 
 @solicitud_retroactivo_bp.route('/api/solicitud-retroactivo/marca', methods=['GET'])
 @requiere_autenticacion
-@requiere_modulo('usuarios_caratula_retroactivos')
+@requiere_modulos('usuarios_retroactivos', 'usuarios_solicitudes_retroactivos')
 def buscar_marca():
     conexion = obtener_conexion()
     if not conexion:
@@ -356,7 +356,7 @@ def buscar_marca():
 
 @solicitud_retroactivo_bp.route('/api/solicitud-retroactivo/formulario', methods=['GET'])
 @requiere_autenticacion
-@requiere_modulo('usuarios_caratula_retroactivos')
+@requiere_modulos('usuarios_retroactivos', 'usuarios_solicitudes_retroactivos')
 def buscar_formulario():
     """GUÍA: antes leía del catálogo viejo (solicitud_retroactivo_formulario,
     solo 2 filas fijas vía SP). Ahora regresa las campañas del módulo de
@@ -382,7 +382,7 @@ def buscar_formulario():
 
 @solicitud_retroactivo_bp.route('/api/solicitud-retroactivo/campania/<int:id_campania>/msi', methods=['GET'])
 @requiere_autenticacion
-@requiere_modulo('usuarios_caratula_retroactivos')
+@requiere_modulos('usuarios_retroactivos', 'usuarios_solicitudes_retroactivos')
 def msi_por_campania(id_campania):
     """Plazos MSI ligados a una campaña, cada uno con SU % propio -- el
     formulario de venta los carga en cuanto el usuario elige la campaña."""
@@ -406,7 +406,7 @@ def msi_por_campania(id_campania):
 
 @solicitud_retroactivo_bp.route('/api/solicitud-retroactivo/campania/<int:id_campania>/productos', methods=['GET'])
 @requiere_autenticacion
-@requiere_modulo('usuarios_caratula_retroactivos')
+@requiere_modulos('usuarios_retroactivos', 'usuarios_solicitudes_retroactivos')
 def productos_por_campania(id_campania):
     """Productos ligados a una campaña -- el formulario de venta los carga en
     cuanto el usuario elige la campaña, para que "Modelo" solo ofrezca lo que
@@ -431,7 +431,7 @@ def productos_por_campania(id_campania):
 
 @solicitud_retroactivo_bp.route('/api/solicitud-retroactivo/campania/<int:id_campania>/marcas', methods=['GET'])
 @requiere_autenticacion
-@requiere_modulo('usuarios_caratula_retroactivos')
+@requiere_modulos('usuarios_retroactivos', 'usuarios_solicitudes_retroactivos')
 def marcas_por_campania(id_campania):
     """Marcas distintas entre los productos de una campaña -- el selector de
     "Marca" solo se activa en el formulario de venta si hay 2 o más."""
@@ -455,7 +455,7 @@ def marcas_por_campania(id_campania):
 
 @solicitud_retroactivo_bp.route('/api/solicitud-retroactivo/razones-sociales', methods=['GET'])
 @requiere_autenticacion
-@requiere_modulo('usuarios_caratula_retroactivos')
+@requiere_modulos('usuarios_retroactivos', 'usuarios_solicitudes_retroactivos')
 def buscar_razones_sociales():
     conexion = obtener_conexion()
     if not conexion:
@@ -482,7 +482,7 @@ def buscar_razones_sociales():
 
 @solicitud_retroactivo_bp.route('/api/solicitud-retroactivo/tiendas/<int:cliente_id>', methods=['GET'])
 @requiere_autenticacion
-@requiere_modulo('usuarios_caratula_retroactivos')
+@requiere_modulos('usuarios_retroactivos', 'usuarios_solicitudes_retroactivos')
 def buscar_tiendas(cliente_id):
     conexion = obtener_conexion()
     if not conexion:
@@ -866,7 +866,7 @@ def corregir_precio(id_venta):
 
 @solicitud_retroactivo_bp.route('/api/solicitud-retroactivo/mis-solicitudes', methods=['GET'])
 @requiere_autenticacion
-@requiere_modulo('usuarios_caratula_retroactivos')
+@requiere_modulos('usuarios_retroactivos', 'usuarios_solicitudes_retroactivos')
 def mis_solicitudes():
     conexion = obtener_conexion()
     if not conexion:
@@ -913,7 +913,7 @@ def mis_solicitudes():
 
 @solicitud_retroactivo_bp.route('/api/solicitud-retroactivo/venta/<int:id_venta>', methods=['PUT'])
 @requiere_autenticacion
-@requiere_modulo('usuarios_caratula_retroactivos')
+@requiere_modulos('usuarios_retroactivos', 'usuarios_solicitudes_retroactivos')
 def editar_venta(id_venta):
     campos_obligatorios = [
         'id_formulario', 'id_msi', 'nombre_sucursal',

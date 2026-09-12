@@ -17,6 +17,7 @@ from utils.jwt_utils import verificar_token
 from utils.auth_decorators import (
     requiere_autenticacion,
     requiere_modulo,
+    requiere_modulos,
     requiere_rol,
 )
 from services.politica_montos_service import PoliticaMontosService
@@ -3357,9 +3358,17 @@ def cerrar_retroactivos_temporada_endpoint():
         return jsonify({'error': str(e)}), 500
 
 
+@retroactivos_bp.route('/api/retroactivos/calculadora/acceso', methods=['GET'])
+@requiere_autenticacion
+@requiere_modulos('usuarios_retroactivos', 'usuarios_calculadora_retroactivos')
+def verificar_acceso_calculadora_retroactivos():
+    """Verificación de servidor para la calculadora, que hoy es local en Angular."""
+    return jsonify({'acceso': True}), 200
+
+
 @retroactivos_bp.route('/retroactivos_temporadas_disponibles', methods=['GET'])
 @requiere_autenticacion
-@requiere_modulo('usuarios_caratula_retroactivos')
+@requiere_modulo('usuarios_retroactivos')
 def retroactivos_temporadas_disponibles():
     """Temporadas con snapshot en tabla_retroactivos_historico.
 
@@ -3385,7 +3394,7 @@ def retroactivos_temporadas_disponibles():
 
 @retroactivos_bp.route('/retroactivos_historico', methods=['GET'])
 @requiere_autenticacion
-@requiere_modulo('usuarios_caratula_retroactivos')
+@requiere_modulo('usuarios_retroactivos')
 def retroactivos_historico():
     temporada = request.args.get('temporada')
     if not temporada:
@@ -3731,7 +3740,7 @@ def cerrar_temporada_masiva_pendientes_endpoint():
 # ==============================================================================
 @retroactivos_bp.route('/retroactivo_cliente/<string:identificador>', methods=['GET'])
 @requiere_autenticacion
-@requiere_modulo('usuarios_caratula_retroactivos')
+@requiere_modulo('usuarios_retroactivos')
 def obtener_retroactivo_individual(identificador):
 
     conexion = obtener_conexion()
