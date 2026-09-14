@@ -12,13 +12,12 @@ SET @retroactivos_id := (
     SELECT id FROM modulos WHERE identificador = 'usuarios_retroactivos' LIMIT 1
 );
 
--- La Carátula conserva su id y queda organizada bajo Retroactivos, pero no
--- forma parte de la bolsa delegable: el acceso a esa vista lo representa el
--- módulo padre Retroactivos.
+-- La Carátula conserva su id, queda organizada bajo Retroactivos y puede
+-- delegarse explícitamente como cualquier otro acceso disponible del área.
 UPDATE modulos
 SET padre_id = @retroactivos_id,
     activo = 1,
-    delegable_a_hijos = 0
+    delegable_a_hijos = 1
 WHERE identificador = 'usuarios_caratula_retroactivos';
 
 INSERT INTO modulos (padre_id, nombre, identificador, activo, delegable_a_hijos)
