@@ -47,7 +47,10 @@ _PRIORIDAD_MAP: dict = {clave.strip().upper(): (prio, nombre)
                         for prio, clave, nombre in PRIORIDAD_CLIENTES}
 
 _ORDENES_CACHE: dict = {'data': {}, 'periodo': '', 'ts': 0.0}
-_ORDENES_TTL = 180  # 3 minutos
+# La consulta a Odoo (ordenes + partners + lineas + productos) tarda ~8s; con un
+# solo proceso Flask (sin gunicorn/workers) una cache en memoria ya es compartida
+# por todos los requests, así que basta con alargar el TTL en vez de Redis.
+_ORDENES_TTL = 600  # 10 minutos
 
 
 def _norm_sku(s: str) -> str:
