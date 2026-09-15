@@ -283,6 +283,15 @@ def movimientos_ruta(importacion_id):
     return jsonify({"ok": True, "data": data}), 200
 
 
+@asignaciones_bp.route("/<int:importacion_id>/asignaciones/reservas", methods=["GET"])
+@token_required
+@_requiere_rol_importaciones
+def reservas_embarque_ruta(importacion_id):
+    clave_cliente = request.args.get("clave_cliente")
+    data = svc.listar_reservas_embarque(importacion_id, clave_cliente=clave_cliente)
+    return jsonify({"ok": True, "data": data}), 200
+
+
 # ── Vistas consolidadas (dashboard) ───────────────────────────────────────────
 # Rutas estáticas: "asignaciones" nunca calza con <int:importacion_id>.
 
