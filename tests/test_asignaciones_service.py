@@ -15,7 +15,6 @@ from services.asignaciones_service import cancelar_venta
 from services.asignaciones_service import cancelar_asignacion
 from services.asignaciones_service import resolver_reserva
 from services.asignaciones_service import obtener_detalle_producto, resumen_embarque, listar_movimientos
-from services.asignaciones_service import listar_reservas_embarque
 from services.asignaciones_service import resumen_global, listar_productos_global
 from services.asignaciones_service import (
     _columna_a_fecha, _fecha_a_columna, _meses_en_ventana, _meses_reasignables,
@@ -1203,46 +1202,6 @@ def test_listar_movimientos_devuelve_los_del_embarque(mocker):
 
     assert len(resultado) == 1
     assert resultado[0]["tipo_movimiento"] == "ENTRADA"
-
-
-def test_listar_reservas_embarque_importacion_no_existe(mocker):
-    cursor = MagicMock()
-    cursor.fetchone.return_value = None
-    _mock_conn(mocker, cursor)
-
-    with pytest.raises(AsignacionesError) as exc:
-        listar_reservas_embarque(999)
-    assert exc.value.code == "IMPORTACION_NO_EXISTE"
-
-
-def test_listar_reservas_embarque_formatea_mes_y_filtra_por_cliente(mocker):
-    cursor = MagicMock()
-    cursor.fetchone.return_value = {"id": 1}
-    cursor.fetchall.return_value = [
-        {"id": 5, "clave_cliente": "LC657", "mes_objetivo": _dt.date(2026, 12, 1),
-         "cantidad_asignada": 3, "sku": "SKU-1", "descripcion": "Bici", "periodo": "2026-2027"},
-    ]
-    _mock_conn(mocker, cursor)
-
-    resultado = listar_reservas_embarque(1, clave_cliente="lc657")
-
-    assert resultado[0]["mes_objetivo"] == "2026-12"
-    executed_sql = cursor.execute.call_args_list[-1][0][0]
-    executed_params = cursor.execute.call_args_list[-1][0][1]
-    assert "a.clave_cliente = %s" in executed_sql
-    assert executed_params[-1] == "LC657"
-
-
-def test_listar_reservas_embarque_sin_filtro_no_agrega_clausula_cliente(mocker):
-    cursor = MagicMock()
-    cursor.fetchone.return_value = {"id": 1}
-    cursor.fetchall.return_value = []
-    _mock_conn(mocker, cursor)
-
-    listar_reservas_embarque(1)
-
-    executed_sql = cursor.execute.call_args_list[-1][0][0]
-    assert "a.clave_cliente = %s" not in executed_sql
 
 
 def test_caso_10_embarcadas_8_proyectadas_deja_2_sobrantes(mocker):

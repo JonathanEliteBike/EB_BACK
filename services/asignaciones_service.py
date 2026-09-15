@@ -1428,40 +1428,6 @@ def obtener_detalle_producto(producto_id: int, importacion_id: int = None) -> di
     }
 
 
-def listar_reservas_embarque(importacion_id: int, clave_cliente: str = None) -> list:
-    """Todas las reservas del embarque (de todos sus productos), opcionalmente
-    filtradas por cliente. Alimenta el buscador "¿qué le reservé a este
-    cliente en este contenedor?" del frontend."""
-    conn = obtener_conexion()
-    if not conn:
-        raise AsignacionesError("DB_NO_DISPONIBLE", "Sin conexión a BD", 500)
-    try:
-        cursor = conn.cursor(dictionary=True)
-        cursor.execute("SELECT id FROM importaciones WHERE id = %s", (importacion_id,))
-        if not cursor.fetchone():
-            raise AsignacionesError("IMPORTACION_NO_EXISTE", "El embarque no existe", 404)
-
-        sql = (
-            "SELECT a.*, p.sku, p.descripcion, p.periodo "
-            "FROM importacion_asignaciones a "
-            "JOIN importacion_productos p ON p.id = a.importacion_producto_id "
-            "WHERE p.importacion_id = %s"
-        )
-        params = [importacion_id]
-        if clave_cliente:
-            sql += " AND a.clave_cliente = %s"
-            params.append(clave_cliente.strip().upper())
-        sql += " ORDER BY a.mes_objetivo, p.sku"
-        cursor.execute(sql, params)
-        reservas = cursor.fetchall()
-    finally:
-        conn.close()
-
-    for r in reservas:
-        r["mes_objetivo"] = _fecha_a_ym(r["mes_objetivo"]) if r.get("mes_objetivo") else None
-    return reservas
-
-
 def resumen_embarque(importacion_id: int) -> dict:
     conn = obtener_conexion()
     if not conn:
