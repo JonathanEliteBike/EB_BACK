@@ -61,6 +61,22 @@ def inicializar_tablas():
         conn.close()
 
 
+@asignaciones_bp.route("/asignaciones/periodos", methods=["GET"])
+@token_required
+@_requiere_rol_importaciones
+def listar_periodos_activos_ruta():
+    data = svc.listar_periodos_activos()
+    return jsonify({"ok": True, "data": data}), 200
+
+
+@asignaciones_bp.route("/asignaciones/periodos/siguiente", methods=["POST"])
+@token_required
+@_requiere_rol_importaciones
+def crear_siguiente_periodo_ruta():
+    data = svc.crear_siguiente_periodo_activo()
+    return jsonify({"ok": True, "data": data}), 201
+
+
 @asignaciones_bp.route("/<int:importacion_id>/asignaciones/productos", methods=["GET"])
 @token_required
 @_requiere_rol_importaciones

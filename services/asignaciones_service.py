@@ -105,6 +105,12 @@ TABLAS_SQL = [
       KEY idx_mov_cliente (clave_cliente)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci
     """,
+    """
+    CREATE TABLE IF NOT EXISTS asignaciones_periodos_activos (
+      periodo     VARCHAR(20) NOT NULL PRIMARY KEY,
+      created_at  DATETIME DEFAULT CURRENT_TIMESTAMP
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci
+    """,
 ]
 
 
@@ -140,6 +146,65 @@ def _split_periodo(periodo: str):
     if not m:
         raise AsignacionesError("PERIODO_INVALIDO", f"Periodo con formato inválido: {periodo!r}", 400)
     return int(m.group(1)), int(m.group(2))
+
+
+def _periodo_por_defecto() -> str:
+    """Periodo 'YYYY-YYYY' vigente hoy según la convención mayo→abril
+    (igual que MESES_ORDEN): si estamos en mayo-diciembre, el periodo arrancó
+    este año; si estamos en enero-abril, arrancó el año anterior."""
+    import datetime as _dt
+    hoy = _dt.date.today()
+    y1 = hoy.year if hoy.month >= 5 else hoy.year - 1
+    return f"{y1}-{y1 + 1}"
+
+
+def listar_periodos_activos() -> list:
+    """Periodos disponibles para elegir al dar de alta/importar productos.
+    Antes se calculaban en el frontend (año actual -1..+2), lo que mostraba
+    hasta 4 periodos seleccionables aunque solo uno estuviera realmente en
+    uso; ahora es una lista explícita que crece solo cuando se decide abrir
+    el siguiente periodo (spec: 'nos podemos adelantar a traer para el
+    siguiente periodo, pero debe ser una decisión explícita')."""
+    conn = obtener_conexion()
+    if not conn:
+        raise AsignacionesError("DB_NO_DISPONIBLE", "Sin conexión a BD", 500)
+    try:
+        cursor = conn.cursor(dictionary=True)
+        cursor.execute("SELECT periodo FROM asignaciones_periodos_activos ORDER BY periodo")
+        rows = cursor.fetchall()
+        if not rows:
+            periodo = _periodo_por_defecto()
+            cursor.execute(
+                "INSERT IGNORE INTO asignaciones_periodos_activos (periodo) VALUES (%s)", (periodo,)
+            )
+            conn.commit()
+            return [periodo]
+        return [r["periodo"] for r in rows]
+    finally:
+        conn.close()
+
+
+def crear_siguiente_periodo_activo() -> list:
+    """Agrega a la lista el periodo cronológicamente siguiente al más reciente
+    ya activo (p. ej. si hay 2026-2027, agrega 2027-2028). No quita los
+    anteriores: pueden seguir llegando embarques rezagados del periodo viejo
+    mientras ya arrancó el nuevo."""
+    activos = listar_periodos_activos()
+    y1, y2 = _split_periodo(max(activos))
+    siguiente = f"{y1 + 1}-{y2 + 1}"
+
+    conn = obtener_conexion()
+    if not conn:
+        raise AsignacionesError("DB_NO_DISPONIBLE", "Sin conexión a BD", 500)
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            "INSERT IGNORE INTO asignaciones_periodos_activos (periodo) VALUES (%s)", (siguiente,)
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    return listar_periodos_activos()
 
 
 def _columna_a_fecha(periodo: str, columna: str):

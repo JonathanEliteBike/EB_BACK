@@ -20,6 +20,7 @@ from services.asignaciones_service import (
     _columna_a_fecha, _fecha_a_columna, _meses_en_ventana, _meses_reasignables,
     _split_periodo, _migrar_esquema_reservas, MESES_ORDEN,
 )
+from services.asignaciones_service import listar_periodos_activos, crear_siguiente_periodo_activo
 from services.proyecciones_service import demanda_neta_por_cliente_mensual
 from db_conexion import obtener_conexion
 import datetime as _dt
@@ -1202,6 +1203,45 @@ def test_listar_movimientos_devuelve_los_del_embarque(mocker):
 
     assert len(resultado) == 1
     assert resultado[0]["tipo_movimiento"] == "ENTRADA"
+
+
+def test_listar_periodos_activos_devuelve_los_existentes_ordenados(mocker):
+    cursor = MagicMock()
+    cursor.fetchall.return_value = [{"periodo": "2025-2026"}, {"periodo": "2026-2027"}]
+    _mock_conn(mocker, cursor)
+
+    assert listar_periodos_activos() == ["2025-2026", "2026-2027"]
+    insert_calls = [c for c in cursor.execute.call_args_list if "INSERT" in c[0][0]]
+    assert not insert_calls
+
+
+def test_listar_periodos_activos_siembra_el_periodo_por_defecto_si_esta_vacia(mocker):
+    cursor = MagicMock()
+    cursor.fetchall.return_value = []
+    _mock_conn(mocker, cursor)
+
+    resultado = listar_periodos_activos()
+
+    assert len(resultado) == 1
+    y1, y2 = _split_periodo(resultado[0])
+    assert y2 == y1 + 1
+    insert_calls = [c for c in cursor.execute.call_args_list if "INSERT" in c[0][0]]
+    assert insert_calls and insert_calls[0][0][1] == (resultado[0],)
+
+
+def test_crear_siguiente_periodo_activo_agrega_el_cronologicamente_siguiente(mocker):
+    cursor = MagicMock()
+    cursor.fetchall.side_effect = [
+        [{"periodo": "2025-2026"}, {"periodo": "2026-2027"}],
+        [{"periodo": "2025-2026"}, {"periodo": "2026-2027"}, {"periodo": "2027-2028"}],
+    ]
+    _mock_conn(mocker, cursor)
+
+    resultado = crear_siguiente_periodo_activo()
+
+    insert_calls = [c for c in cursor.execute.call_args_list if "INSERT" in c[0][0]]
+    assert insert_calls[0][0][1] == ("2027-2028",)
+    assert resultado == ["2025-2026", "2026-2027", "2027-2028"]
 
 
 def test_caso_10_embarcadas_8_proyectadas_deja_2_sobrantes(mocker):
