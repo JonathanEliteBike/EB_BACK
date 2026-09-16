@@ -46,6 +46,18 @@ PRIORIDAD_CLIENTES = [
 _PRIORIDAD_MAP: dict = {clave.strip().upper(): (prio, nombre)
                         for prio, clave, nombre in PRIORIDAD_CLIENTES}
 
+# Vendedor de Odoo (res.users id) responsable de cada distribuidor. Se usa para
+# asignar el `user_id` y la actividad de seguimiento en las órdenes de venta que
+# el módulo de Asignaciones crea automáticamente al reservar (ver reservar_en_odoo).
+VENDEDOR_POR_CLIENTE: dict = {
+    'LC657': 18, 'MC677': 18, 'MC679': 17, 'GC411': 17, 'HE420': 17,
+    'EC216': 18, 'JC539': 18, 'MD670': 17, 'GD380': 17, 'HA433': 18,
+    'ID506': 18, '4E013': 17, 'JE537': 17, 'LC625': 18, 'LC626': 18,
+    'LC627': 18, '84920': 18, 'MD697': 18, 'EA219': 17, 'HF427': 18,
+    'FA271': 18, 'AG873': 17, 'LD664': 18, '5GEG6': 17, 'IA500': 18,
+    'DC192': 17, 'JC554': 18, 'FA318': 17,
+}
+
 _ORDENES_CACHE: dict = {'data': {}, 'periodo': '', 'ts': 0.0}
 # La consulta a Odoo (ordenes + partners + lineas + productos) tarda ~8s; con un
 # solo proceso Flask (sin gunicorn/workers) una cache en memoria ya es compartida
@@ -307,4 +319,163 @@ def demanda_neta_por_cliente_mensual(periodo: str, skus_norm: list) -> dict:
                     neto_mes[m] = neta
             if neto_mes:
                 resultado[sku_n][clave] = neto_mes
+    return resultado
+
+
+# ── Reserva automática en Odoo (sale.order) al confirmar una reserva ──────────
+
+class OdooReservaError(Exception):
+    """Falló crear/completar la orden de venta en Odoo. El caller (Asignaciones)
+    decide qué hacer -- hoy: revertir la reserva local (todo o nada por línea)."""
+
+
+_MES_NUM_A_ABREV = {
+    1: 'ENE', 2: 'FEB', 3: 'MAR', 4: 'ABR', 5: 'MAY', 6: 'JUN',
+    7: 'JUL', 8: 'AGO', 9: 'SEP', 10: 'OCT', 11: 'NOV', 12: 'DIC',
+}
+
+
+def _mes_abreviado_desde_ym(mes_ym: str) -> str:
+    """'2026-10' -> 'OCT'. Lanza ValueError si el formato no calza."""
+    m = re.match(r'^\d{4}-(\d{1,2})$', str(mes_ym or ''))
+    if not m or int(m.group(1)) not in _MES_NUM_A_ABREV:
+        raise ValueError(f"mes_objetivo inválido para Odoo: {mes_ym!r}")
+    return _MES_NUM_A_ABREV[int(m.group(1))]
+
+
+def _crear_actividad_revisar_reserva(models, uid, order_id: int, vendedor_id: int) -> None:
+    """Actividad 'To-Do' en la orden, asignada al vendedor. Best-effort: si falla
+    no tumba la reserva -- lo importante es que la orden de venta exista."""
+    try:
+        _mod, activity_type_id = models.execute_kw(
+            ODOO_DB, uid, ODOO_PASSWORD,
+            'ir.model.data', 'check_object_reference', ['mail', 'mail_activity_data_todo'],
+        )
+        models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD,
+            'mail.activity', 'create', [{
+                'res_model':        'sale.order',
+                'res_id':           order_id,
+                'activity_type_id': activity_type_id,
+                'user_id':          vendedor_id,
+                'summary':          'Revisar reserva de proyección',
+            }])
+    except Exception:
+        logging.exception('[reservar_en_odoo] no se pudo crear la actividad en la orden %s', order_id)
+
+
+def reservar_en_odoo(clave_cliente: str, mes_ym: str, lineas: list) -> dict:
+    """Crea o completa (find-or-append) la orden de venta MY27 de `clave_cliente`
+    para el mes `mes_ym` ('YYYY-MM'), agregando `lineas` ([{sku, cantidad}]) como
+    order_line.
+
+    Si ya existe una orden en estado 'draft' de ese partner con la etiqueta del
+    mes (p. ej. 'MY27 OCT'), le agrega/incrementa las líneas en vez de crear una
+    nueva -- así una reserva de varios SKU hecha en llamadas separadas (una por
+    producto, ver services/asignaciones_service.py:_persistir_reservas) termina
+    en UNA sola orden por (cliente, mes), no una por SKU.
+
+    Asigna vendedor según VENDEDOR_POR_CLIENTE y crea la actividad de
+    seguimiento la primera vez que se crea la orden (no en cada append).
+
+    Lanza OdooReservaError si algo falla -- el caller (Asignaciones) revierte la
+    reserva local: la orden de venta es la fuente de verdad de que la reserva ya
+    "cuenta" de verdad para el equipo de ventas."""
+    clave = (clave_cliente or '').strip().upper()
+    try:
+        mes_abrev = _mes_abreviado_desde_ym(mes_ym)
+    except ValueError as e:
+        raise OdooReservaError(str(e))
+    tag_label = f'MY27 {mes_abrev}'
+
+    try:
+        uid, models, err = get_odoo_models()
+        if not uid:
+            raise OdooReservaError(f'No se pudo conectar a Odoo: {err}')
+
+        partners = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD,
+            'res.partner', 'search_read',
+            [[['ref', '=', clave]]], {'fields': ['id', 'name'], 'limit': 1})
+        if not partners:
+            raise OdooReservaError(f'No se encontró contacto en Odoo con ref={clave}')
+        partner_id = partners[0]['id']
+
+        skus = [(l.get('sku') or '').strip() for l in lineas]
+        prods = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD,
+            'product.product', 'search_read',
+            [[['default_code', 'in', skus]]],
+            {'fields': ['id', 'default_code', 'lst_price'], 'limit': 0})
+        sku_to_prod = {(p.get('default_code') or '').strip(): p for p in prods}
+        no_encontrados = sorted({s for s in skus if s not in sku_to_prod})
+        if no_encontrados:
+            raise OdooReservaError(f'SKU no encontrados en el catálogo de Odoo: {", ".join(no_encontrados)}')
+
+        existing_tags = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD,
+            'crm.tag', 'search_read',
+            [[['name', '=', tag_label]]], {'fields': ['id'], 'limit': 1})
+        tag_id = (existing_tags[0]['id'] if existing_tags else
+                  models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD,
+                      'crm.tag', 'create', [{'name': tag_label}]))
+
+        vendedor_id = VENDEDOR_POR_CLIENTE.get(clave)
+
+        ordenes = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD,
+            'sale.order', 'search_read',
+            [[['partner_id', '=', partner_id], ['tag_ids', 'in', [tag_id]], ['state', '=', 'draft']]],
+            {'fields': ['id', 'name', 'order_line'], 'limit': 1})
+
+        if ordenes:
+            order_id, order_name = ordenes[0]['id'], ordenes[0]['name']
+            lineas_actuales = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD,
+                'sale.order.line', 'read', [ordenes[0]['order_line']],
+                {'fields': ['id', 'product_id', 'product_uom_qty']}) if ordenes[0]['order_line'] else []
+            linea_por_producto = {l['product_id'][0]: l for l in lineas_actuales}
+
+            order_line_cmds = []
+            for l in lineas:
+                sku = (l.get('sku') or '').strip()
+                cantidad = int(l.get('cantidad') or 0)
+                prod = sku_to_prod[sku]
+                existente = linea_por_producto.get(prod['id'])
+                if existente:
+                    order_line_cmds.append((1, existente['id'],
+                        {'product_uom_qty': existente['product_uom_qty'] + cantidad}))
+                else:
+                    order_line_cmds.append((0, 0, {
+                        'product_id': prod['id'], 'product_uom_qty': cantidad,
+                        'price_unit': float(prod.get('lst_price') or 0),
+                    }))
+            models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD,
+                'sale.order', 'write', [[order_id], {'order_line': order_line_cmds}])
+        else:
+            order_line_cmds = [
+                (0, 0, {
+                    'product_id':      sku_to_prod[(l.get('sku') or '').strip()]['id'],
+                    'product_uom_qty': int(l.get('cantidad') or 0),
+                    'price_unit':      float(sku_to_prod[(l.get('sku') or '').strip()].get('lst_price') or 0),
+                })
+                for l in lineas
+            ]
+            order_vals = {
+                'partner_id': partner_id,
+                'tag_ids':    [(4, tag_id)],
+                'note':       f'RESERVA MY27 — {mes_abrev} — {clave}',
+                'order_line': order_line_cmds,
+            }
+            if vendedor_id:
+                order_vals['user_id'] = vendedor_id
+            order_id = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD,
+                'sale.order', 'create', [order_vals])
+            order_name = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD,
+                'sale.order', 'read', [[order_id]], {'fields': ['name']})[0]['name']
+
+            if vendedor_id:
+                _crear_actividad_revisar_reserva(models, uid, order_id, vendedor_id)
+
+        return {'order_id': order_id, 'order_name': order_name}
+
+    except OdooReservaError:
+        raise
+    except Exception as e:
+        logging.exception('[reservar_en_odoo] error creando/actualizando orden para %s/%s', clave, mes_ym)
+        raise OdooReservaError(str(e))
     return resultado

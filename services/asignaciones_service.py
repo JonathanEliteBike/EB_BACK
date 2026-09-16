@@ -116,6 +116,7 @@ TABLAS_SQL = [
 
 from services.proyecciones_service import (
     _norm_sku, demanda_neta_por_cliente, demanda_neta_por_cliente_mensual, _PRIORIDAD_MAP,
+    reservar_en_odoo, OdooReservaError,
 )
 
 # ── Meses del periodo MY27 (mismo orden cronológico que forecast_proyecciones) ──
@@ -772,7 +773,7 @@ def _persistir_reservas(producto_id: int, reservas: list, *, origen: str, estado
     try:
         cursor = conn.cursor(dictionary=True)
         cursor.execute(
-            "SELECT id, importacion_id, periodo, sku_norm FROM importacion_productos "
+            "SELECT id, importacion_id, periodo, sku, sku_norm FROM importacion_productos "
             "WHERE id = %s FOR UPDATE",
             (producto_id,),
         )
@@ -840,6 +841,25 @@ def _persistir_reservas(producto_id: int, reservas: list, *, origen: str, estado
                 usuario_id=usuario_id,
                 metadata={"mes_objetivo": _fecha_a_ym(mes_fecha)} if mes_fecha else None,
             )
+
+        # Reserva en Odoo (todo o nada por línea): si falla, se revierte la
+        # reserva local -- la orden de venta es la fuente de verdad de que la
+        # reserva ya "cuenta" de verdad para ventas. Se agrupa por (cliente, mes)
+        # porque varios items de esta llamada pueden compartir cliente y mes.
+        # Sin mes_objetivo no hay forma de etiquetar la orden (MY27 <MES>), así
+        # que esos items quedan solo en la BD local, como antes de esta función.
+        grupos_odoo: dict = {}
+        for item in reservas:
+            if item["_mes_fecha"] is None:
+                continue
+            clave = item["clave_cliente"].strip().upper()
+            key = (clave, item["_mes_fecha"])
+            grupos_odoo[key] = grupos_odoo.get(key, 0) + item["cantidad"]
+        for (clave, mes_fecha), cantidad_total in grupos_odoo.items():
+            try:
+                reservar_en_odoo(clave, _fecha_a_ym(mes_fecha), [{"sku": producto["sku"], "cantidad": cantidad_total}])
+            except OdooReservaError as e:
+                raise AsignacionesError("ODOO_ERROR", f"No se pudo reservar en Odoo: {e}", 502)
 
         conn.commit()
         return {"producto_id": producto_id, "disponible_restante": disponible - total_solicitado}

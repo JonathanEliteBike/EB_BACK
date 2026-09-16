@@ -1,9 +1,21 @@
 # tests/test_asignaciones_routes.py
+import pytest
 from flask import Flask
 
 from db_conexion import obtener_conexion
 from utils.jwt_utils import generar_token
 from routes.asignaciones_importaciones import asignaciones_bp
+
+
+@pytest.fixture(autouse=True)
+def _mock_reservar_en_odoo(mocker):
+    """Estas pruebas usan la BD local real, pero NUNCA deben crear ordenes de
+    verdad en Odoo (produccion). Se simula siempre en exito salvo que una
+    prueba puntual lo sobreescriba para probar el camino de error/rollback."""
+    return mocker.patch(
+        "services.asignaciones_service.reservar_en_odoo",
+        return_value={"order_id": 1, "order_name": "S00000-TEST"},
+    )
 
 
 def _cliente_test():

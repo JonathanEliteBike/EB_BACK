@@ -21,7 +21,7 @@ from services.asignaciones_service import (
     _split_periodo, _migrar_esquema_reservas, MESES_ORDEN,
 )
 from services.asignaciones_service import listar_periodos_activos, crear_siguiente_periodo_activo
-from services.proyecciones_service import demanda_neta_por_cliente_mensual
+from services.proyecciones_service import demanda_neta_por_cliente_mensual, OdooReservaError
 from db_conexion import obtener_conexion
 import datetime as _dt
 
@@ -31,6 +31,18 @@ def _mock_conn(mocker, cursor):
     conn.cursor.return_value = cursor
     mocker.patch("services.asignaciones_service.obtener_conexion", return_value=conn)
     return conn
+
+
+@pytest.fixture(autouse=True)
+def _mock_reservar_en_odoo(mocker):
+    """_persistir_reservas ahora crea/completa una orden de venta en Odoo por
+    cada reserva. Estas pruebas usan un cursor MagicMock (no hay Odoo real que
+    llamar ni tiene sentido hacerlo en unitarias); se simula siempre en éxito
+    salvo que una prueba puntual lo sobreescriba para probar el camino de error."""
+    return mocker.patch(
+        "services.asignaciones_service.reservar_en_odoo",
+        return_value={"order_id": 1, "order_name": "S00000-TEST"},
+    )
 
 
 def _recalc_setup(mocker, *, producto, demanda_mensual, disponible, vigentes_rows=None):
@@ -386,7 +398,7 @@ def test_reasignacion_exige_ventana_desde():
 def test_confirmar_reasignacion_crea_fila_pendiente_y_movimiento_reasignacion(mocker):
     cursor = MagicMock()
     cursor.fetchone.side_effect = [
-        {"id": 10, "importacion_id": 1, "periodo": "2026-2027", "sku_norm": "SKU1"},
+        {"id": 10, "importacion_id": 1, "periodo": "2026-2027", "sku": "SKU-1", "sku_norm": "SKU1"},
         {"clave": "LC657"},   # cliente existe
         None,                 # no hay reserva REASIGNACION previa
     ]
@@ -562,6 +574,89 @@ def test_asignar_a_cliente_ya_asignado_suma_en_lugar_de_duplicar(mocker):
     assert len(updates) == 1
     inserts = [c for c in cursor.execute.call_args_list if "INSERT INTO importacion_asignaciones" in c.args[0]]
     assert len(inserts) == 0
+
+
+def test_asignar_sin_mes_objetivo_no_llama_a_odoo(mocker):
+    cursor = MagicMock()
+    cursor.fetchone.side_effect = [{"id": 10}, {"clave": "LC657"}, None]
+    _mock_conn(mocker, cursor)
+    mocker.patch("services.asignaciones_service._disponible_producto", return_value=10)
+    odoo_mock = mocker.patch(
+        "services.asignaciones_service.reservar_en_odoo",
+        return_value={"order_id": 1, "order_name": "S00001"},
+    )
+
+    asignar(10, [{"clave_cliente": "LC657", "cantidad": 3}])  # sin mes_objetivo
+
+    odoo_mock.assert_not_called()
+
+
+def test_asignar_agrupa_items_del_mismo_cliente_y_mes_en_una_sola_llamada_a_odoo(mocker):
+    cursor = MagicMock()
+    cursor.fetchone.side_effect = [
+        {"id": 10, "importacion_id": 1, "periodo": "2026-2027", "sku": "SKU-1", "sku_norm": "SKU1"},
+        {"clave": "LC657"}, {"clave": "LC657"},  # cliente existe, item 1 y 2
+        None, None,                              # sin asignación previa, item 1 y 2
+    ]
+    _mock_conn(mocker, cursor)
+    mocker.patch("services.asignaciones_service._disponible_producto", return_value=10)
+    odoo_mock = mocker.patch(
+        "services.asignaciones_service.reservar_en_odoo",
+        return_value={"order_id": 1, "order_name": "S00001"},
+    )
+
+    asignar(10, [
+        {"clave_cliente": "LC657", "mes_objetivo": "2026-10", "cantidad": 3},
+        {"clave_cliente": "LC657", "mes_objetivo": "2026-10", "cantidad": 2},
+    ])
+
+    odoo_mock.assert_called_once_with("LC657", "2026-10", [{"sku": "SKU-1", "cantidad": 5}])
+
+
+def test_asignar_llama_a_odoo_una_vez_por_cada_cliente_y_mes_distinto(mocker):
+    cursor = MagicMock()
+    cursor.fetchone.side_effect = [
+        {"id": 10, "importacion_id": 1, "periodo": "2026-2027", "sku": "SKU-1", "sku_norm": "SKU1"},
+        {"clave": "LC657"}, {"clave": "MC677"},  # cliente existe, item 1 y 2
+        None, None,                              # sin asignación previa, item 1 y 2
+    ]
+    _mock_conn(mocker, cursor)
+    mocker.patch("services.asignaciones_service._disponible_producto", return_value=10)
+    odoo_mock = mocker.patch(
+        "services.asignaciones_service.reservar_en_odoo",
+        return_value={"order_id": 1, "order_name": "S00001"},
+    )
+
+    asignar(10, [
+        {"clave_cliente": "LC657", "mes_objetivo": "2026-10", "cantidad": 3},
+        {"clave_cliente": "MC677", "mes_objetivo": "2026-11", "cantidad": 2},
+    ])
+
+    assert odoo_mock.call_count == 2
+    llamadas = {(c.args[0], c.args[1]): c.args[2] for c in odoo_mock.call_args_list}
+    assert llamadas[("LC657", "2026-10")] == [{"sku": "SKU-1", "cantidad": 3}]
+    assert llamadas[("MC677", "2026-11")] == [{"sku": "SKU-1", "cantidad": 2}]
+
+
+def test_asignar_revierte_todo_si_falla_la_reserva_en_odoo(mocker):
+    cursor = MagicMock()
+    cursor.fetchone.side_effect = [
+        {"id": 10, "importacion_id": 1, "periodo": "2026-2027", "sku": "SKU-1", "sku_norm": "SKU1"},
+        {"clave": "LC657"}, None,
+    ]
+    conn = _mock_conn(mocker, cursor)
+    mocker.patch("services.asignaciones_service._disponible_producto", return_value=10)
+    mocker.patch(
+        "services.asignaciones_service.reservar_en_odoo",
+        side_effect=OdooReservaError("no se encontró el contacto"),
+    )
+
+    with pytest.raises(AsignacionesError) as exc:
+        asignar(10, [{"clave_cliente": "LC657", "mes_objetivo": "2026-10", "cantidad": 3}])
+
+    assert exc.value.code == "ODOO_ERROR"
+    conn.rollback.assert_called_once()
+    conn.commit.assert_not_called()
 
 
 def test_venta_sobrante_rechaza_cantidad_invalida():
