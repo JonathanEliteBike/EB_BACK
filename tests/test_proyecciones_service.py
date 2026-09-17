@@ -114,6 +114,7 @@ def test_reservar_en_odoo_crea_orden_nueva_con_vendedor_y_actividad(mocker):
         [],                                                  # sale.order search_read (no hay orden abierta)
         3001,                                                # sale.order create -> order_id
         [{"name": "S00042"}],                               # sale.order read -> name
+        [733],                                               # ir.model search -> id de sale.order
         ("mail.activity.type", 5),                          # ir.model.data check_object_reference
         9001,                                                # mail.activity create
     ]
@@ -130,6 +131,9 @@ def test_reservar_en_odoo_crea_orden_nueva_con_vendedor_y_actividad(mocker):
     activity_call = [c for c in models.execute_kw.call_args_list if c.args[3] == "mail.activity"][0]
     assert activity_call.args[5][0]["summary"] == "Revisar reserva de proyección"
     assert activity_call.args[5][0]["user_id"] == 18
+    # res_model_id (no res_model) es el campo obligatorio que espera mail.activity
+    assert activity_call.args[5][0]["res_model_id"] == 733
+    assert "res_model" not in activity_call.args[5][0]
 
 
 def test_reservar_en_odoo_agrega_lineas_a_orden_en_borrador_existente_sin_crear_otra(mocker):

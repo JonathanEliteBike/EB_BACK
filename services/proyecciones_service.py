@@ -345,19 +345,27 @@ def _mes_abreviado_desde_ym(mes_ym: str) -> str:
 
 def _crear_actividad_revisar_reserva(models, uid, order_id: int, vendedor_id: int) -> None:
     """Actividad 'To-Do' en la orden, asignada al vendedor. Best-effort: si falla
-    no tumba la reserva -- lo importante es que la orden de venta exista."""
+    no tumba la reserva -- lo importante es que la orden de venta exista.
+
+    `mail.activity.res_model_id` (Many2one a ir.model) es el campo obligatorio;
+    `res_model` es un related/store derivado de ahí y Odoo lo ignora si se manda
+    solo. Sin res_model_id, create() falla con 'campo obligatorio no definido'."""
     try:
+        modelo_ids = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD,
+            'ir.model', 'search', [[['model', '=', 'sale.order']]], {'limit': 1})
+        if not modelo_ids:
+            raise RuntimeError("No se encontró ir.model para 'sale.order'")
         _mod, activity_type_id = models.execute_kw(
             ODOO_DB, uid, ODOO_PASSWORD,
             'ir.model.data', 'check_object_reference', ['mail', 'mail_activity_data_todo'],
         )
         models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD,
             'mail.activity', 'create', [{
-                'res_model':        'sale.order',
-                'res_id':           order_id,
-                'activity_type_id': activity_type_id,
-                'user_id':          vendedor_id,
-                'summary':          'Revisar reserva de proyección',
+                'res_model_id':      modelo_ids[0],
+                'res_id':            order_id,
+                'activity_type_id':  activity_type_id,
+                'user_id':           vendedor_id,
+                'summary':           'Revisar reserva de proyección',
             }])
     except Exception:
         logging.exception('[reservar_en_odoo] no se pudo crear la actividad en la orden %s', order_id)
@@ -478,4 +486,3 @@ def reservar_en_odoo(clave_cliente: str, mes_ym: str, lineas: list) -> dict:
     except Exception as e:
         logging.exception('[reservar_en_odoo] error creando/actualizando orden para %s/%s', clave, mes_ym)
         raise OdooReservaError(str(e))
-    return resultado
