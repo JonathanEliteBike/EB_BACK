@@ -361,6 +361,13 @@ def _migrar_esquema_reservas(cursor) -> list:
         )
         aplicados.append("movimientos enum +RESERVA/REASIGNACION/RECHAZO_RESERVA")
 
+    if not _col_existe(T, "odoo_order_id"):
+        cursor.execute(f"ALTER TABLE {T} ADD COLUMN odoo_order_id INT NULL AFTER confirmada_por")
+        aplicados.append("add odoo_order_id")
+    if not _col_existe(T, "odoo_order_name"):
+        cursor.execute(f"ALTER TABLE {T} ADD COLUMN odoo_order_name VARCHAR(32) NULL AFTER odoo_order_id")
+        aplicados.append("add odoo_order_name")
+
     return aplicados
 
 
@@ -865,6 +872,14 @@ def _persistir_reservas(producto_id: int, reservas: list, *, origen: str, estado
                 "clave_cliente": clave, "mes_objetivo": _fecha_a_ym(mes_fecha),
                 "order_id": orden["order_id"], "order_name": orden["order_name"],
             })
+            # Se guarda en la reserva local para poder monitorearla después
+            # (tarjetas de KPI -> detalle de reservas) sin volver a llamar a Odoo.
+            cursor.execute(
+                "UPDATE importacion_asignaciones SET odoo_order_id = %s, odoo_order_name = %s "
+                f"WHERE importacion_producto_id = %s AND clave_cliente = %s "
+                f"AND (mes_objetivo <=> %s) AND origen = '{origen}'",
+                (orden["order_id"], orden["order_name"], producto_id, clave, mes_fecha),
+            )
 
         conn.commit()
         return {
@@ -1791,6 +1806,43 @@ def listar_productos_global(filtros: dict = None, limite: int = 200, offset: int
         "limite": limite,
         "offset": offset,
     }
+
+
+def listar_reservas_embarque(importacion_id: int, estado: str = None) -> list:
+    """Todas las reservas del embarque (de todos sus productos), con el SKU/
+    descripción y la orden de Odoo que se tocó -- para las tarjetas de KPI
+    interactivas (clic en "Reservadas" -> quién tiene qué y con qué orden dar
+    seguimiento en Odoo). Opcionalmente filtrado por estado."""
+    conn = obtener_conexion()
+    if not conn:
+        raise AsignacionesError("DB_NO_DISPONIBLE", "Sin conexión a BD", 500)
+    try:
+        cursor = conn.cursor(dictionary=True)
+        cursor.execute("SELECT id FROM importaciones WHERE id = %s", (importacion_id,))
+        if not cursor.fetchone():
+            raise AsignacionesError("IMPORTACION_NO_EXISTE", "El embarque no existe", 404)
+
+        sql = (
+            "SELECT a.id, a.importacion_producto_id, a.clave_cliente, a.mes_objetivo, "
+            "a.origen, a.estado, a.cantidad_asignada, a.odoo_order_id, a.odoo_order_name, "
+            "a.confirmada_at, p.sku, p.descripcion, p.periodo "
+            "FROM importacion_asignaciones a "
+            "JOIN importacion_productos p ON p.id = a.importacion_producto_id "
+            "WHERE p.importacion_id = %s"
+        )
+        params = [importacion_id]
+        if estado:
+            sql += " AND a.estado = %s"
+            params.append(estado)
+        sql += " ORDER BY a.mes_objetivo, p.sku"
+        cursor.execute(sql, params)
+        reservas = cursor.fetchall()
+    finally:
+        conn.close()
+
+    for r in reservas:
+        r["mes_objetivo"] = _fecha_a_ym(r["mes_objetivo"]) if r.get("mes_objetivo") else None
+    return reservas
 
 
 def listar_movimientos(importacion_id: int) -> list:
