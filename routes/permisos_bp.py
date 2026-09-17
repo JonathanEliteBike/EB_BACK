@@ -217,6 +217,8 @@ def revocar_modulo_hijo():
         if not all([hijo_id, modulo_id]):
             return jsonify({"error": "hijo_id y modulo_id son requeridos."}), 400
         return jsonify(PermisosModulosService.revocar_modulo_hijo(g.usuario_actual['id'], hijo_id, modulo_id)), 200
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
     except PermissionError as e:
         return jsonify({"error": str(e)}), 403
 

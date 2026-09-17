@@ -33,7 +33,7 @@ class PermisosModulosService:
     def _validar_modulo_delegable(cur, modulo_id):
         cur.execute(
             """
-            SELECT 1 FROM modulos
+            SELECT padre_id, nombre FROM modulos
             WHERE id = %s
               AND activo = 1
               AND delegable_a_hijos = 1
@@ -41,8 +41,10 @@ class PermisosModulosService:
             """,
             (modulo_id,),
         )
-        if not cur.fetchone():
+        modulo = cur.fetchone()
+        if not modulo:
             raise PermissionError("El módulo seleccionado no puede delegarse a usuarios hijo.")
+        return modulo
 
     @staticmethod
     def _validar_capacidad(capacidad):
@@ -51,6 +53,7 @@ class PermisosModulosService:
 
     @staticmethod
     def _listar_modulos(cur, tabla, usuario_id):
+        columna_usuario = "administrador_id" if tabla == "permisos_delegables_modulos" else "usuario_id"
         cur.execute(
             f"""
             SELECT m.id AS modulo_id, m.nombre AS modulo, m.identificador,
@@ -58,9 +61,13 @@ class PermisosModulosService:
             FROM {tabla} pm
             INNER JOIN modulos m ON m.id = pm.modulo_id AND m.activo = 1
             LEFT JOIN modulos p ON p.id = m.padre_id
-            WHERE pm.{"administrador_id" if tabla == "permisos_delegables_modulos" else "usuario_id"} = %s
+            LEFT JOIN {tabla} permiso_padre
+                ON permiso_padre.{columna_usuario} = pm.{columna_usuario}
+                AND permiso_padre.modulo_id = m.padre_id
+            WHERE pm.{columna_usuario} = %s
               AND m.delegable_a_hijos = 1
               AND m.identificador NOT IN ('creacion_usuarios_dis', 'usuarios_hijos')
+              AND (m.padre_id IS NULL OR permiso_padre.modulo_id IS NOT NULL)
             ORDER BY m.nombre
             """,
             (usuario_id,),
@@ -97,12 +104,17 @@ class PermisosModulosService:
                     ON pdm.modulo_id = um.modulo_id AND pdm.administrador_id = %s
                 INNER JOIN modulos m ON m.id = um.modulo_id AND m.activo = 1
                 LEFT JOIN modulos p ON p.id = m.padre_id
+                LEFT JOIN permisos_delegables_modulos pdm_padre
+                    ON pdm_padre.administrador_id = %s AND pdm_padre.modulo_id = m.padre_id
+                LEFT JOIN usuario_modulos um_padre
+                    ON um_padre.usuario_id = um.usuario_id AND um_padre.modulo_id = m.padre_id
                 WHERE um.usuario_id = %s
                   AND m.delegable_a_hijos = 1
                   AND m.identificador NOT IN ('creacion_usuarios_dis', 'usuarios_hijos')
+                  AND (m.padre_id IS NULL OR (pdm_padre.modulo_id IS NOT NULL AND um_padre.modulo_id IS NOT NULL))
                 ORDER BY m.nombre
                 """,
-                (padre_id, hijo_id),
+                (padre_id, padre_id, hijo_id),
             )
             return cur.fetchall()
         finally:
@@ -192,13 +204,42 @@ class PermisosModulosService:
         conn = obtener_conexion()
         cur = conn.cursor()
         try:
-            PermisosModulosService._validar_modulo_delegable(cur, modulo_id)
+            modulo = PermisosModulosService._validar_modulo_delegable(cur, modulo_id)
             cur.execute(
                 "SELECT 1 FROM permisos_delegables_modulos WHERE administrador_id = %s AND modulo_id = %s",
                 (padre_id, modulo_id),
             )
             if not cur.fetchone():
                 raise PermissionError("No puede delegar un módulo que no está en su bolsa.")
+
+            padre_modulo_id = modulo[0]
+            if padre_modulo_id:
+                cur.execute(
+                    """
+                    SELECT nombre
+                    FROM modulos
+                    WHERE id = %s AND activo = 1 AND delegable_a_hijos = 1
+                    """,
+                    (padre_modulo_id,),
+                )
+                padre = cur.fetchone()
+                if not padre:
+                    raise ValueError("El módulo padre no existe, está inactivo o no puede delegarse.")
+
+                cur.execute(
+                    """
+                    SELECT 1
+                    FROM permisos_delegables_modulos pdm
+                    INNER JOIN usuario_modulos um
+                        ON um.modulo_id = pdm.modulo_id AND um.usuario_id = %s
+                    WHERE pdm.administrador_id = %s AND pdm.modulo_id = %s
+                    """,
+                    (hijo_id, padre_id, padre_modulo_id),
+                )
+                if not cur.fetchone():
+                    raise ValueError(
+                        f"El módulo padre '{padre[0]}' debe estar habilitado antes de asignar este submódulo."
+                    )
             cur.execute(
                 "INSERT IGNORE INTO usuario_modulos (usuario_id, modulo_id) VALUES (%s, %s)",
                 (hijo_id, modulo_id),
@@ -219,12 +260,26 @@ class PermisosModulosService:
         conn = obtener_conexion()
         cur = conn.cursor()
         try:
+            PermisosModulosService._validar_modulo(cur, modulo_id)
+            cur.execute("SELECT id, padre_id FROM modulos")
+            relaciones = cur.fetchall()
+            descendientes = {modulo_id}
+            pendientes = [modulo_id]
+            while pendientes:
+                padre_actual = pendientes.pop()
+                hijos = [fila[0] for fila in relaciones if fila[1] == padre_actual]
+                for hijo in hijos:
+                    if hijo not in descendientes:
+                        descendientes.add(hijo)
+                        pendientes.append(hijo)
+
+            placeholders = ", ".join(["%s"] * len(descendientes))
             cur.execute(
-                "DELETE FROM usuario_modulos WHERE usuario_id = %s AND modulo_id = %s",
-                (hijo_id, modulo_id),
+                f"DELETE FROM usuario_modulos WHERE usuario_id = %s AND modulo_id IN ({placeholders})",
+                (hijo_id, *descendientes),
             )
             conn.commit()
-            return {"mensaje": "Acceso al módulo retirado del usuario hijo."}
+            return {"mensaje": "Acceso al módulo y sus submódulos retirado del usuario hijo."}
         except Exception:
             conn.rollback()
             raise
