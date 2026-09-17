@@ -428,11 +428,20 @@ def reservar_en_odoo(clave_cliente: str, mes_ym: str, lineas: list) -> dict:
 
         ordenes = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD,
             'sale.order', 'search_read',
-            [[['partner_id', '=', partner_id], ['tag_ids', 'in', [tag_id]], ['state', '=', 'draft']]],
-            {'fields': ['id', 'name', 'order_line'], 'limit': 1})
+            [[['partner_id', '=', partner_id], ['tag_ids', 'in', [tag_id]], ['state', 'in', ['draft', 'sale']]]],
+            {'fields': ['id', 'name', 'order_line', 'state', 'locked'], 'limit': 1})
 
         if ordenes:
             order_id, order_name = ordenes[0]['id'], ordenes[0]['name']
+            estado_orden = ordenes[0]['state']
+            # Una orden confirmada normalmente queda bloqueada (locked=True) --
+            # hay que desbloquearla para poder agregarle líneas y volver a
+            # bloquearla después, si no Odoo rechaza la escritura.
+            estaba_bloqueada = bool(ordenes[0]['locked'])
+            if estaba_bloqueada:
+                models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD,
+                    'sale.order', 'write', [[order_id], {'locked': False}])
+
             lineas_actuales = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD,
                 'sale.order.line', 'read', [ordenes[0]['order_line']],
                 {'fields': ['id', 'product_id', 'product_uom_qty']}) if ordenes[0]['order_line'] else []
@@ -453,6 +462,10 @@ def reservar_en_odoo(clave_cliente: str, mes_ym: str, lineas: list) -> dict:
                     }))
             models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD,
                 'sale.order', 'write', [[order_id], {'order_line': order_line_cmds}])
+
+            if estaba_bloqueada:
+                models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD,
+                    'sale.order', 'write', [[order_id], {'locked': True}])
         else:
             order_line_cmds = [
                 (0, 0, {
@@ -471,11 +484,20 @@ def reservar_en_odoo(clave_cliente: str, mes_ym: str, lineas: list) -> dict:
                 order_vals['user_id'] = vendedor_id
             order_id = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD,
                 'sale.order', 'create', [order_vals])
-            order_name = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD,
-                'sale.order', 'read', [[order_id]], {'fields': ['name']})[0]['name']
+            datos_orden = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD,
+                'sale.order', 'read', [[order_id]], {'fields': ['name', 'state']})[0]
+            order_name = datos_orden['name']
+            estado_orden = datos_orden['state']
 
             if vendedor_id:
                 _crear_actividad_revisar_reserva(models, uid, order_id, vendedor_id)
+
+        # La reserva debe quedar como orden de venta confirmada (state='sale'),
+        # no como cotización en borrador -- así el equipo de ventas la ve lista
+        # para monitorear sin tener que confirmarla a mano uno por uno.
+        if estado_orden == 'draft':
+            models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD,
+                'sale.order', 'action_confirm', [[order_id]])
 
         return {'order_id': order_id, 'order_name': order_name}
 

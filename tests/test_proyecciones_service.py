@@ -113,10 +113,11 @@ def test_reservar_en_odoo_crea_orden_nueva_con_vendedor_y_actividad(mocker):
         77,                                                  # crm.tag create -> tag_id
         [],                                                  # sale.order search_read (no hay orden abierta)
         3001,                                                # sale.order create -> order_id
-        [{"name": "S00042"}],                               # sale.order read -> name
+        [{"name": "S00042", "state": "draft"}],             # sale.order read -> name + state
         [733],                                               # ir.model search -> id de sale.order
         ("mail.activity.type", 5),                          # ir.model.data check_object_reference
         9001,                                                # mail.activity create
+        True,                                                # sale.order action_confirm
     ]
     mocker.patch("services.proyecciones_service.get_odoo_models", return_value=(1, models, None))
 
@@ -137,6 +138,9 @@ def test_reservar_en_odoo_crea_orden_nueva_con_vendedor_y_actividad(mocker):
     # res_model_id (no res_model) es el campo obligatorio que espera mail.activity
     assert activity_call.args[5][0]["res_model_id"] == 733
     assert "res_model" not in activity_call.args[5][0]
+    # La orden nueva queda confirmada (sale), no como cotización en borrador.
+    confirm_call = [c for c in models.execute_kw.call_args_list if c.args[3] == "sale.order" and c.args[4] == "action_confirm"][0]
+    assert confirm_call.args[5] == [[3001]]
 
 
 def test_reservar_en_odoo_agrega_lineas_a_orden_en_borrador_existente_sin_crear_otra(mocker):
@@ -145,9 +149,10 @@ def test_reservar_en_odoo_agrega_lineas_a_orden_en_borrador_existente_sin_crear_
         [{"id": 501, "name": "Víctor Hugo"}],                        # partner
         [{"id": 900, "default_code": "SKU-1"}],                       # producto
         [{"id": 77}],                                                 # tag ya existe
-        [{"id": 3001, "name": "S00042", "order_line": [11]}],         # orden en borrador ya existe
+        [{"id": 3001, "name": "S00042", "order_line": [11], "state": "draft", "locked": False}],  # orden en borrador ya existe
         [{"id": 11, "product_id": [900, "SKU-1"], "product_uom_qty": 3}],  # línea ya existente para ese producto
-        True,                                                          # sale.order write
+        True,                                                          # sale.order write (order_line)
+        True,                                                          # sale.order action_confirm
     ]
     mocker.patch("services.proyecciones_service.get_odoo_models", return_value=(1, models, None))
 
@@ -158,9 +163,41 @@ def test_reservar_en_odoo_agrega_lineas_a_orden_en_borrador_existente_sin_crear_
     metodos_llamados = [(c.args[3], c.args[4]) for c in models.execute_kw.call_args_list]
     assert ("sale.order", "create") not in metodos_llamados
     assert ("mail.activity", "create") not in metodos_llamados
-    write_call = [c for c in models.execute_kw.call_args_list if c.args[3] == "sale.order" and c.args[4] == "write"][0]
-    order_line_cmds = write_call.args[5][1]["order_line"]
+    write_calls = [c for c in models.execute_kw.call_args_list if c.args[3] == "sale.order" and c.args[4] == "write"]
+    order_line_cmds = write_calls[0].args[5][1]["order_line"]
     assert order_line_cmds == [(1, 11, {"product_uom_qty": 5})]  # 3 existentes + 2 nuevas
+    # La orden en borrador aún no estaba bloqueada -- no hace falta desbloquearla,
+    # solo confirmarla al final (queda en 'sale').
+    assert len(write_calls) == 1
+    assert ("sale.order", "action_confirm") in metodos_llamados
+
+
+def test_reservar_en_odoo_desbloquea_agrega_y_vuelve_a_bloquear_una_orden_ya_confirmada(mocker):
+    models = MagicMock()
+    models.execute_kw.side_effect = [
+        [{"id": 501, "name": "Víctor Hugo"}],                        # partner
+        [{"id": 900, "default_code": "SKU-1"}],                       # producto
+        [{"id": 77}],                                                 # tag ya existe
+        [{"id": 3001, "name": "S00042", "order_line": [11], "state": "sale", "locked": True}],  # ya confirmada y bloqueada
+        True,                                                          # sale.order write (locked=False)
+        [{"id": 11, "product_id": [900, "SKU-1"], "product_uom_qty": 3}],
+        True,                                                          # sale.order write (order_line)
+        True,                                                          # sale.order write (locked=True)
+    ]
+    mocker.patch("services.proyecciones_service.get_odoo_models", return_value=(1, models, None))
+
+    resultado = reservar_en_odoo("LC657", "2026-10", [{"sku": "SKU-1", "cantidad": 2}])
+
+    assert resultado == {"order_id": 3001, "order_name": "S00042"}
+    write_calls = [c for c in models.execute_kw.call_args_list if c.args[3] == "sale.order" and c.args[4] == "write"]
+    assert [c.args[5][1] for c in write_calls] == [
+        {"locked": False},
+        {"order_line": [(1, 11, {"product_uom_qty": 5})]},
+        {"locked": True},
+    ]
+    # Ya estaba confirmada: no hace falta (ni se debe) volver a llamar action_confirm.
+    metodos_llamados = [(c.args[3], c.args[4]) for c in models.execute_kw.call_args_list]
+    assert ("sale.order", "action_confirm") not in metodos_llamados
 
 
 def test_reservar_en_odoo_lanza_error_si_no_encuentra_el_contacto(mocker):
