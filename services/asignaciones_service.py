@@ -855,14 +855,22 @@ def _persistir_reservas(producto_id: int, reservas: list, *, origen: str, estado
             clave = item["clave_cliente"].strip().upper()
             key = (clave, item["_mes_fecha"])
             grupos_odoo[key] = grupos_odoo.get(key, 0) + item["cantidad"]
+        ordenes_odoo = []
         for (clave, mes_fecha), cantidad_total in grupos_odoo.items():
             try:
-                reservar_en_odoo(clave, _fecha_a_ym(mes_fecha), [{"sku": producto["sku"], "cantidad": cantidad_total}])
+                orden = reservar_en_odoo(clave, _fecha_a_ym(mes_fecha), [{"sku": producto["sku"], "cantidad": cantidad_total}])
             except OdooReservaError as e:
                 raise AsignacionesError("ODOO_ERROR", f"No se pudo reservar en Odoo: {e}", 502)
+            ordenes_odoo.append({
+                "clave_cliente": clave, "mes_objetivo": _fecha_a_ym(mes_fecha),
+                "order_id": orden["order_id"], "order_name": orden["order_name"],
+            })
 
         conn.commit()
-        return {"producto_id": producto_id, "disponible_restante": disponible - total_solicitado}
+        return {
+            "producto_id": producto_id, "disponible_restante": disponible - total_solicitado,
+            "ordenes_odoo": ordenes_odoo,
+        }
     except AsignacionesError:
         conn.rollback()
         raise

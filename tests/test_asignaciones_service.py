@@ -410,7 +410,8 @@ def test_confirmar_reasignacion_crea_fila_pendiente_y_movimiento_reasignacion(mo
         importacion_id=1,
     )
 
-    assert res == {"producto_id": 10, "disponible_restante": 4}
+    assert res["producto_id"] == 10 and res["disponible_restante"] == 4
+    assert res["ordenes_odoo"] == [{"clave_cliente": "LC657", "mes_objetivo": "2026-11", "order_id": 1, "order_name": "S00000-TEST"}]
     inserts = [c for c in cursor.execute.call_args_list if "INSERT INTO importacion_asignaciones" in c.args[0]]
     assert len(inserts) == 1
     assert "'REASIGNACION'" in inserts[0].args[0] and "'PENDIENTE_CONFIRMACION'" in inserts[0].args[0]
@@ -489,7 +490,7 @@ def test_asignar_exitoso_inserta_asignacion_y_movimiento(mocker):
 
     resultado = asignar(10, [{"clave_cliente": "lc657", "cantidad": 3}], usuario_id=7)
 
-    assert resultado == {"producto_id": 10, "disponible_restante": 2}
+    assert resultado == {"producto_id": 10, "disponible_restante": 2, "ordenes_odoo": []}
     inserts = [c for c in cursor.execute.call_args_list if "INSERT INTO importacion_asignaciones" in c.args[0]]
     assert len(inserts) == 1
     assert inserts[0].args[1][1] == "LC657"  # clave normalizada a mayúsculas
