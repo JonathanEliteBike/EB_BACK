@@ -411,7 +411,7 @@ def reservar_en_odoo(clave_cliente: str, mes_ym: str, lineas: list) -> dict:
         prods = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD,
             'product.product', 'search_read',
             [[['default_code', 'in', skus]]],
-            {'fields': ['id', 'default_code', 'lst_price'], 'limit': 0})
+            {'fields': ['id', 'default_code'], 'limit': 0})
         sku_to_prod = {(p.get('default_code') or '').strip(): p for p in prods}
         no_encontrados = sorted({s for s in skus if s not in sku_to_prod})
         if no_encontrados:
@@ -450,7 +450,6 @@ def reservar_en_odoo(clave_cliente: str, mes_ym: str, lineas: list) -> dict:
                 else:
                     order_line_cmds.append((0, 0, {
                         'product_id': prod['id'], 'product_uom_qty': cantidad,
-                        'price_unit': float(prod.get('lst_price') or 0),
                     }))
             models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD,
                 'sale.order', 'write', [[order_id], {'order_line': order_line_cmds}])
@@ -459,7 +458,6 @@ def reservar_en_odoo(clave_cliente: str, mes_ym: str, lineas: list) -> dict:
                 (0, 0, {
                     'product_id':      sku_to_prod[(l.get('sku') or '').strip()]['id'],
                     'product_uom_qty': int(l.get('cantidad') or 0),
-                    'price_unit':      float(sku_to_prod[(l.get('sku') or '').strip()].get('lst_price') or 0),
                 })
                 for l in lineas
             ]

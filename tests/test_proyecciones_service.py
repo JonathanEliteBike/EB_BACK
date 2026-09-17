@@ -108,7 +108,7 @@ def test_reservar_en_odoo_crea_orden_nueva_con_vendedor_y_actividad(mocker):
     models = MagicMock()
     models.execute_kw.side_effect = [
         [{"id": 501, "name": "Víctor Hugo"}],              # res.partner search_read
-        [{"id": 900, "default_code": "SKU-1", "lst_price": 1000.0}],  # product.product search_read
+        [{"id": 900, "default_code": "SKU-1"}],             # product.product search_read
         [],                                                  # crm.tag search_read (no existe)
         77,                                                  # crm.tag create -> tag_id
         [],                                                  # sale.order search_read (no hay orden abierta)
@@ -128,6 +128,9 @@ def test_reservar_en_odoo_crea_orden_nueva_con_vendedor_y_actividad(mocker):
     assert order_vals["partner_id"] == 501
     assert order_vals["user_id"] == 18  # VENDEDOR_POR_CLIENTE["LC657"]
     assert order_vals["tag_ids"] == [(4, 77)]
+    # price_unit NO debe enviarse: Odoo lo calcula solo a partir de la
+    # lista de precios del cliente (cada nivel de distribuidor tiene la suya).
+    assert "price_unit" not in order_vals["order_line"][0][2]
     activity_call = [c for c in models.execute_kw.call_args_list if c.args[3] == "mail.activity"][0]
     assert activity_call.args[5][0]["summary"] == "Revisar reserva de proyección"
     assert activity_call.args[5][0]["user_id"] == 18
@@ -140,7 +143,7 @@ def test_reservar_en_odoo_agrega_lineas_a_orden_en_borrador_existente_sin_crear_
     models = MagicMock()
     models.execute_kw.side_effect = [
         [{"id": 501, "name": "Víctor Hugo"}],                        # partner
-        [{"id": 900, "default_code": "SKU-1", "lst_price": 1000.0}], # producto
+        [{"id": 900, "default_code": "SKU-1"}],                       # producto
         [{"id": 77}],                                                 # tag ya existe
         [{"id": 3001, "name": "S00042", "order_line": [11]}],         # orden en borrador ya existe
         [{"id": 11, "product_id": [900, "SKU-1"], "product_uom_qty": 3}],  # línea ya existente para ese producto
