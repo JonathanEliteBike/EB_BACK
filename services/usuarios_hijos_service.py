@@ -123,12 +123,12 @@ class UsuariosHijosService:
 
             cur.execute(f"SELECT max_hijos FROM limites_usuario WHERE {col_fk} = %s", (padre_id,))
             limite_res = cur.fetchone()
-            
+
             # Si no existe registro en limites_usuario, el cupo por defecto es 0
             max_hijos = limite_res['max_hijos'] if limite_res is not None else 0
 
             cur.execute("""
-                SELECT COUNT(*) as activos 
+                SELECT COUNT(*) as activos
                 FROM jerarquia_usuarios ju
                 INNER JOIN usuarios u ON ju.hijo_id = u.id
                 WHERE ju.padre_id = %s AND u.activo = 1
@@ -176,7 +176,7 @@ class UsuariosHijosService:
         cur = conn.cursor()
         try:
             cur.execute("""
-                SELECT id FROM jerarquia_usuarios 
+                SELECT id FROM jerarquia_usuarios
                 WHERE padre_id = %s AND hijo_id = %s
             """, (padre_id, hijo_id))
             return cur.fetchone() is not None
@@ -310,7 +310,7 @@ class UsuariosHijosService:
     @staticmethod
     def cambiar_estado_hijo(padre_id, hijo_id, nuevo_estado):
         """
-        Activa o desactiva un usuario hijo. 
+        Activa o desactiva un usuario hijo.
         Si se intenta reactivar (estado=1), valida la disponibilidad de cupo.
         """
         if not UsuariosHijosService.validar_pertenencia_hijo(padre_id, hijo_id):
@@ -335,13 +335,13 @@ class UsuariosHijosService:
         finally:
             cur.close()
             conn.close()
-            
+
     @staticmethod
     def eliminar_usuario_hijo(padre_id, hijo_id):
         """Elimina físicamente un usuario hijo (Rol 3) y sus relaciones previa validación de ámbito."""
         if not UsuariosHijosService.validar_pertenencia_hijo(padre_id, hijo_id):
             raise Exception("Acceso denegado: Este usuario no pertenece a su ámbito de administración.")
-        
+
         conn = obtener_conexion()
         cur = conn.cursor()
         try:
@@ -366,7 +366,7 @@ class UsuariosHijosService:
         finally:
             cur.close()
             conn.close()
-            
+
     @staticmethod
     def obtener_correo_padre(padre_id):
         """Obtiene únicamente el correo electrónico del usuario Administrador (Rol 2)."""

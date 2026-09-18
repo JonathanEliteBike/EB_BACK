@@ -11,7 +11,7 @@ class PermisosService:
         cur = conn.cursor(dictionary=True)
         try:
             cur.execute("""
-                SELECT 
+                SELECT
                     m.id AS modulo_id,
                     m.nombre AS modulo,
                     m.identificador,
@@ -62,7 +62,7 @@ class PermisosService:
             # exige que el permiso PERMANEZCA activo en la bolsa delegable del padre.
             if es_super_admin:
                 sql = """
-                    SELECT 
+                    SELECT
                         up.modulo_id,
                         m.nombre AS modulo,
                         m.identificador,
@@ -82,7 +82,7 @@ class PermisosService:
                 cur.execute(sql, (hijo_id,))
             else:
                 sql = """
-                    SELECT 
+                    SELECT
                         up.modulo_id,
                         m.nombre AS modulo,
                         m.identificador,
@@ -92,17 +92,17 @@ class PermisosService:
                         a.nombre AS accion,
                         a.identificador AS accion_id_texto
                     FROM usuario_permisos up
-                    INNER JOIN permisos_delegables pd 
-                        ON pd.administrador_id = %s 
-                    AND pd.modulo_id = up.modulo_id 
+                    INNER JOIN permisos_delegables pd
+                        ON pd.administrador_id = %s
+                    AND pd.modulo_id = up.modulo_id
                     AND pd.accion_id = up.accion_id
                     INNER JOIN modulos m ON up.modulo_id = m.id
                     INNER JOIN modulo_acciones ma
                         ON ma.modulo_id = up.modulo_id AND ma.accion_id = up.accion_id
                     LEFT JOIN modulos p ON m.padre_id = p.id
                     INNER JOIN acciones a ON up.accion_id = a.id
-                    WHERE up.usuario_id = %s 
-                    AND m.activo = 1 
+                    WHERE up.usuario_id = %s
+                    AND m.activo = 1
                     AND m.delegable_a_hijos = 1
                     AND a.activo = 1
                 """
@@ -173,7 +173,7 @@ class PermisosService:
         cur = conn.cursor()
         try:
             cur.execute("""
-                DELETE FROM usuario_permisos 
+                DELETE FROM usuario_permisos
                 WHERE usuario_id = %s AND modulo_id = %s AND accion_id = %s
             """, (hijo_id, modulo_id, accion_id))
             conn.commit()

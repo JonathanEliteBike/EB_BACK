@@ -107,7 +107,7 @@ def cambiar_estado(hijo_id):
         return jsonify(resultado), 200
     except Exception as e:
         return jsonify({"error": str(e)}), 400
-    
+
 @usuarios_hijos_bp.route('/<int:hijo_id>', methods=['DELETE'])
 @requiere_autenticacion
 @requiere_rol(2)
@@ -120,7 +120,7 @@ def eliminar_hijo(hijo_id):
         return jsonify(resultado), 200
     except Exception as e:
         return jsonify({"error": str(e)}), 400
-    
+
 @usuarios_hijos_bp.route('/correo-padre/<int:_padre_id>', methods=['GET'])
 @requiere_autenticacion
 @requiere_rol(2)

@@ -127,7 +127,7 @@ class AdminSistemaService:
 
     @staticmethod
     def revocar_permiso_delegable(admin_id, modulo_id, accion_id):
-        """Retira un permiso de la bolsa delegable de un Administrador Cliente 
+        """Retira un permiso de la bolsa delegable de un Administrador Cliente
            y lo elimina en cascada de todos sus usuarios hijos."""
         conn = obtener_conexion()
         cur = conn.cursor()
