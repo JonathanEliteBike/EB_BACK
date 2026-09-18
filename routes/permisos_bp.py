@@ -86,7 +86,7 @@ def obtener_delegables():
     """Obtiene los módulos y acciones que un administrador puede delegar a sus hijos."""
     try:
         padre_id = g.usuario_actual['id']
-            
+
         permisos = PermisosService.obtener_permisos_delegables(padre_id)
         return jsonify({"permisos_delegables": permisos}), 200
     except Exception as e:
@@ -119,13 +119,13 @@ def asignar_permiso():
         hijo_id = data.get('hijo_id')
         modulo_id = data.get('modulo_id')
         accion_id = data.get('accion_id')
-        
+
         if not all([hijo_id, modulo_id, accion_id]):
             return jsonify({"error": "Faltan parámetros requeridos (hijo_id, modulo_id, accion_id)."}), 400
-            
+
         resultado = PermisosService.asignar_permiso_hijo(padre_id, hijo_id, modulo_id, accion_id)
         return jsonify(resultado), 200
-        
+
     except ValueError as e:
         return jsonify({"error": str(e)}), 400
     except Exception as e:

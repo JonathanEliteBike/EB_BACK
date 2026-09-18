@@ -179,7 +179,7 @@ def create_app():
     app.register_blueprint(proyecciones_my27_bp)
     app.register_blueprint(solicitud_retroactivo_bp)
     app.register_blueprint(solicitud_retroactivo_campanias_bp)
-    
+
     # --- REGISTRO DE PERMISOS ---
     app.register_blueprint(usuarios_hijos_bp)
     app.register_blueprint(permisos_bp)

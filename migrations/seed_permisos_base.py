@@ -12,7 +12,7 @@ def run():
     try:
         print("Insertando rol: Administrador Cliente...")
         cur.execute("""
-            INSERT IGNORE INTO roles (id, nombre) 
+            INSERT IGNORE INTO roles (id, nombre)
             VALUES (4, 'Administrador Cliente')
         """)
 
@@ -23,8 +23,8 @@ def run():
             ('Crear', 'crear', 1),
             ('Editar', 'editar', 1),
             ('Eliminar', 'eliminar', 1)
-            ON DUPLICATE KEY UPDATE 
-                nombre = VALUES(nombre), 
+            ON DUPLICATE KEY UPDATE
+                nombre = VALUES(nombre),
                 activo = VALUES(activo)
         """)
 
