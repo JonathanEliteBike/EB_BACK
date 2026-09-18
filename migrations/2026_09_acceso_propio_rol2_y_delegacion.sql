@@ -32,22 +32,28 @@ CREATE TABLE IF NOT EXISTS modulos_roles_acceso (
         ON UPDATE CASCADE ON DELETE RESTRICT
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci;
 
--- Estos son los módulos propios del distribuidor. Sólo los cuatro primeros
--- pueden formar parte de la bolsa que se delega a rol 3.
+-- Los ocho módulos son accesos propios del distribuidor (rol 2).
+-- Todos pueden delegarse a rol 3 excepto usuarios_creacion_usuarios.
 UPDATE modulos
 SET delegable_a_hijos = CASE identificador
     WHEN 'usuarios_creacion_usuarios' THEN 0
     WHEN 'usuarios_proyeccion_compras' THEN 1
     WHEN 'usuarios_garantias' THEN 1
     WHEN 'usuarios_caratula' THEN 1
+    WHEN 'usuarios_retroactivos' THEN 1
     WHEN 'usuarios_caratula_retroactivos' THEN 1
+    WHEN 'usuarios_calculadora_retroactivos' THEN 1
+    WHEN 'usuarios_solicitudes_retroactivos' THEN 1
     ELSE delegable_a_hijos
 END
 WHERE identificador IN (
     'usuarios_proyeccion_compras',
     'usuarios_garantias',
     'usuarios_caratula',
+    'usuarios_retroactivos',
     'usuarios_caratula_retroactivos',
+    'usuarios_calculadora_retroactivos',
+    'usuarios_solicitudes_retroactivos',
     'usuarios_creacion_usuarios'
 );
 
@@ -58,7 +64,10 @@ WHERE m.identificador IN (
     'usuarios_proyeccion_compras',
     'usuarios_garantias',
     'usuarios_caratula',
+    'usuarios_retroactivos',
     'usuarios_caratula_retroactivos',
+    'usuarios_calculadora_retroactivos',
+    'usuarios_solicitudes_retroactivos',
     'usuarios_creacion_usuarios'
 )
   AND m.activo = 1
