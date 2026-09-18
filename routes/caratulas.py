@@ -2,6 +2,7 @@ from __future__ import annotations
 from flask import Blueprint, jsonify, request, Response, g
 from db_conexion import obtener_conexion
 from decimal import Decimal
+from datetime import datetime
 import json
 import os
 import re
@@ -137,6 +138,1077 @@ def _debe_ocultar_montos_detalle_compras():
     return PoliticaMontosService.debe_ocultar_montos(
         g.usuario_actual['id'], 'detalle_compras'
     )
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CARÁTULAS MY27 — cálculo maestro
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# Fuente de verdad para la temporada vigente:
+# - previo: universo de carátula, metas y compromisos.
+# - clientes: estado vigente, EVAC, nivel, grupo y ventana f_inicio/f_fin.
+# - monitor: ventas/acumulados reales.
+# - clientes_multimarcas: catálogo Multimarcas vigente.
+#
+# Reglas:
+# 1) Cliente normal activo: cuenta una vez.
+# 2) Integral completo en un solo EVAC:
+#       Global -> fila Integral N una vez.
+#       EVAC   -> fila Integral N una vez.
+# 3) Integral repartido entre A y B:
+#       Global -> fila Integral N una vez.
+#       EVAC   -> sucursales reales del EVAC con su meta individual.
+# 4) Apparel del integral multi-EVAC se reparte proporcionalmente a la
+#    meta anual asignada a cada EVAC y luego a sus sucursales.
+# 5) Bicicletas = Meta General - Apparel/Syncros/Vittoria.
+#
+# No se hardcodean claves de sucursales ni números de integrales.
+_NIVELES_CARATULA = {
+    "Distribuidor",
+    "Partner",
+    "Partner Elite",
+    "Partner Elite Plus",
+}
+_NIVELES_CATEGORIA = {
+    "Partner",
+    "Partner Elite",
+    "Partner Elite Plus",
+}
+
+
+def _caratula_decimal(valor) -> Decimal:
+    if valor in (None, ""):
+        return Decimal("0")
+    if isinstance(valor, Decimal):
+        return valor
+    return Decimal(str(valor))
+
+
+def _caratula_money(valor: Decimal) -> Decimal:
+    return valor.quantize(Decimal("0.01"))
+
+
+def _caratula_json_fila(fila: dict) -> dict:
+    """Copia serializable manteniendo el mismo shape que previo."""
+    salida = {}
+    for key, value in fila.items():
+        if key.startswith("_"):
+            continue
+        if isinstance(value, Decimal):
+            salida[key] = float(value)
+        elif hasattr(value, "strftime"):
+            salida[key] = value.strftime("%Y-%m-%d")
+        else:
+            salida[key] = value
+    return salida
+
+
+def _caratula_cargar_base_my27(cursor):
+    """
+    Carga previo y el estado vigente de clientes.
+    Las filas integrales no tienen cliente equivalente y se conservan por
+    es_integral/grupo_integral.
+    """
+    cursor.execute("""
+        SELECT
+            p.*,
+            c.id       AS _cliente_id_actual,
+            c.activo   AS _activo_actual,
+            c.evac     AS _evac_actual,
+            c.nivel    AS _nivel_actual,
+            c.id_grupo AS _id_grupo_actual
+        FROM previo p
+        LEFT JOIN clientes c
+          ON c.clave = p.clave
+         AND COALESCE(p.es_integral, 0) = 0
+    """)
+    return cursor.fetchall()
+
+
+def _caratula_repartir_proporcional(total: Decimal, items: list[dict], campo_peso: str):
+    """
+    Reparte un monto a centavos y garantiza que la suma sea EXACTAMENTE total.
+    El último registro absorbe únicamente el residuo de redondeo.
+    """
+    if not items:
+        return {}
+
+    total = _caratula_money(total)
+    pesos = [_caratula_decimal(item.get(campo_peso)) for item in items]
+    suma_pesos = sum(pesos, Decimal("0"))
+
+    if suma_pesos <= 0:
+        return {id(item): Decimal("0.00") for item in items}
+
+    asignaciones = {}
+    acumulado = Decimal("0.00")
+
+    for index, (item, peso) in enumerate(zip(items, pesos)):
+        if index == len(items) - 1:
+            monto = total - acumulado
+        else:
+            monto = _caratula_money(total * peso / suma_pesos)
+            acumulado += monto
+        asignaciones[id(item)] = monto
+
+    return asignaciones
+
+
+def _caratula_construir_contribuciones_my27(filas):
+    """
+    Construye las tres vistas DESDE LA MISMA BASE:
+      - global
+      - A
+      - B
+
+    Devuelve filas compatibles con los componentes actuales.
+    """
+    integrales_por_grupo = {}
+    miembros_por_grupo = {}
+    normales = []
+
+    for original in filas:
+        fila = dict(original)
+        es_integral = int(fila.get("es_integral") or 0) == 1
+
+        if es_integral:
+            grupo = fila.get("grupo_integral")
+            nivel = fila.get("nivel")
+            if grupo is not None and nivel in _NIVELES_CARATULA:
+                integrales_por_grupo[int(grupo)] = fila
+            continue
+
+        # MY27 actual: solo clientes existentes y activos.
+        if not fila.get("_cliente_id_actual"):
+            continue
+        if int(fila.get("_activo_actual") or 0) != 1:
+            continue
+
+        evac_actual = fila.get("_evac_actual")
+        nivel_actual = fila.get("_nivel_actual") or fila.get("nivel")
+
+        # Multimarcas / registros sin nivel o sin EVAC normal no entran aquí.
+        # Global los sigue manejando por su flujo Multimarcas de producción.
+        if evac_actual not in ("A", "B"):
+            continue
+        if nivel_actual not in _NIVELES_CARATULA:
+            continue
+
+        fila["evac"] = evac_actual
+        fila["nivel"] = nivel_actual
+
+        grupo_actual = fila.get("_id_grupo_actual")
+        if grupo_actual is None:
+            normales.append(fila)
+        else:
+            miembros_por_grupo.setdefault(int(grupo_actual), []).append(fila)
+
+    contrib_global = [dict(fila) for fila in normales]
+    contrib_a = [dict(fila) for fila in normales if fila.get("evac") == "A"]
+    contrib_b = [dict(fila) for fila in normales if fila.get("evac") == "B"]
+
+    grupos_ids = set(miembros_por_grupo) | set(integrales_por_grupo)
+
+    for grupo_id in sorted(grupos_ids):
+        miembros = miembros_por_grupo.get(grupo_id, [])
+        integral = integrales_por_grupo.get(grupo_id)
+
+        # Si ya no hay ningún miembro activo del grupo, no aporta a MY27.
+        if not miembros:
+            continue
+
+        # Fallback conservador si faltara la fila Integral N.
+        if integral is None:
+            contrib_global.extend(dict(m) for m in miembros)
+            contrib_a.extend(dict(m) for m in miembros if m.get("evac") == "A")
+            contrib_b.extend(dict(m) for m in miembros if m.get("evac") == "B")
+            continue
+
+        # GLOBAL: el integral siempre cuenta una sola vez.
+        fila_integral_global = dict(integral)
+        contrib_global.append(fila_integral_global)
+
+        miembros_a = [m for m in miembros if m.get("evac") == "A"]
+        miembros_b = [m for m in miembros if m.get("evac") == "B"]
+        evacs_presentes = int(bool(miembros_a)) + int(bool(miembros_b))
+
+        # Integral completo dentro de un solo EVAC:
+        # ese EVAC recibe la fila integral una sola vez.
+        if evacs_presentes == 1:
+            evac = "A" if miembros_a else "B"
+            fila_integral_evac = dict(integral)
+            fila_integral_evac["evac"] = evac
+
+            if evac == "A":
+                contrib_a.append(fila_integral_evac)
+            else:
+                contrib_b.append(fila_integral_evac)
+            continue
+
+        # Integral multi-EVAC:
+        # primero se reparte Apparel entre EVAC A/B según la suma de metas
+        # individuales del escenario vigente.
+        apparel_integral = _caratula_decimal(
+            integral.get("compromiso_apparel_syncros_vittoria")
+        )
+
+        grupos_evac = []
+        if miembros_a:
+            grupos_evac.append({
+                "evac": "A",
+                "miembros": miembros_a,
+                "peso": sum(
+                    (_caratula_decimal(m.get("compra_minima_anual")) for m in miembros_a),
+                    Decimal("0"),
+                ),
+            })
+        if miembros_b:
+            grupos_evac.append({
+                "evac": "B",
+                "miembros": miembros_b,
+                "peso": sum(
+                    (_caratula_decimal(m.get("compra_minima_anual")) for m in miembros_b),
+                    Decimal("0"),
+                ),
+            })
+
+        # Reparto a centavos exacto entre EVACs.
+        total_peso_evacs = sum((g["peso"] for g in grupos_evac), Decimal("0"))
+        apparel_por_evac = {}
+        acumulado_apparel = Decimal("0.00")
+
+        for index, grupo_evac in enumerate(grupos_evac):
+            if index == len(grupos_evac) - 1:
+                monto_evac = _caratula_money(apparel_integral) - acumulado_apparel
+            elif total_peso_evacs > 0:
+                monto_evac = _caratula_money(
+                    apparel_integral * grupo_evac["peso"] / total_peso_evacs
+                )
+                acumulado_apparel += monto_evac
+            else:
+                monto_evac = Decimal("0.00")
+            apparel_por_evac[grupo_evac["evac"]] = monto_evac
+
+        # Luego se reparte el monto del EVAC entre sus sucursales, también exacto.
+        for grupo_evac in grupos_evac:
+            evac = grupo_evac["evac"]
+            miembros_evac = sorted(
+                grupo_evac["miembros"],
+                key=lambda x: str(x.get("clave") or ""),
+            )
+
+            reparto_miembros = _caratula_repartir_proporcional(
+                apparel_por_evac.get(evac, Decimal("0.00")),
+                miembros_evac,
+                "compra_minima_anual",
+            )
+
+            for miembro in miembros_evac:
+                fila_evac = dict(miembro)
+                meta_miembro = _caratula_decimal(
+                    fila_evac.get("compra_minima_anual")
+                )
+                apparel_miembro = reparto_miembros.get(
+                    id(miembro), Decimal("0.00")
+                )
+
+                # Solo se derivan estos dos campos en la respuesta.
+                # NO se altera la BD.
+                fila_evac["compromiso_apparel_syncros_vittoria"] = float(
+                    _caratula_money(apparel_miembro)
+                )
+                fila_evac["compromiso_scott"] = float(
+                    _caratula_money(meta_miembro - apparel_miembro)
+                )
+
+                if evac == "A":
+                    contrib_a.append(fila_evac)
+                else:
+                    contrib_b.append(fila_evac)
+
+    return {
+        "global": contrib_global,
+        "A": contrib_a,
+        "B": contrib_b,
+    }
+
+
+
+def _caratula_obtener_contribuciones_my27(
+    fecha_desde=None,
+    fecha_hasta=None,
+):
+    """
+    Construye Global/A/B y reemplaza SOLO los acumulados de las filas actuales
+    por ventas reales de monitor.
+
+    Sin fechas solicitadas conserva exactamente la lógica MY27 vigente:
+      - f_inicio individual puede ser anterior al 01/jul;
+      - f_fin individual limita el acumulado;
+      - NULL usa el rango general MY27.
+
+    Con fechas solicitadas aplica la intersección:
+      inicio = MAX(fecha_desde, f_inicio o inicio MY27)
+      fin    = MIN(fecha_hasta, f_fin o fin MY27, hoy)
+
+    No modifica previo ni ninguna tabla.
+    """
+    conexion = None
+    cursor = None
+    try:
+        conexion = obtener_conexion()
+        cursor = conexion.cursor(dictionary=True)
+
+        filas = _caratula_cargar_base_my27(cursor)
+        contribuciones = _caratula_construir_contribuciones_my27(filas)
+
+        fecha_inicio_my27, fecha_fin_my27 = _caratula_rango_my27(cursor)
+
+        acumulados, grupos = _caratula_acumulados_normales_desde_monitor(
+            cursor,
+            fecha_inicio_my27,
+            fecha_fin_my27,
+            fecha_desde=fecha_desde,
+            fecha_hasta=fecha_hasta,
+        )
+
+        _caratula_aplicar_acumulados_reales(
+            contribuciones,
+            acumulados,
+            grupos,
+        )
+
+        return contribuciones
+    finally:
+        if cursor:
+            cursor.close()
+        if conexion and conexion.is_connected():
+            conexion.close()
+
+def _caratula_resumen_acumulado_lineas(filas):
+    """
+    Resume únicamente acumulados que ya existen en previo.
+    No consulta Odoo ni modifica la BD.
+
+    BICICLETAS base = SCOTT + BOLD.
+    La parte MEGAMO se agrega después desde monitor para poder validarla
+    por separado antes de tocar el frontend.
+    """
+    general = Decimal("0")
+    bicicletas_base = Decimal("0")
+    apparel_syncros_vittoria = Decimal("0")
+
+    for fila in filas:
+        general += _caratula_decimal(fila.get("acumulado_anticipado"))
+        bicicletas_base += (
+            _caratula_decimal(fila.get("avance_global_scott"))
+            + _caratula_decimal(fila.get("acumulado_bold"))
+        )
+        apparel_syncros_vittoria += _caratula_decimal(
+            fila.get("avance_global_apparel_syncros_vittoria")
+        )
+
+    return {
+        "general": _caratula_money(general),
+        "bicicletas_base": _caratula_money(bicicletas_base),
+        "apparel_syncros_vittoria": _caratula_money(apparel_syncros_vittoria),
+    }
+
+
+def _caratula_rango_my27(cursor):
+    """
+    MY27 actual: julio -> junio.
+    Se calcula con la fecha del servidor MySQL para no depender del reloj
+    del navegador ni de una fecha hardcodeada.
+    """
+    cursor.execute("""
+        SELECT
+            CASE
+                WHEN MONTH(CURDATE()) >= 7
+                    THEN STR_TO_DATE(CONCAT(YEAR(CURDATE()), '-07-01'), '%Y-%m-%d')
+                ELSE STR_TO_DATE(CONCAT(YEAR(CURDATE()) - 1, '-07-01'), '%Y-%m-%d')
+            END AS fecha_inicio,
+            CASE
+                WHEN MONTH(CURDATE()) >= 7
+                    THEN STR_TO_DATE(CONCAT(YEAR(CURDATE()) + 1, '-06-30'), '%Y-%m-%d')
+                ELSE STR_TO_DATE(CONCAT(YEAR(CURDATE()), '-06-30'), '%Y-%m-%d')
+            END AS fecha_fin
+    """)
+    row = cursor.fetchone() or {}
+    return row.get("fecha_inicio"), row.get("fecha_fin")
+
+
+def _caratula_parse_fecha_opcional(valor, nombre):
+    """Convierte YYYY-MM-DD a date. Vacío/None se interpreta como no enviado."""
+    if valor in (None, ""):
+        return None
+
+    valor = str(valor).strip()
+    if not valor:
+        return None
+
+    try:
+        return datetime.strptime(valor, "%Y-%m-%d").date()
+    except ValueError as exc:
+        raise ValueError(
+            f"{nombre} debe tener formato YYYY-MM-DD."
+        ) from exc
+
+
+def _caratula_leer_rango_solicitado():
+    """
+    Lee fecha_desde/fecha_hasta del query string.
+
+    - Sin parámetros: devuelve (None, None) y conserva el comportamiento MY27 actual.
+    - Con parámetros: exige ambos y valida que desde <= hasta.
+    """
+    desde_raw = request.args.get("fecha_desde")
+    hasta_raw = request.args.get("fecha_hasta")
+
+    fecha_desde = _caratula_parse_fecha_opcional(desde_raw, "fecha_desde")
+    fecha_hasta = _caratula_parse_fecha_opcional(hasta_raw, "fecha_hasta")
+
+    if (fecha_desde is None) != (fecha_hasta is None):
+        raise ValueError(
+            "Debes enviar fecha_desde y fecha_hasta juntos."
+        )
+
+    if fecha_desde and fecha_hasta and fecha_desde > fecha_hasta:
+        raise ValueError(
+            "fecha_desde no puede ser posterior a fecha_hasta."
+        )
+
+    return fecha_desde, fecha_hasta
+
+
+def _caratula_rango_general_efectivo(
+    fecha_inicio_my27,
+    fecha_fin_my27,
+    fecha_desde=None,
+    fecha_hasta=None,
+):
+    """
+    Rango para ventas SIN ventana individual (Multimarcas/no registradas).
+    Nunca sale del calendario MY27.
+    """
+    inicio = fecha_inicio_my27
+    fin = fecha_fin_my27
+
+    if fecha_desde is not None:
+        inicio = max(inicio, fecha_desde)
+
+    if fecha_hasta is not None:
+        fin = min(fin, fecha_hasta)
+
+    return inicio, fin
+
+
+def _caratula_condicion_apparel_sql(alias="m"):
+    """
+    Clasificación exclusiva de APPAREL / SYNCROS / VITTORIA.
+    Una línea que entra aquí NO debe volver a entrar en BICICLETAS.
+    """
+    return f"""
+        (
+            UPPER(TRIM(COALESCE({alias}.apparel, ''))) IN ('SI', 'YES')
+            OR UPPER(TRIM(COALESCE({alias}.marca, ''))) IN ('SYNCROS', 'VITTORIA')
+        )
+    """
+
+
+def _caratula_condicion_megamo_sql(alias="m"):
+    return f"""
+        (
+            UPPER(TRIM(COALESCE({alias}.marca, ''))) = 'MEGAMO'
+            OR UPPER(TRIM(COALESCE({alias}.subcategoria, ''))) = 'MEGAMO'
+            OR UPPER(COALESCE({alias}.categoria_producto, '')) LIKE '%MEGAMO%'
+        )
+    """
+
+
+
+def _caratula_normal_en_previo_sql(cliente_alias="c"):
+    """Universo operativo de carátula: la clave DEBE existir en previo.
+
+    `clientes` solo aporta el estado vigente (activo, EVAC, nivel, grupo y fechas).
+    Esto evita que clientes de prueba/auxiliares que existan en `clientes` pero no
+    estén dados de alta en la carátula entren por accidente al acumulado.
+    """
+    return f"""
+        EXISTS (
+            SELECT 1
+            FROM previo p_scope
+            WHERE COALESCE(p_scope.es_integral, 0) = 0
+              AND TRIM(UPPER(p_scope.clave)) = TRIM(UPPER({cliente_alias}.clave))
+              AND COALESCE(
+                    NULLIF(TRIM({cliente_alias}.nivel), ''),
+                    p_scope.nivel
+                  ) IN ('Distribuidor', 'Partner', 'Partner Elite', 'Partner Elite Plus')
+        )
+    """
+
+
+def _caratula_clasificacion_sql(alias="m"):
+    """Clasificación EXCLUSIVA de una venta; cada línea cae en una sola categoría."""
+    return f"""
+        CASE
+            WHEN UPPER(TRIM(COALESCE({alias}.marca, ''))) = 'VITTORIA'
+              OR UPPER(COALESCE({alias}.categoria_producto, '')) LIKE 'VITTORIA%'
+                THEN 'VITTORIA'
+
+            WHEN UPPER(TRIM(COALESCE({alias}.marca, ''))) = 'SYNCROS'
+              OR UPPER(COALESCE({alias}.categoria_producto, '')) LIKE 'SYNCROS%'
+                THEN 'SYNCROS'
+
+            WHEN UPPER(TRIM(COALESCE({alias}.marca, ''))) = 'BOLD'
+              OR UPPER(COALESCE({alias}.categoria_producto, '')) LIKE 'BOLD%'
+                THEN 'BOLD'
+
+            WHEN UPPER(TRIM(COALESCE({alias}.apparel, ''))) IN ('SI', 'YES')
+              OR UPPER(COALESCE({alias}.categoria_producto, '')) LIKE 'SCOTT / APPAREL%'
+                THEN 'APPAREL'
+
+            WHEN UPPER(TRIM(COALESCE({alias}.marca, ''))) = 'MEGAMO'
+              OR UPPER(TRIM(COALESCE({alias}.subcategoria, ''))) = 'MEGAMO'
+              OR UPPER(COALESCE({alias}.categoria_producto, '')) LIKE '%MEGAMO%'
+                THEN 'MEGAMO'
+
+            WHEN UPPER(TRIM(COALESCE({alias}.marca, ''))) = 'SCOTT'
+              OR UPPER(COALESCE({alias}.categoria_producto, '')) LIKE 'SCOTT%'
+                THEN 'SCOTT'
+
+            ELSE 'OTROS'
+        END
+    """
+
+def _caratula_acumulados_normales_desde_monitor(
+    cursor,
+    fecha_inicio_my27,
+    fecha_fin_my27,
+    fecha_desde=None,
+    fecha_hasta=None,
+):
+    """Ventas reales de CLIENTES NORMALES que pertenecen a la carátula.
+
+    Reglas:
+      - cliente activo;
+      - EVAC vigente A/B;
+      - la clave debe existir como fila normal en previo;
+      - sin filtro manual conserva f_inicio/f_fin actual;
+      - con filtro manual intersecta rango solicitado con ventana individual;
+      - nunca incluye facturas posteriores a hoy;
+      - clasificación exclusiva para evitar dobles conteos.
+    """
+    scope = _caratula_normal_en_previo_sql("c")
+    clasificacion = _caratula_clasificacion_sql("m")
+
+    cursor.execute(f"""
+        SELECT
+            x.clave,
+            x.evac,
+            x.nivel,
+            x.id_grupo,
+            ROUND(SUM(x.venta_total), 2) AS general,
+            ROUND(SUM(CASE WHEN x.clasificacion = 'SCOTT' THEN x.venta_total ELSE 0 END), 2) AS scott,
+            ROUND(SUM(CASE WHEN x.clasificacion = 'BOLD' THEN x.venta_total ELSE 0 END), 2) AS bold,
+            ROUND(SUM(CASE WHEN x.clasificacion = 'MEGAMO' THEN x.venta_total ELSE 0 END), 2) AS megamo,
+            ROUND(SUM(CASE WHEN x.clasificacion = 'APPAREL' THEN x.venta_total ELSE 0 END), 2) AS apparel,
+            ROUND(SUM(CASE WHEN x.clasificacion = 'SYNCROS' THEN x.venta_total ELSE 0 END), 2) AS syncros,
+            ROUND(SUM(CASE WHEN x.clasificacion = 'VITTORIA' THEN x.venta_total ELSE 0 END), 2) AS vittoria,
+            ROUND(SUM(CASE WHEN x.clasificacion IN ('APPAREL','SYNCROS','VITTORIA') THEN x.venta_total ELSE 0 END), 2) AS apparel_syncros_vittoria,
+            ROUND(SUM(CASE WHEN x.clasificacion = 'OTROS' THEN x.venta_total ELSE 0 END), 2) AS otros
+        FROM (
+            SELECT
+                c.clave,
+                c.evac,
+                c.nivel AS nivel,
+                c.id_grupo,
+                COALESCE(m.venta_total, 0) AS venta_total,
+                {clasificacion} AS clasificacion
+            FROM monitor m
+            INNER JOIN clientes c
+                ON TRIM(UPPER(c.clave)) = TRIM(UPPER(m.contacto_referencia))
+            WHERE c.activo = 1
+              AND c.evac IN ('A', 'B')
+              AND {scope}
+              AND m.fecha_factura >= CASE
+                    WHEN %s IS NULL
+                        THEN COALESCE(c.f_inicio, %s)
+                    ELSE GREATEST(
+                        %s,
+                        COALESCE(c.f_inicio, %s)
+                    )
+                  END
+              AND m.fecha_factura < DATE_ADD(
+                    LEAST(
+                        COALESCE(c.f_fin, %s),
+                        COALESCE(%s, %s),
+                        CURDATE()
+                    ),
+                    INTERVAL 1 DAY
+                  )
+        ) x
+        GROUP BY x.clave, x.evac, x.nivel, x.id_grupo
+    """, (
+        fecha_desde,
+        fecha_inicio_my27,
+        fecha_desde,
+        fecha_inicio_my27,
+        fecha_fin_my27,
+        fecha_hasta,
+        fecha_fin_my27,
+    ))
+
+    acumulados = {}
+    for row in cursor.fetchall():
+        clave = str(row.get("clave") or "").strip().upper()
+        evac = str(row.get("evac") or "").strip().upper()
+        if not clave or evac not in ("A", "B"):
+            continue
+
+        acumulados[clave] = {
+            "general": _caratula_money(_caratula_decimal(row.get("general"))),
+            "scott": _caratula_money(_caratula_decimal(row.get("scott"))),
+            "bold": _caratula_money(_caratula_decimal(row.get("bold"))),
+            "megamo": _caratula_money(_caratula_decimal(row.get("megamo"))),
+            "apparel": _caratula_money(_caratula_decimal(row.get("apparel"))),
+            "syncros": _caratula_money(_caratula_decimal(row.get("syncros"))),
+            "vittoria": _caratula_money(_caratula_decimal(row.get("vittoria"))),
+            "apparel_syncros_vittoria": _caratula_money(
+                _caratula_decimal(row.get("apparel_syncros_vittoria"))
+            ),
+            "otros": _caratula_money(_caratula_decimal(row.get("otros"))),
+            "evac": evac,
+            "nivel": row.get("nivel"),
+            "id_grupo": row.get("id_grupo"),
+        }
+
+    # La membresía del grupo NO depende de que el cliente haya vendido.
+    cursor.execute(f"""
+        SELECT DISTINCT c.clave, c.id_grupo
+        FROM clientes c
+        WHERE c.activo = 1
+          AND c.evac IN ('A', 'B')
+          AND c.id_grupo IS NOT NULL
+          AND {scope}
+    """)
+
+    grupos = {}
+    for row in cursor.fetchall():
+        clave = str(row.get("clave") or "").strip().upper()
+        grupo = row.get("id_grupo")
+        if clave and grupo is not None:
+            grupos.setdefault(int(grupo), []).append(clave)
+
+    return acumulados, grupos
+
+def _caratula_sumar_acumulados_claves(acumulados, claves):
+    total = {
+        "general": Decimal("0"),
+        "scott": Decimal("0"),
+        "bold": Decimal("0"),
+        "megamo": Decimal("0"),
+        "apparel": Decimal("0"),
+        "syncros": Decimal("0"),
+        "vittoria": Decimal("0"),
+        "apparel_syncros_vittoria": Decimal("0"),
+        "otros": Decimal("0"),
+    }
+
+    for clave in claves:
+        dato = acumulados.get(str(clave or "").strip().upper())
+        if not dato:
+            continue
+        for campo in ("general", "scott", "bold", "megamo", "apparel", "syncros", "vittoria", "apparel_syncros_vittoria", "otros"):
+            total[campo] += _caratula_decimal(dato.get(campo))
+
+    for key in total:
+        total[key] = _caratula_money(total[key])
+    return total
+
+def _caratula_aplicar_acumulados_reales(contribuciones, acumulados, grupos):
+    """Sustituye EN MEMORIA los acumulados de las filas vigentes de carátula.
+
+    No escribe en `previo`. Las integrales toman la suma de sus sucursales reales.
+    """
+    for vista in ("global", "A", "B"):
+        for fila in contribuciones[vista]:
+            es_integral = int(fila.get("es_integral") or 0) == 1
+
+            if es_integral:
+                grupo = fila.get("grupo_integral")
+                claves = list(grupos.get(int(grupo), [])) if grupo is not None else []
+                if vista in ("A", "B"):
+                    claves = [
+                        clave for clave in claves
+                        if acumulados.get(clave, {}).get("evac") == vista
+                    ]
+            else:
+                clave = str(fila.get("clave") or "").strip().upper()
+                claves = [clave] if clave else []
+
+            total = _caratula_sumar_acumulados_claves(acumulados, claves)
+
+            fila["acumulado_anticipado"] = float(total["general"])
+            fila["avance_global_scott"] = float(total["scott"])
+            fila["acumulado_bold"] = float(total["bold"])
+            fila["acumulado_apparel"] = float(total["apparel"])
+            fila["acumulado_syncros"] = float(total["syncros"])
+            fila["acumulado_vittoria"] = float(total["vittoria"])
+            fila["avance_global_apparel_syncros_vittoria"] = float(
+                total["apparel_syncros_vittoria"]
+            )
+            # Campos adicionales compatibles hacia atrás: frontends viejos los ignoran.
+            fila["acumulado_megamo"] = float(total["megamo"])
+            fila["acumulado_otros"] = float(total["otros"])
+
+def _caratula_megamo_desde_monitor(
+    cursor,
+    fecha_inicio_my27,
+    fecha_fin_my27,
+    fecha_desde=None,
+    fecha_hasta=None,
+):
+    """MEGAMO válido: normal PREVIO + Multimarcas vigente, respetando el filtro."""
+    scope = _caratula_normal_en_previo_sql("c")
+    clasificacion = _caratula_clasificacion_sql("m")
+
+    cursor.execute(f"""
+        SELECT c.evac, ROUND(SUM(COALESCE(m.venta_total, 0)), 2) AS total
+        FROM monitor m
+        INNER JOIN clientes c
+            ON TRIM(UPPER(c.clave)) = TRIM(UPPER(m.contacto_referencia))
+        WHERE c.activo = 1
+          AND c.evac IN ('A', 'B')
+          AND {scope}
+          AND m.fecha_factura >= CASE
+                WHEN %s IS NULL
+                    THEN COALESCE(c.f_inicio, %s)
+                ELSE GREATEST(
+                    %s,
+                    COALESCE(c.f_inicio, %s)
+                )
+              END
+          AND m.fecha_factura < DATE_ADD(
+                LEAST(
+                    COALESCE(c.f_fin, %s),
+                    COALESCE(%s, %s),
+                    CURDATE()
+                ),
+                INTERVAL 1 DAY
+              )
+          AND ({clasificacion}) = 'MEGAMO'
+        GROUP BY c.evac
+    """, (
+        fecha_desde,
+        fecha_inicio_my27,
+        fecha_desde,
+        fecha_inicio_my27,
+        fecha_fin_my27,
+        fecha_hasta,
+        fecha_fin_my27,
+    ))
+
+    normal = {"A": Decimal("0"), "B": Decimal("0")}
+    for row in cursor.fetchall():
+        evac = row.get("evac")
+        if evac in normal:
+            normal[evac] = _caratula_money(_caratula_decimal(row.get("total")))
+
+    inicio_multi, fin_multi = _caratula_rango_general_efectivo(
+        fecha_inicio_my27,
+        fecha_fin_my27,
+        fecha_desde,
+        fecha_hasta,
+    )
+
+    cursor.execute(f"""
+        SELECT cm.evac, ROUND(SUM(COALESCE(m.venta_total, 0)), 2) AS total
+        FROM monitor m
+        INNER JOIN clientes_multimarcas cm
+          ON (
+                (TRIM(COALESCE(cm.clave, '')) <> ''
+                 AND TRIM(UPPER(cm.clave)) = TRIM(UPPER(m.contacto_referencia)))
+                OR
+                ((m.contacto_referencia IS NULL OR TRIM(m.contacto_referencia) = '')
+                 AND TRIM(COALESCE(cm.cliente_razon_social, '')) <> ''
+                 AND TRIM(UPPER(cm.cliente_razon_social)) = TRIM(UPPER(m.contacto_nombre)))
+             )
+        WHERE cm.activo = 1
+          AND cm.evac IN ('A', 'B')
+          AND UPPER(TRIM(COALESCE(m.evac, ''))) = UPPER(CONCAT(TRIM(cm.evac), ' MULTIMARCAS'))
+          AND m.fecha_factura >= %s
+          AND m.fecha_factura < DATE_ADD(LEAST(%s, CURDATE()), INTERVAL 1 DAY)
+          AND ({clasificacion}) = 'MEGAMO'
+          AND NOT EXISTS (
+                SELECT 1
+                FROM clientes c
+                WHERE c.activo = 1
+                  AND c.evac IN ('A', 'B')
+                  AND TRIM(UPPER(c.clave)) = TRIM(UPPER(cm.clave))
+                  AND {_caratula_normal_en_previo_sql('c')}
+          )
+        GROUP BY cm.evac
+    """, (inicio_multi, fin_multi))
+
+    multimarcas = {"A": Decimal("0"), "B": Decimal("0")}
+    for row in cursor.fetchall():
+        evac = row.get("evac")
+        if evac in multimarcas:
+            multimarcas[evac] = _caratula_money(_caratula_decimal(row.get("total")))
+
+    return {
+        "normal": normal,
+        "multimarcas": multimarcas,
+        "total": {
+            "A": _caratula_money(normal["A"] + multimarcas["A"]),
+            "B": _caratula_money(normal["B"] + multimarcas["B"]),
+        },
+    }
+
+
+def _caratula_multimarcas_acumulados(
+    cursor,
+    fecha_inicio_my27=None,
+    fecha_fin_my27=None,
+    fecha_desde=None,
+    fecha_hasta=None,
+):
+    """Acumulado Multimarcas activo dentro del rango efectivo solicitado."""
+    if fecha_inicio_my27 is None or fecha_fin_my27 is None:
+        fecha_inicio_my27, fecha_fin_my27 = _caratula_rango_my27(cursor)
+
+    fecha_inicio, fecha_fin = _caratula_rango_general_efectivo(
+        fecha_inicio_my27,
+        fecha_fin_my27,
+        fecha_desde,
+        fecha_hasta,
+    )
+
+    clasificacion = _caratula_clasificacion_sql("m")
+    scope_normal = _caratula_normal_en_previo_sql("c_scope")
+
+    cursor.execute(f"""
+        SELECT
+            x.evac,
+            ROUND(SUM(x.venta_total), 2) AS general,
+            ROUND(SUM(CASE WHEN x.clasificacion IN ('SCOTT','BOLD') THEN x.venta_total ELSE 0 END), 2) AS bicicletas_base,
+            ROUND(SUM(CASE WHEN x.clasificacion = 'SCOTT' THEN x.venta_total ELSE 0 END), 2) AS scott,
+            ROUND(SUM(CASE WHEN x.clasificacion = 'BOLD' THEN x.venta_total ELSE 0 END), 2) AS bold,
+            ROUND(SUM(CASE WHEN x.clasificacion = 'MEGAMO' THEN x.venta_total ELSE 0 END), 2) AS megamo,
+            ROUND(SUM(CASE WHEN x.clasificacion = 'APPAREL' THEN x.venta_total ELSE 0 END), 2) AS apparel,
+            ROUND(SUM(CASE WHEN x.clasificacion = 'SYNCROS' THEN x.venta_total ELSE 0 END), 2) AS syncros,
+            ROUND(SUM(CASE WHEN x.clasificacion = 'VITTORIA' THEN x.venta_total ELSE 0 END), 2) AS vittoria,
+            ROUND(SUM(CASE WHEN x.clasificacion IN ('APPAREL','SYNCROS','VITTORIA') THEN x.venta_total ELSE 0 END), 2) AS apparel_syncros_vittoria,
+            ROUND(SUM(CASE WHEN x.clasificacion = 'OTROS' THEN x.venta_total ELSE 0 END), 2) AS otros
+        FROM (
+            SELECT
+                cm.evac,
+                COALESCE(m.venta_total, 0) AS venta_total,
+                {clasificacion} AS clasificacion
+            FROM monitor m
+            INNER JOIN clientes_multimarcas cm
+              ON (
+                    (TRIM(COALESCE(cm.clave, '')) <> ''
+                     AND TRIM(UPPER(cm.clave)) = TRIM(UPPER(m.contacto_referencia)))
+                    OR
+                    ((m.contacto_referencia IS NULL OR TRIM(m.contacto_referencia) = '')
+                     AND TRIM(COALESCE(cm.cliente_razon_social, '')) <> ''
+                     AND TRIM(UPPER(cm.cliente_razon_social)) = TRIM(UPPER(m.contacto_nombre)))
+                 )
+            WHERE cm.activo = 1
+              AND cm.evac IN ('A', 'B')
+              AND UPPER(TRIM(COALESCE(m.evac, ''))) = UPPER(CONCAT(TRIM(cm.evac), ' MULTIMARCAS'))
+              AND m.fecha_factura >= %s
+              AND m.fecha_factura < DATE_ADD(LEAST(%s, CURDATE()), INTERVAL 1 DAY)
+              AND NOT EXISTS (
+                    SELECT 1
+                    FROM clientes c_scope
+                    WHERE c_scope.activo = 1
+                      AND c_scope.evac IN ('A', 'B')
+                      AND TRIM(UPPER(c_scope.clave)) = TRIM(UPPER(cm.clave))
+                      AND {scope_normal}
+              )
+        ) x
+        GROUP BY x.evac
+    """, (fecha_inicio, fecha_fin))
+
+    resultado = {
+        "A": {
+            "general": Decimal("0"), "bicicletas_base": Decimal("0"),
+            "scott": Decimal("0"), "bold": Decimal("0"), "megamo": Decimal("0"),
+            "apparel": Decimal("0"), "syncros": Decimal("0"), "vittoria": Decimal("0"),
+            "apparel_syncros_vittoria": Decimal("0"), "otros": Decimal("0")
+        },
+        "B": {
+            "general": Decimal("0"), "bicicletas_base": Decimal("0"),
+            "scott": Decimal("0"), "bold": Decimal("0"), "megamo": Decimal("0"),
+            "apparel": Decimal("0"), "syncros": Decimal("0"), "vittoria": Decimal("0"),
+            "apparel_syncros_vittoria": Decimal("0"), "otros": Decimal("0")
+        },
+    }
+
+    for row in cursor.fetchall():
+        evac = row.get("evac")
+        if evac not in resultado:
+            continue
+        resultado[evac] = {
+            "general": _caratula_money(_caratula_decimal(row.get("general"))),
+            "bicicletas_base": _caratula_money(_caratula_decimal(row.get("bicicletas_base"))),
+            "scott": _caratula_money(_caratula_decimal(row.get("scott"))),
+            "bold": _caratula_money(_caratula_decimal(row.get("bold"))),
+            "megamo": _caratula_money(_caratula_decimal(row.get("megamo"))),
+            "apparel": _caratula_money(_caratula_decimal(row.get("apparel"))),
+            "syncros": _caratula_money(_caratula_decimal(row.get("syncros"))),
+            "vittoria": _caratula_money(_caratula_decimal(row.get("vittoria"))),
+            "apparel_syncros_vittoria": _caratula_money(_caratula_decimal(row.get("apparel_syncros_vittoria"))),
+            "otros": _caratula_money(_caratula_decimal(row.get("otros"))),
+        }
+
+    return resultado
+
+def _caratula_ventas_no_registradas_resumen(cursor, fecha_inicio, fecha_fin):
+    """Ventas sin cliente registrado. Solo pertenecen a Global, nunca a EVAC A/B."""
+    clasificacion = _caratula_clasificacion_sql("m")
+    cursor.execute(f"""
+        SELECT
+            ROUND(SUM(x.venta_total), 2) AS total,
+            COUNT(*) AS filas,
+            ROUND(SUM(CASE WHEN x.clasificacion = 'SCOTT' THEN x.venta_total ELSE 0 END), 2) AS scott,
+            ROUND(SUM(CASE WHEN x.clasificacion = 'BOLD' THEN x.venta_total ELSE 0 END), 2) AS bold,
+            ROUND(SUM(CASE WHEN x.clasificacion = 'MEGAMO' THEN x.venta_total ELSE 0 END), 2) AS megamo,
+            ROUND(SUM(CASE WHEN x.clasificacion = 'APPAREL' THEN x.venta_total ELSE 0 END), 2) AS apparel,
+            ROUND(SUM(CASE WHEN x.clasificacion = 'SYNCROS' THEN x.venta_total ELSE 0 END), 2) AS syncros,
+            ROUND(SUM(CASE WHEN x.clasificacion = 'VITTORIA' THEN x.venta_total ELSE 0 END), 2) AS vittoria,
+            ROUND(SUM(CASE WHEN x.clasificacion = 'OTROS' THEN x.venta_total ELSE 0 END), 2) AS otros
+        FROM (
+            SELECT
+                COALESCE(m.venta_total, 0) AS venta_total,
+                {clasificacion} AS clasificacion
+            FROM monitor m
+            WHERE NOT EXISTS (
+                SELECT 1 FROM clientes c
+                WHERE UPPER(TRIM(c.clave)) = UPPER(TRIM(m.contacto_referencia))
+                  AND TRIM(COALESCE(c.clave, '')) <> ''
+            )
+            AND NOT EXISTS (
+                SELECT 1 FROM clientes_multimarcas cm
+                WHERE UPPER(TRIM(cm.clave)) = UPPER(TRIM(m.contacto_referencia))
+                  AND TRIM(COALESCE(cm.clave, '')) <> ''
+            )
+            AND NOT EXISTS (
+                SELECT 1 FROM clientes_multimarcas cm2
+                WHERE UPPER(TRIM(cm2.cliente_razon_social)) = UPPER(TRIM(m.contacto_nombre))
+                  AND TRIM(COALESCE(cm2.cliente_razon_social, '')) <> ''
+            )
+            AND m.fecha_factura >= %s
+            AND m.fecha_factura < DATE_ADD(LEAST(%s, CURDATE()), INTERVAL 1 DAY)
+        ) x
+    """, (fecha_inicio, fecha_fin))
+    row = cursor.fetchone() or {}
+    salida = {campo: _caratula_money(_caratula_decimal(row.get(campo))) for campo in (
+        "total", "scott", "bold", "megamo", "apparel", "syncros", "vittoria", "otros"
+    )}
+    salida["filas"] = int(row.get("filas") or 0)
+    salida["bicicletas"] = _caratula_money(salida["scott"] + salida["bold"] + salida["megamo"])
+    salida["apparel_syncros_vittoria"] = _caratula_money(salida["apparel"] + salida["syncros"] + salida["vittoria"])
+    return salida
+
+
+def _caratula_desglose_contribuciones(filas):
+    """Desglose exclusivo de ventas normales ya filtradas por el universo de carátula."""
+    campos = {
+        "scott": "avance_global_scott",
+        "bold": "acumulado_bold",
+        "megamo": "acumulado_megamo",
+        "apparel": "acumulado_apparel",
+        "syncros": "acumulado_syncros",
+        "vittoria": "acumulado_vittoria",
+        "otros": "acumulado_otros",
+    }
+    resultado = {clave: Decimal("0") for clave in campos}
+    for fila in filas:
+        for clave, campo in campos.items():
+            resultado[clave] += _caratula_decimal(fila.get(campo))
+    return {clave: _caratula_money(valor) for clave, valor in resultado.items()}
+
+
+def _caratula_sumar_desglose(base, multi=None, extra=None):
+    """Suma desgloses exclusivos y devuelve también agrupaciones comerciales."""
+    campos = ("scott", "bold", "megamo", "apparel", "syncros", "vittoria", "otros")
+    multi = multi or {}
+    extra = extra or {}
+    salida = {}
+    for campo in campos:
+        salida[campo] = _caratula_money(
+            _caratula_decimal(base.get(campo))
+            + _caratula_decimal(multi.get(campo))
+            + _caratula_decimal(extra.get(campo))
+        )
+
+    salida["bicicletas"] = _caratula_money(
+        salida["scott"] + salida["bold"] + salida["megamo"]
+    )
+    salida["apparel_syncros_vittoria"] = _caratula_money(
+        salida["apparel"] + salida["syncros"] + salida["vittoria"]
+    )
+    salida["general"] = _caratula_money(
+        salida["bicicletas"]
+        + salida["apparel_syncros_vittoria"]
+        + salida["otros"]
+    )
+    return salida
+
+
+def _caratula_armar_validacion_lineas(base, multi, megamo):
+    general = _caratula_money(base["general"] + multi["general"])
+    bicicletas_base = _caratula_money(base["bicicletas_base"] + multi["bicicletas_base"])
+    apparel = _caratula_money(base["apparel_syncros_vittoria"] + multi["apparel_syncros_vittoria"])
+    megamo = _caratula_money(megamo)
+    bicicletas = _caratula_money(bicicletas_base + megamo)
+    otros = _caratula_money(general - bicicletas - apparel)
+    return {
+        "acumulado_general": float(general),
+        "bicicletas_antes_megamo": float(bicicletas_base),
+        "megamo_my27": float(megamo),
+        "bicicletas_con_megamo": float(bicicletas),
+        "apparel_syncros_vittoria": float(apparel),
+        "otros_despues_megamo": float(otros),
+    }
+
+def _caratula_resumen_meta(filas):
+    meta = Decimal("0")
+    categoria = Decimal("0")
+    distribuidor = Decimal("0")
+    apparel = Decimal("0")
+
+    for fila in filas:
+        nivel = fila.get("nivel")
+        meta_fila = _caratula_decimal(fila.get("compra_minima_anual"))
+
+        meta += meta_fila
+        apparel += _caratula_decimal(
+            fila.get("compromiso_apparel_syncros_vittoria")
+        )
+
+        if nivel in _NIVELES_CATEGORIA:
+            categoria += meta_fila
+        elif nivel == "Distribuidor":
+            distribuidor += meta_fila
+
+    meta = _caratula_money(meta)
+    categoria = _caratula_money(categoria)
+    distribuidor = _caratula_money(distribuidor)
+    apparel = _caratula_money(apparel)
+    bicicletas = _caratula_money(meta - apparel)
+
+    return {
+        "meta": float(meta),
+        "categoria": float(categoria),
+        "distribuidor": float(distribuidor),
+        "bicicletas": float(bicicletas),
+        "apparel": float(apparel),
+    }
+
 
 
 def _precalentar_claves(claves: list[str], host: str = 'http://localhost:5000') -> None:
@@ -337,54 +1409,41 @@ def obtener_nombres():
 @caratulas_bp.route('/clientes_a', methods=['GET'])
 def obtener_previo_evac_a():
     try:
-        conexion = obtener_conexion()
-        with conexion.cursor(dictionary=True) as cursor:
-            query = "SELECT * FROM previo WHERE evac = %s"
-            cursor.execute(query, ("A",))
-            resultados = cursor.fetchall()
-        
-        # Convertir valores Decimal a float para JSON
-        for fila in resultados:
-            for key, value in fila.items():
-                if isinstance(value, Decimal):
-                    fila[key] = float(value)
-
+        fecha_desde, fecha_hasta = _caratula_leer_rango_solicitado()
+        contribuciones = _caratula_obtener_contribuciones_my27(
+            fecha_desde=fecha_desde,
+            fecha_hasta=fecha_hasta,
+        )
+        resultados = [
+            _caratula_json_fila(fila)
+            for fila in contribuciones["A"]
+        ]
         return jsonify(resultados), 200
-
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
     except Exception as e:
+        logging.exception("Error en obtener_previo_evac_a MY27")
         return jsonify({"error": str(e)}), 500
 
-    finally:
-        if cursor:
-            cursor.close()
-        if conexion and conexion.is_connected():
-            conexion.close()
-            
+
 @caratulas_bp.route('/clientes_b', methods=['GET'])
 def obtener_previo_evac_b():
     try:
-        conexion = obtener_conexion()
-        with conexion.cursor(dictionary=True) as cursor:
-            query = "SELECT * FROM previo WHERE evac = %s"
-            cursor.execute(query, ("B",))
-            resultados = cursor.fetchall()
-        
-        # Convertir valores Decimal a float para JSON
-        for fila in resultados:
-            for key, value in fila.items():
-                if isinstance(value, Decimal):
-                    fila[key] = float(value)
-
+        fecha_desde, fecha_hasta = _caratula_leer_rango_solicitado()
+        contribuciones = _caratula_obtener_contribuciones_my27(
+            fecha_desde=fecha_desde,
+            fecha_hasta=fecha_hasta,
+        )
+        resultados = [
+            _caratula_json_fila(fila)
+            for fila in contribuciones["B"]
+        ]
         return jsonify(resultados), 200
-
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
     except Exception as e:
+        logging.exception("Error en obtener_previo_evac_b MY27")
         return jsonify({"error": str(e)}), 500
-
-    finally:
-        if cursor:
-            cursor.close()
-        if conexion and conexion.is_connected():
-            conexion.close()
 
 @caratulas_bp.route('/clientes_go', methods=['GET'])
 def obtener_previo_evac_go():
@@ -558,38 +1617,212 @@ def obtener_caratula_evac_b():
 @caratulas_bp.route('/datos_previo', methods=['GET'])
 def obtener_datos_previo():
     try:
-        conexion = obtener_conexion()
-        with conexion.cursor(dictionary=True) as cursor:
-            # Excluir las claves dadas
-            cursor.execute("""
-                SELECT * 
-                FROM previo
-                WHERE clave NOT IN (
-                    'JC539','EC216','LC657',
-                    'GC411','MC679','MC677',
-                    'LC625','LC626','LC627',
-                    'LD653','MD680','ID492',
-                    'LD660','NA718','7C042'
-                )
-                AND nombre_cliente IS NOT NULL
-                AND nombre_cliente <> ''
-                AND nivel IS NOT NULL
-                AND nivel <> ''
-                AND clave NOT LIKE 'ODOO%'
-            """)
-            resultados = cursor.fetchall()
-            
-            # Convertir Decimal a float si es necesario
-            for fila in resultados:
-                for key, value in fila.items():
-                    if isinstance(value, Decimal):
-                        fila[key] = float(value)
-                    elif hasattr(value, 'strftime'):
-                        fila[key] = value.strftime('%Y-%m-%d')
-                        
+        contribuciones = _caratula_obtener_contribuciones_my27()
+        resultados = [
+            _caratula_json_fila(fila)
+            for fila in contribuciones["global"]
+        ]
         return jsonify(resultados), 200
     except Exception as e:
+        logging.exception("Error en obtener_datos_previo MY27")
         return jsonify({'error': str(e)}), 500
+
+
+@caratulas_bp.route('/resumen_caratulas_my27', methods=['GET'])
+def obtener_resumen_caratulas_my27():
+    """
+    Fuente maestra MY27 para Global, EVAC A y EVAC B.
+
+    Sin query params conserva el cálculo actual.
+    Con fecha_desde/fecha_hasta usa exactamente la misma lógica y solo limita
+    el acumulado al rango solicitado, respetando ventanas individuales.
+    """
+    conexion = None
+    cursor = None
+    try:
+        fecha_desde, fecha_hasta = _caratula_leer_rango_solicitado()
+
+        contribuciones = _caratula_obtener_contribuciones_my27(
+            fecha_desde=fecha_desde,
+            fecha_hasta=fecha_hasta,
+        )
+
+        global_resumen = _caratula_resumen_meta(contribuciones["global"])
+        a_resumen = _caratula_resumen_meta(contribuciones["A"])
+        b_resumen = _caratula_resumen_meta(contribuciones["B"])
+
+        base_global = _caratula_resumen_acumulado_lineas(contribuciones["global"])
+        base_a = _caratula_resumen_acumulado_lineas(contribuciones["A"])
+        base_b = _caratula_resumen_acumulado_lineas(contribuciones["B"])
+
+        detalle_normal_a = _caratula_desglose_contribuciones(contribuciones["A"])
+        detalle_normal_b = _caratula_desglose_contribuciones(contribuciones["B"])
+
+        conexion = obtener_conexion()
+        cursor = conexion.cursor(dictionary=True)
+
+        fecha_inicio_my27, fecha_fin_my27 = _caratula_rango_my27(cursor)
+        fecha_inicio_efectiva, fecha_fin_efectiva = _caratula_rango_general_efectivo(
+            fecha_inicio_my27,
+            fecha_fin_my27,
+            fecha_desde,
+            fecha_hasta,
+        )
+
+        multimarcas = _caratula_multimarcas_acumulados(
+            cursor,
+            fecha_inicio_my27,
+            fecha_fin_my27,
+            fecha_desde=fecha_desde,
+            fecha_hasta=fecha_hasta,
+        )
+
+        megamo = _caratula_megamo_desde_monitor(
+            cursor,
+            fecha_inicio_my27,
+            fecha_fin_my27,
+            fecha_desde=fecha_desde,
+            fecha_hasta=fecha_hasta,
+        )
+
+        no_reg = _caratula_ventas_no_registradas_resumen(
+            cursor,
+            fecha_inicio_efectiva,
+            fecha_fin_efectiva,
+        )
+
+        detalle_a = _caratula_sumar_desglose(detalle_normal_a, multimarcas["A"])
+        detalle_b = _caratula_sumar_desglose(detalle_normal_b, multimarcas["B"])
+        detalle_global_operativo = _caratula_sumar_desglose(detalle_a, detalle_b)
+        detalle_global = _caratula_sumar_desglose(
+            detalle_global_operativo,
+            extra=no_reg,
+        )
+
+        acumulado_a = _caratula_armar_validacion_lineas(
+            base_a, multimarcas["A"], megamo["total"]["A"]
+        )
+        acumulado_b = _caratula_armar_validacion_lineas(
+            base_b, multimarcas["B"], megamo["total"]["B"]
+        )
+
+        multi_global = {
+            "general": multimarcas["A"]["general"] + multimarcas["B"]["general"],
+            "bicicletas_base": multimarcas["A"]["bicicletas_base"] + multimarcas["B"]["bicicletas_base"],
+            "apparel_syncros_vittoria": multimarcas["A"]["apparel_syncros_vittoria"] + multimarcas["B"]["apparel_syncros_vittoria"],
+        }
+
+        operativo_global = _caratula_armar_validacion_lineas(
+            base_global,
+            multi_global,
+            megamo["total"]["A"] + megamo["total"]["B"],
+        )
+
+        global_final = {
+            "acumulado_general": round(operativo_global["acumulado_general"] + float(no_reg["total"]), 2),
+            "acumulado_bicicletas": round(operativo_global["bicicletas_con_megamo"] + float(no_reg["bicicletas"]), 2),
+            "acumulado_apparel": round(operativo_global["apparel_syncros_vittoria"] + float(no_reg["apparel_syncros_vittoria"]), 2),
+            "acumulado_otros": round(operativo_global["otros_despues_megamo"] + float(no_reg["otros"]), 2),
+            "acumulado_megamo": round(operativo_global["megamo_my27"] + float(no_reg["megamo"]), 2),
+        }
+
+        global_resumen.update(global_final)
+
+        a_resumen.update({
+            "acumulado_general": acumulado_a["acumulado_general"],
+            "acumulado_bicicletas": acumulado_a["bicicletas_con_megamo"],
+            "acumulado_apparel": acumulado_a["apparel_syncros_vittoria"],
+            "acumulado_otros": acumulado_a["otros_despues_megamo"],
+            "acumulado_megamo": acumulado_a["megamo_my27"],
+        })
+
+        b_resumen.update({
+            "acumulado_general": acumulado_b["acumulado_general"],
+            "acumulado_bicicletas": acumulado_b["bicicletas_con_megamo"],
+            "acumulado_apparel": acumulado_b["apparel_syncros_vittoria"],
+            "acumulado_otros": acumulado_b["otros_despues_megamo"],
+            "acumulado_megamo": acumulado_b["megamo_my27"],
+        })
+
+        a_resumen["desglose"] = {k: float(v) for k, v in detalle_a.items()}
+        b_resumen["desglose"] = {k: float(v) for k, v in detalle_b.items()}
+        global_resumen["desglose"] = {k: float(v) for k, v in detalle_global.items()}
+
+        a_mas_b_general = round(
+            a_resumen["acumulado_general"] + b_resumen["acumulado_general"],
+            2,
+        )
+        a_mas_b_bicicletas = round(
+            a_resumen["acumulado_bicicletas"] + b_resumen["acumulado_bicicletas"],
+            2,
+        )
+        a_mas_b_apparel = round(
+            a_resumen["acumulado_apparel"] + b_resumen["acumulado_apparel"],
+            2,
+        )
+        a_mas_b_otros = round(
+            a_resumen["acumulado_otros"] + b_resumen["acumulado_otros"],
+            2,
+        )
+
+        return jsonify({
+            "global": global_resumen,
+            "evac_a": a_resumen,
+            "evac_b": b_resumen,
+            "rango_my27": {
+                "fecha_inicio": fecha_inicio_my27.strftime("%Y-%m-%d") if hasattr(fecha_inicio_my27, "strftime") else str(fecha_inicio_my27),
+                "fecha_fin": fecha_fin_my27.strftime("%Y-%m-%d") if hasattr(fecha_fin_my27, "strftime") else str(fecha_fin_my27),
+            },
+            "rango_solicitado": {
+                "fecha_desde": fecha_desde.strftime("%Y-%m-%d") if fecha_desde else None,
+                "fecha_hasta": fecha_hasta.strftime("%Y-%m-%d") if fecha_hasta else None,
+                "fecha_inicio_general_efectiva": fecha_inicio_efectiva.strftime("%Y-%m-%d") if hasattr(fecha_inicio_efectiva, "strftime") else str(fecha_inicio_efectiva),
+                "fecha_fin_general_efectiva": fecha_fin_efectiva.strftime("%Y-%m-%d") if hasattr(fecha_fin_efectiva, "strftime") else str(fecha_fin_efectiva),
+            },
+            "ventas_no_registradas": {
+                k: (float(v) if isinstance(v, Decimal) else v)
+                for k, v in no_reg.items()
+            },
+            "validacion": {
+                "meta_a_mas_b": round(a_resumen["meta"] + b_resumen["meta"], 2),
+                "meta_global": round(global_resumen["meta"], 2),
+                "acumulado_general_a_mas_b": a_mas_b_general,
+                "acumulado_general_global": round(global_resumen["acumulado_general"], 2),
+                "diferencia_global_vs_a_b": round(global_resumen["acumulado_general"] - a_mas_b_general, 2),
+                "ventas_no_registradas_total": float(no_reg["total"]),
+                "acumulado_bicicletas_a_mas_b": a_mas_b_bicicletas,
+                "acumulado_bicicletas_global": round(global_resumen["acumulado_bicicletas"], 2),
+                "acumulado_apparel_a_mas_b": a_mas_b_apparel,
+                "acumulado_apparel_global": round(global_resumen["acumulado_apparel"], 2),
+                "acumulado_otros_a_mas_b": a_mas_b_otros,
+                "acumulado_otros_global": round(global_resumen["acumulado_otros"], 2),
+                "cuadre_global_categorias": round(
+                    global_resumen["acumulado_general"]
+                    - global_resumen["acumulado_bicicletas"]
+                    - global_resumen["acumulado_apparel"]
+                    - global_resumen["acumulado_otros"],
+                    2,
+                ),
+                "cuadre_desglose_global": round(
+                    global_resumen["acumulado_general"] - float(detalle_global["general"]),
+                    2,
+                ),
+                "cuadre_desglose_a": round(
+                    a_resumen["acumulado_general"] - float(detalle_a["general"]),
+                    2,
+                ),
+                "cuadre_desglose_b": round(
+                    b_resumen["acumulado_general"] - float(detalle_b["general"]),
+                    2,
+                ),
+            },
+        }), 200
+
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    except Exception as e:
+        logging.exception("Error en resumen_caratulas_my27")
+        return jsonify({"error": str(e)}), 500
     finally:
         if cursor:
             cursor.close()
@@ -749,6 +1982,157 @@ def obtener_datos_evac_b_historico():
         if 'cursor' in locals() and cursor:
             cursor.close()
         if 'conexion' in locals() and conexion and conexion.is_connected():
+            conexion.close()
+
+
+
+@caratulas_bp.route('/validar-bicicletas-megamo-my27', methods=['GET'])
+def validar_bicicletas_megamo_my27():
+    """
+    Diagnóstico NO destructivo.
+
+    Valida cuánto MEGAMO debe moverse de "Otros productos" a BICICLETAS
+    para Global, EVAC A y EVAC B.
+
+    NO hace UPDATE, INSERT, DELETE ni TRUNCATE.
+    """
+    conexion = None
+    cursor = None
+
+    try:
+        contribuciones = _caratula_obtener_contribuciones_my27()
+
+        base_global = _caratula_resumen_acumulado_lineas(
+            contribuciones["global"]
+        )
+        base_a = _caratula_resumen_acumulado_lineas(
+            contribuciones["A"]
+        )
+        base_b = _caratula_resumen_acumulado_lineas(
+            contribuciones["B"]
+        )
+
+        conexion = obtener_conexion()
+        cursor = conexion.cursor(dictionary=True)
+
+        fecha_inicio, fecha_fin = _caratula_rango_my27(cursor)
+        megamo = _caratula_megamo_desde_monitor(
+            cursor, fecha_inicio, fecha_fin
+        )
+        multimarcas = _caratula_multimarcas_acumulados(cursor)
+
+        resultado_a = _caratula_armar_validacion_lineas(
+            base_a,
+            multimarcas["A"],
+            megamo["total"]["A"],
+        )
+        resultado_b = _caratula_armar_validacion_lineas(
+            base_b,
+            multimarcas["B"],
+            megamo["total"]["B"],
+        )
+
+        base_global_con_multi = {
+            "general": base_global["general"],
+            "bicicletas_base": base_global["bicicletas_base"],
+            "apparel_syncros_vittoria": base_global[
+                "apparel_syncros_vittoria"
+            ],
+        }
+        multi_global = {
+            "general": (
+                multimarcas["A"]["general"]
+                + multimarcas["B"]["general"]
+            ),
+            "bicicletas_base": (
+                multimarcas["A"]["bicicletas_base"]
+                + multimarcas["B"]["bicicletas_base"]
+            ),
+            "apparel_syncros_vittoria": (
+                multimarcas["A"]["apparel_syncros_vittoria"]
+                + multimarcas["B"]["apparel_syncros_vittoria"]
+            ),
+        }
+        megamo_global = (
+            megamo["total"]["A"] + megamo["total"]["B"]
+        )
+
+        resultado_global = _caratula_armar_validacion_lineas(
+            base_global_con_multi,
+            multi_global,
+            megamo_global,
+        )
+
+        return jsonify({
+            "regla": (
+                "BICICLETAS = SCOTT + BOLD + MEGAMO; "
+                "APPAREL/SYNCROS/VITTORIA se mantiene separado."
+            ),
+            "rango_my27": {
+                "fecha_inicio": (
+                    fecha_inicio.strftime("%Y-%m-%d")
+                    if hasattr(fecha_inicio, "strftime")
+                    else str(fecha_inicio)
+                ),
+                "fecha_fin": (
+                    fecha_fin.strftime("%Y-%m-%d")
+                    if hasattr(fecha_fin, "strftime")
+                    else str(fecha_fin)
+                ),
+            },
+            "global": resultado_global,
+            "evac_a": resultado_a,
+            "evac_b": resultado_b,
+            "detalle_megamo": {
+                "clientes_normales": {
+                    "A": float(_caratula_money(megamo["normal"]["A"])),
+                    "B": float(_caratula_money(megamo["normal"]["B"])),
+                },
+                "multimarcas": {
+                    "A": float(
+                        _caratula_money(megamo["multimarcas"]["A"])
+                    ),
+                    "B": float(
+                        _caratula_money(megamo["multimarcas"]["B"])
+                    ),
+                },
+            },
+            "validacion": {
+                "megamo_a_mas_b": round(
+                    resultado_a["megamo_my27"]
+                    + resultado_b["megamo_my27"],
+                    2,
+                ),
+                "megamo_global": round(
+                    resultado_global["megamo_my27"], 2
+                ),
+                "general_a_mas_b": round(
+                    resultado_a["acumulado_general"]
+                    + resultado_b["acumulado_general"],
+                    2,
+                ),
+                "general_global": round(
+                    resultado_global["acumulado_general"], 2
+                ),
+                "otros_a_mas_b": round(
+                    resultado_a["otros_despues_megamo"]
+                    + resultado_b["otros_despues_megamo"],
+                    2,
+                ),
+                "otros_global": round(
+                    resultado_global["otros_despues_megamo"], 2
+                ),
+            },
+        }), 200
+
+    except Exception as e:
+        logging.exception("Error en validar_bicicletas_megamo_my27")
+        return jsonify({"error": str(e)}), 500
+
+    finally:
+        if cursor:
+            cursor.close()
+        if conexion and conexion.is_connected():
             conexion.close()
 
 
@@ -2341,61 +3725,26 @@ def detalle_compras_odoo():
 
 @caratulas_bp.route('/ventas_no_registradas', methods=['GET'])
 def ventas_no_registradas():
-    """Total de ventas en `monitor` que no corresponden a ningun cliente
-    registrado -- ni por clave en `clientes`/`clientes_multimarcas`, ni por
-    nombre en `clientes_multimarcas.cliente_razon_social` -- pero que SI
-    forman parte del acumulado general de la comercializadora (Caratula
-    Global). Acepta ?fecha_desde=&fecha_hasta= opcionales (YYYY-MM-DD).
+    """Ventas sin cliente registrado para Carátula Global.
+
+    Si no se mandan fechas, usa automáticamente el rango MY27 vigente y hoy como
+    tope efectivo. Mantiene `total` y `filas` y agrega desglose por categoría.
     """
     conexion = None
     cursor = None
     try:
-        fecha_desde = request.args.get('fecha_desde')
-        fecha_hasta = request.args.get('fecha_hasta')
-
         conexion = obtener_conexion()
         cursor = conexion.cursor(dictionary=True)
+        rango_inicio, rango_fin = _caratula_rango_my27(cursor)
 
-        # NOT EXISTS correlacionado en vez de NOT IN (SELECT ...): con los
-        # indices en monitor.contacto_referencia/contacto_nombre y
-        # clientes_multimarcas.clave/cliente_razon_social, MariaDB resuelve
-        # esto con lookups indexados por fila en vez de escanear las
-        # subconsultas repetidamente -- bajo de ~2.7s a milisegundos.
-        params = []
-        filtro_fecha = ""
-        if fecha_desde:
-            filtro_fecha += " AND m.fecha_factura >= %s"
-            params.append(fecha_desde)
-        if fecha_hasta:
-            filtro_fecha += " AND m.fecha_factura <= %s"
-            params.append(fecha_hasta)
-
-        query = f"""
-            SELECT COALESCE(SUM(m.venta_total), 0) AS total, COUNT(*) AS filas
-            FROM monitor m
-            WHERE NOT EXISTS (
-                SELECT 1 FROM clientes c
-                WHERE UPPER(TRIM(c.clave)) = UPPER(TRIM(m.contacto_referencia)) AND c.clave <> ''
-            )
-            AND NOT EXISTS (
-                SELECT 1 FROM clientes_multimarcas cm
-                WHERE UPPER(TRIM(cm.clave)) = UPPER(TRIM(m.contacto_referencia)) AND cm.clave <> ''
-            )
-            AND NOT EXISTS (
-                SELECT 1 FROM clientes_multimarcas cm2
-                WHERE UPPER(TRIM(cm2.cliente_razon_social)) = UPPER(TRIM(m.contacto_nombre))
-                  AND cm2.cliente_razon_social <> ''
-            )
-            {filtro_fecha}
-        """
-        cursor.execute(query, tuple(params))
-        fila = cursor.fetchone()
+        fecha_desde = request.args.get('fecha_desde') or rango_inicio
+        fecha_hasta = request.args.get('fecha_hasta') or rango_fin
+        resumen = _caratula_ventas_no_registradas_resumen(cursor, fecha_desde, fecha_hasta)
 
         return jsonify({
-            'total': float(fila['total'] or 0),
-            'filas': fila['filas'],
+            k: (float(v) if isinstance(v, Decimal) else v)
+            for k, v in resumen.items()
         }), 200
-
     except Exception as e:
         logging.exception('ventas_no_registradas: error')
         return jsonify({'error': str(e)}), 500
