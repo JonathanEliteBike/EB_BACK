@@ -5,8 +5,8 @@ import os
 import uuid
 from datetime import date, datetime
 
-from flask import Blueprint, jsonify, request, send_file, redirect, g
-from services.s3_service import subir_archivo_s3, generar_url_firmada_s3, existe_archivo_s3
+from flask import Blueprint, jsonify, request, send_file, g
+from services.s3_service import subir_archivo_s3, generar_url_firmada_s3, existe_archivo_s3, descargar_archivo_s3
 from werkzeug.utils import secure_filename
 
 from db_conexion import obtener_conexion
@@ -1557,9 +1557,13 @@ def descargar_archivo(nombre):
         if not existe_archivo_s3(key_s3):
             return jsonify({"error": "Archivo no encontrado"}), 404
 
-        url = generar_url_firmada_s3(key_s3)
+        contenido, content_type = descargar_archivo_s3(key_s3)
 
-        return redirect(url)
+        return send_file(
+            io.BytesIO(contenido),
+            mimetype=content_type,
+            download_name=os.path.basename(key_s3),
+        )
 
     except Exception as e:
         logging.exception("Error obteniendo archivo de garantia desde S3: %s", e)
