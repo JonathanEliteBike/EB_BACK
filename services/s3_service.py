@@ -13,6 +13,7 @@ load_dotenv()
 AWS_S3_BUCKET = os.getenv("AWS_S3_BUCKET")
 AWS_S3_PREFIX = os.getenv("AWS_S3_PREFIX", "garantias")
 AWS_DEFAULT_REGION = os.getenv("AWS_DEFAULT_REGION", "us-east-2")
+S3_ENABLED = os.getenv("S3_ENABLED", "true").strip().lower() not in {"false", "0", "no", "off"}
 
 _s3_client = None
 
@@ -47,6 +48,16 @@ _TRANSFER_CONFIG = TransferConfig(
 
 
 def subir_archivo_s3(file_storage) -> dict:
+    if not S3_ENABLED:
+        original = secure_filename(file_storage.filename)
+        fecha = datetime.now()
+        key_s3 = f"local-test/{fecha.year}/{fecha.month:02d}/{uuid.uuid4().hex}_{original}"
+        return {
+            "key": key_s3,
+            "original": original,
+            "content_type": file_storage.content_type or "application/octet-stream"
+        }
+
     if not AWS_S3_BUCKET:
         raise ValueError("AWS_S3_BUCKET no está configurado")
 
@@ -68,7 +79,10 @@ def subir_archivo_s3(file_storage) -> dict:
     }
 
 
-def generar_url_firmada_s3(key_s3: str, expires_in: int = 3600) -> str:
+def generar_url_firmada_s3(key_s3: str, expires_in: int = 3600) -> str | None:
+    if not S3_ENABLED:
+        return None
+
     if not AWS_S3_BUCKET:
         raise ValueError("AWS_S3_BUCKET no está configurado")
 

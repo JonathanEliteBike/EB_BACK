@@ -1019,8 +1019,10 @@ def dashboard_distribuidor():
             'rechazadas': 0,
             'notas_credito_capturadas': 0,
             'notas_credito_validadas': 0,
+            'bicicletas_aplicadas': 0,
         }
         monto_total_estimado = Decimal('0')
+        monto_total_aplicado = Decimal('0')
         notas_por_numero = {}
 
         for solicitud in solicitudes:
@@ -1046,6 +1048,13 @@ def dashboard_distribuidor():
             totales[f"{solicitud['estatus']}s"] += 1
             monto_solicitud = Decimal(str(solicitud.get('monto_pagar') or 0))
             monto_total_estimado += monto_solicitud
+
+            if (
+                _tiene_nota_credito(solicitud.get('nota_credito'))
+                and solicitud.get('nota_credito_estatus') == 'validada'
+            ):
+                totales['bicicletas_aplicadas'] += 1
+                monto_total_aplicado += monto_solicitud
 
             if _tiene_nota_credito(solicitud.get('nota_credito')):
                 numero_nc = str(solicitud['nota_credito']).strip()
@@ -1079,6 +1088,7 @@ def dashboard_distribuidor():
         )
         if not ocultar_montos:
             totales['monto_total_estimado'] = str(monto_total_estimado)
+            totales['monto_total_aplicado'] = f'{monto_total_aplicado:.2f}'
 
         return jsonify({
             'totales': totales,
