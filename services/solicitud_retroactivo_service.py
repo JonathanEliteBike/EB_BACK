@@ -8,7 +8,27 @@ commit/rollback -- esa lógica de negocio y el manejo de la conexión se
 quedan en las rutas, sin cambios.
 """
 
+import json
+import logging
+import os
+
+import redis as redis_lib
+
 from utils.odoo_utils import get_odoo_models, ODOO_DB, ODOO_PASSWORD
+
+
+# La consulta de entregas y lotes en Odoo es costosa. Se conserva el mismo
+# intervalo de 30 min que el caché existente de detalle-compras-odoo: permite
+# que Celery la refresque cada 25 min sin dejar una ventana larga de datos
+# desactualizados para el formulario.
+_SERIES_REDIS_TTL = 1800
+_SERIES_REDIS_URL = os.getenv('CELERY_BROKER_URL', 'redis://localhost:6379/0')
+_series_redis = redis_lib.from_url(
+    _SERIES_REDIS_URL,
+    decode_responses=True,
+    socket_connect_timeout=2,
+    socket_timeout=2,
+)
 
 
 class SeriesOdooError(Exception):
@@ -819,3 +839,112 @@ def _respuesta_series_vacia(estado, campo_cantidad, origen_partner):
         'origen_partner': origen_partner,
         'series': [],
     }
+
+
+def _clave_cache_series(cliente_id):
+    """Clave aislada por el cliente resuelto desde el JWT/base local."""
+    return f'retroactivos:series:{int(cliente_id)}'
+
+
+def _filtrar_series_entregadas(resultado, sku=None, producto=None, serie=None):
+    """Filtra una respuesta ya cargada sin volver a consultar Odoo.
+
+    La entrada de caché siempre contiene todas las series del cliente. Así se
+    puede servir tanto Producto -> Serie (SKU exacto) como Serie -> Producto
+    (coincidencia parcial) desde la misma fuente.
+    """
+    sku_filtro = str(sku or '').strip().casefold()
+    producto_filtro = str(producto or '').strip().casefold()
+    serie_filtro = str(serie or '').strip().casefold()
+
+    series = []
+    for item in resultado.get('series') or []:
+        sku_item = str(item.get('sku') or '').strip().casefold()
+        producto_item = str(item.get('nombre_producto') or '').strip().casefold()
+        serie_item = str(item.get('numero_serie') or '').strip().casefold()
+        if sku_filtro and sku_item != sku_filtro:
+            continue
+        if producto_filtro and producto_filtro not in producto_item:
+            continue
+        if serie_filtro and serie_filtro not in serie_item:
+            continue
+        series.append(item)
+
+    filtrado = {clave: valor for clave, valor in resultado.items() if clave != 'series'}
+    filtrado['series'] = series
+    if series:
+        filtrado['estado'] = 'ok'
+    elif resultado.get('estado') != 'ok':
+        # Si Odoo ya informó que no había pedidos, entregas o lotes, se
+        # conserva ese diagnóstico que el endpoint ya exponía antes del caché.
+        filtrado['estado'] = resultado.get('estado')
+    elif sku_filtro or producto_filtro:
+        filtrado['estado'] = 'sin_series_para_producto'
+    else:
+        filtrado['estado'] = 'sin_series'
+    return filtrado
+
+
+def _leer_cache_series(cliente_id):
+    try:
+        raw = _series_redis.get(_clave_cache_series(cliente_id))
+        if not raw:
+            return None
+        resultado = json.loads(raw)
+        if not isinstance(resultado, dict) or not isinstance(resultado.get('series'), list):
+            logging.warning('Cache de series inválido para cliente_id=%s; se descartará.', cliente_id)
+            _series_redis.delete(_clave_cache_series(cliente_id))
+            return None
+        return resultado
+    except Exception as exc:
+        logging.warning('Redis no disponible al leer series de Retroactivos: %s', exc)
+        return None
+
+
+def _guardar_cache_series(cliente_id, resultado):
+    try:
+        _series_redis.setex(
+            _clave_cache_series(cliente_id),
+            _SERIES_REDIS_TTL,
+            json.dumps(resultado, default=str),
+        )
+        return True
+    except Exception as exc:
+        logging.warning('Redis no disponible al guardar series de Retroactivos: %s', exc)
+        return False
+
+
+def cache_series_disponible():
+    """Permite a Celery evitar consultas Odoo inútiles cuando Redis cayó."""
+    try:
+        return bool(_series_redis.ping())
+    except Exception as exc:
+        logging.warning('Redis no disponible para precalentar series de Retroactivos: %s', exc)
+        return False
+
+
+def obtener_series_entregadas_cacheadas_odoo(cliente_id, clave_cliente, razon_social, sku=None, producto=None, serie=None):
+    """Obtiene series propias desde Redis y usa Odoo como fallback seguro.
+
+    ``cliente_id`` llega exclusivamente de la relación local usuario-cliente;
+    nunca de parámetros de la petición. La caché almacena la respuesta completa
+    del cliente y los filtros se aplican después de recuperarla.
+    """
+    resultado = _leer_cache_series(cliente_id)
+    if resultado is None:
+        resultado = obtener_series_entregadas_odoo(
+            clave_cliente=clave_cliente,
+            razon_social=razon_social,
+        )
+        _guardar_cache_series(cliente_id, resultado)
+
+    return _filtrar_series_entregadas(resultado, sku=sku, producto=producto, serie=serie)
+
+
+def refrescar_cache_series_entregadas_odoo(cliente_id, clave_cliente, razon_social):
+    """Refresca una entrada de Redis para la tarea periódica de Celery."""
+    resultado = obtener_series_entregadas_odoo(
+        clave_cliente=clave_cliente,
+        razon_social=razon_social,
+    )
+    return _guardar_cache_series(cliente_id, resultado)

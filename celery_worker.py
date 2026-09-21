@@ -43,6 +43,10 @@ celery_app.conf.update(
             'schedule': 1500,  # 25 minutos en segundos
             'args': ('http://localhost:5000',),
         },
+        'precalentar-series-retroactivos-periodico': {
+            'task': 'tasks.precalentar_series_retroactivos_async',
+            'schedule': 1500,  # 25 min; el TTL de series es de 30 min
+        },
     },
 )
 
@@ -229,3 +233,62 @@ def precalentar_monitor_async(host='http://localhost:5000'):
 
     logging.info('precalentar_monitor_async: %d OK, %d errores de %d clientes', ok, err, len(claves))
     return {'status': 'ok', 'clientes': len(claves), 'ok': ok, 'errores': err}
+
+
+@celery_app.task(name='tasks.precalentar_series_retroactivos_async')
+def precalentar_series_retroactivos_async():
+    """Refresca en Redis las series Odoo de clientes de portal activos.
+
+    La tarea usa la misma función de consulta por lotes que la API. Si Redis
+    no está disponible, termina sin tocar Odoo: las peticiones web conservan
+    su fallback directo a Odoo.
+    """
+    from db_conexion import obtener_conexion
+    from services import solicitud_retroactivo_service as retroactivos
+
+    if not retroactivos.cache_series_disponible():
+        return {'status': 'sin_redis', 'clientes': 0, 'ok': 0, 'errores': 0}
+
+    conexion = obtener_conexion()
+    if not conexion:
+        return {'status': 'error', 'mensaje': 'No se pudo conectar a la base de datos.'}
+
+    cursor = conexion.cursor(dictionary=True)
+    try:
+        cursor.execute("""
+            SELECT DISTINCT c.id, c.clave, c.nombre_cliente
+            FROM clientes c
+            INNER JOIN usuarios u ON u.cliente_id = c.id
+            WHERE u.activo = 1
+              AND u.rol_id IN (2, 3)
+              AND c.clave IS NOT NULL AND c.clave != ''
+        """)
+        clientes = cursor.fetchall()
+    except Exception as exc:
+        logging.exception('precalentar_series_retroactivos_async: error al leer clientes')
+        return {'status': 'error', 'mensaje': str(exc)}
+    finally:
+        cursor.close()
+        conexion.close()
+
+    ok = err = 0
+    for cliente in clientes:
+        try:
+            if retroactivos.refrescar_cache_series_entregadas_odoo(
+                cliente['id'], str(cliente['clave']).strip(), cliente.get('nombre_cliente')
+            ):
+                ok += 1
+            else:
+                err += 1
+        except Exception as exc:
+            err += 1
+            logging.warning(
+                'precalentar_series_retroactivos_async: error para cliente_id=%s: %s',
+                cliente['id'], exc,
+            )
+
+    logging.info(
+        'precalentar_series_retroactivos_async: %d OK, %d errores de %d clientes',
+        ok, err, len(clientes),
+    )
+    return {'status': 'ok', 'clientes': len(clientes), 'ok': ok, 'errores': err}

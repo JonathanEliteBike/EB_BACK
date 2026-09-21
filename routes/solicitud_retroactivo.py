@@ -499,7 +499,7 @@ def marcas_por_campania(id_campania):
 def series_disponibles():
     """Devuelve únicamente series entregadas al cliente del JWT.
 
-    ``sku`` y ``producto`` son filtros opcionales; nunca identifican al
+    ``sku``, ``producto`` y ``serie`` son filtros opcionales; nunca identifican al
     distribuidor. La autoridad para ello siempre es usuarios.cliente_id.
     """
     conexion = obtener_conexion()
@@ -515,11 +515,13 @@ def series_disponibles():
                 'codigo': 'cliente_sin_clave_odoo'
             }), 403
 
-        resultado = data.obtener_series_entregadas_odoo(
+        resultado = data.obtener_series_entregadas_cacheadas_odoo(
+            cliente_id=cliente['id'],
             clave_cliente=str(cliente['clave']).strip(),
             razon_social=cliente.get('nombre_cliente'),
             sku=request.args.get('sku'),
             producto=request.args.get('producto'),
+            serie=request.args.get('serie'),
         )
         return jsonify(resultado), 200
 
