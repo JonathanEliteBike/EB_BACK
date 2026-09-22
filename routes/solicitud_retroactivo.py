@@ -139,15 +139,21 @@ def _calcular_estatus(validacion_docs, tiene_factura_xml=False):
         return 'validado'
     return 'pendiente'
 
+
+def _tiene_nota_credito(nota_credito):
+    """Mantiene la misma convención de seguimiento: vacío, None y 0 no son NC."""
+    valor = str(nota_credito or '').strip()
+    return bool(valor and valor.lower() not in ('none', '0'))
+
 @solicitud_retroactivo_bp.route('/api/solicitud-retroactivo/registrar/venta', methods=['POST'])
 @requiere_autenticacion
 @requiere_modulos('usuarios_retroactivos', 'usuarios_solicitudes_retroactivos')
 def registrar_venta():
-    # 1. Recuperar los campos del formulario
     campos_obligatorios = [
         'id_usuario', 'id_formulario', 'id_msi',
         'correo_electronico', 'fecha_venta',
-        'modelo_bicicleta', 'numero_serie', 'precio_publico'
+        'modelo_bicicleta', 'numero_serie', 'precio_publico',
+        'producto_detalle_id', 'sku'
     ]
 
     datos = {campo: request.form.get(campo) for campo in campos_obligatorios}
@@ -159,48 +165,24 @@ def registrar_venta():
 
     nombre_usuario = g.usuario_actual.get('nombre') or g.usuario_actual.get('usuario')
 
-    # 2. Validar que los archivos obligatorios estén presentes (PDF y XML son opcionales)
-    for key_archivo in ARCHIVOS_REQUERIDOS.keys():
-        file = request.files.get(key_archivo)
-
-        if key_archivo in ['factura_xml']:
-            if not file or not file.filename:
-                continue
-
-        if not file:
-            return jsonify({"error": f"No se recibió el archivo: {key_archivo}"}), 400
-
-        if not file.filename:
-            return jsonify({"error": f"Nombre de archivo vacío para: {key_archivo}"}), 400
-
-        if not allowed_file(file.filename):
-            return jsonify({"error": f"Tipo de archivo no permitido para: {key_archivo}"}), 400
-
-    # 3. Subida de archivos a AWS S3 PRIMERO
-    archivos_procesados = {}
-    keys_archivos = {k: None for k in ARCHIVOS_REQUERIDOS.keys()}
+    faltantes = [campo for campo in campos_obligatorios if not datos.get(campo)]
+    if faltantes:
+        return jsonify({"error": "Campos de texto faltantes", "campos": faltantes}), 400
 
     try:
-        for key_archivo in ARCHIVOS_REQUERIDOS.keys():
-            file = request.files.get(key_archivo)
-            if not file or not file.filename:
-                continue
+        id_formulario_seleccionado = int(datos['id_formulario'])
+        id_producto_detalle = int(datos['producto_detalle_id'])
+        id_msi_seleccionado = int(datos['id_msi'])
+    except (TypeError, ValueError):
+        return jsonify({
+            "error": "Los identificadores de campaña, producto o MSI son inválidos.",
+            "codigo": "identificador_invalido"
+        }), 400
 
-            resultado = subir_archivo_s3(file)
-
-            keys_archivos[key_archivo] = resultado["key"]
-            archivos_procesados[key_archivo] = {
-                "key": resultado["key"],
-                "original": resultado["original"],
-                "url": generar_url_firmada_s3(resultado["key"]),
-                "storage": "s3"
-            }
-
-    except Exception as e:
-        logging.exception("Error al subir archivos a S3: %s", e)
-        return jsonify({"error": "Ocurrió un error al subir los archivos."}), 500
-
-    # 4. Operaciones de Base de Datos
+    # Se inicializan antes de validar para mantener la respuesta existente,
+    # pero no se sube ningún archivo hasta que campaña, SKU y serie pasen.
+    archivos_procesados = {}
+    keys_archivos = {k: None for k in ARCHIVOS_REQUERIDOS.keys()}
     conexion = obtener_conexion()
     if not conexion:
         return jsonify({"error": "No se pudo conectar a la base de datos."}), 500
@@ -208,12 +190,14 @@ def registrar_venta():
     cursor = conexion.cursor(dictionary=True, buffered=True)
 
     try:
+        # La identidad del distribuidor viene siempre del JWT, no de
+        # id_usuario/id_cliente enviados en el multipart.
         cliente_id_autenticado = _cliente_id_autenticado(cursor)
         if cliente_id_autenticado is not None:
-            datos['id_usuario'] = str(g.usuario_actual['id'])
             datos['id_cliente'] = str(cliente_id_autenticado)
+        datos['id_usuario'] = str(g.usuario_actual['id'])
 
-        # Resolver nombre_completo y nombre_sucursal si se enviaron IDs de cliente/tienda
+        # Resolver nombre_completo y nombre_sucursal si se enviaron IDs de cliente/tienda.
         if datos.get('id_cliente') or datos.get('id_tienda'):
             nom_cli, nom_suc = data.obtener_nombres_cliente_y_tienda(cursor, datos.get('id_cliente'), datos.get('id_tienda'))
             if nom_cli:
@@ -234,12 +218,36 @@ def registrar_venta():
         if not datos.get('nombre_sucursal'):
             datos['nombre_sucursal'] = request.form.get('nombre_sucursal') or 'Matriz'
 
-        faltantes = [campo for campo, valor in datos.items() if campo in campos_obligatorios and not valor]
-        if faltantes:
+        if not data.obtener_campania_vigente(cursor, id_formulario_seleccionado):
             return jsonify({
-                "error": "Campos de texto faltantes",
-                "campos": faltantes
-            }), 400
+                "error": "La campaña seleccionada no está vigente.",
+                "codigo": "campania_no_vigente"
+            }), 422
+
+        producto_detalle = data.obtener_producto_detalle_de_campania(
+            cursor, id_formulario_seleccionado, id_producto_detalle
+        )
+        if not producto_detalle:
+            return jsonify({
+                "error": "El producto seleccionado no pertenece a la campaña.",
+                "codigo": "producto_no_pertenece_campania"
+            }), 422
+
+        sku_real = str(producto_detalle['sku'] or '').strip()
+        if str(datos['sku']).strip().casefold() != sku_real.casefold():
+            return jsonify({
+                "error": "El SKU no corresponde al producto seleccionado.",
+                "codigo": "sku_no_corresponde_producto"
+            }), 422
+
+        # Reutiliza la consulta Odoo de series entregadas. Sólo continúa si la
+        # serie fue entregada a este distribuidor y corresponde al SKU local.
+        data.validar_serie_entregada_odoo(
+            cursor,
+            g.usuario_actual['id'],
+            sku_real,
+            datos['numero_serie'],
+        )
 
         raw_marca = datos.get('id_marca_bicicleta')
         id_marca = int(raw_marca) if raw_marca and str(raw_marca).isdigit() else None
@@ -247,8 +255,6 @@ def registrar_venta():
         # GUÍA: el % ya no es fijo por plazo MSI -- depende de la campaña
         # elegida (ver solicitud_retroactivo_campania_msi). Si el plazo no
         # está ligado a esa campaña, es una combinación inválida.
-        id_msi_seleccionado = int(datos['id_msi'])
-        id_formulario_seleccionado = int(datos['id_formulario'])
         resultado = data.obtener_porcentaje_campania_msi(cursor, id_formulario_seleccionado, id_msi_seleccionado)
         if not resultado:
             return jsonify({"error": "El plazo MSI seleccionado no aplica para esta campaña."}), 400
@@ -258,6 +264,36 @@ def registrar_venta():
         precio_publico = Decimal(str(datos['precio_publico']).replace(',', ''))
         monto_pagar = (precio_publico * porcentaje) / Decimal(100)
         monto_aplicar = monto_pagar
+
+        # Se revisan los archivos antes de subirlos; hasta este punto no hubo
+        # escrituras en S3 ni en la base de datos.
+        for key_archivo in ARCHIVOS_REQUERIDOS:
+            file = request.files.get(key_archivo)
+            if key_archivo == 'factura_xml' and (not file or not file.filename):
+                continue
+            if not file:
+                return jsonify({"error": f"No se recibió el archivo: {key_archivo}"}), 400
+            if not file.filename:
+                return jsonify({"error": f"Nombre de archivo vacío para: {key_archivo}"}), 400
+            if not allowed_file(file.filename):
+                return jsonify({"error": f"Tipo de archivo no permitido para: {key_archivo}"}), 400
+
+        try:
+            for key_archivo in ARCHIVOS_REQUERIDOS:
+                file = request.files.get(key_archivo)
+                if not file or not file.filename:
+                    continue
+                resultado = subir_archivo_s3(file)
+                keys_archivos[key_archivo] = resultado["key"]
+                archivos_procesados[key_archivo] = {
+                    "key": resultado["key"],
+                    "original": resultado["original"],
+                    "url": generar_url_firmada_s3(resultado["key"]),
+                    "storage": "s3"
+                }
+        except Exception as e:
+            logging.exception("Error al subir archivos a S3: %s", e)
+            return jsonify({"error": "Ocurrió un error al subir los archivos."}), 500
 
         parametros = (
             int(datos['id_usuario']),
@@ -301,6 +337,9 @@ def registrar_venta():
             _redactar_montos_solicitud(respuesta['datos_venta'])
         return jsonify(respuesta), 200
 
+    except data.SeriesOdooError as e:
+        conexion.rollback()
+        return jsonify({'error': e.mensaje, 'codigo': e.codigo}), e.http_status
     except PermissionError as e:
         conexion.rollback()
         return jsonify({'error': str(e)}), 403
@@ -448,6 +487,52 @@ def marcas_por_campania(id_campania):
     except Exception as e:
         return jsonify({"error": "Error al consultar las marcas de la campaña.", "detalle": str(e)}), 500
 
+    finally:
+        cursor.close()
+        conexion.close()
+
+
+@solicitud_retroactivo_bp.route('/api/solicitud-retroactivo/series-disponibles', methods=['GET'])
+@requiere_autenticacion
+@requiere_rol(2, 3)
+@requiere_modulos('usuarios_retroactivos', 'usuarios_solicitudes_retroactivos')
+def series_disponibles():
+    """Devuelve únicamente series entregadas al cliente del JWT.
+
+    ``sku``, ``producto`` y ``serie`` son filtros opcionales; nunca identifican al
+    distribuidor. La autoridad para ello siempre es usuarios.cliente_id.
+    """
+    conexion = obtener_conexion()
+    if not conexion:
+        return jsonify({'error': 'No se pudo conectar a la base de datos.'}), 500
+
+    cursor = conexion.cursor(dictionary=True, buffered=True)
+    try:
+        cliente = data.obtener_cliente_odoo_usuario(cursor, g.usuario_actual['id'])
+        if not cliente or not cliente.get('clave'):
+            return jsonify({
+                'error': 'El usuario autenticado no tiene un cliente con clave Odoo asociada.',
+                'codigo': 'cliente_sin_clave_odoo'
+            }), 403
+
+        resultado = data.obtener_series_entregadas_cacheadas_odoo(
+            cliente_id=cliente['id'],
+            clave_cliente=str(cliente['clave']).strip(),
+            razon_social=cliente.get('nombre_cliente'),
+            sku=request.args.get('sku'),
+            producto=request.args.get('producto'),
+            serie=request.args.get('serie'),
+        )
+        return jsonify(resultado), 200
+
+    except data.SeriesOdooError as e:
+        return jsonify({'error': e.mensaje, 'codigo': e.codigo}), e.http_status
+    except Exception as e:
+        logging.exception('Error al consultar series elegibles en Odoo: %s', e)
+        return jsonify({
+            'error': 'Error técnico al consultar las series en Odoo.',
+            'codigo': 'error_tecnico_odoo'
+        }), 500
     finally:
         cursor.close()
         conexion.close()
@@ -906,6 +991,118 @@ def mis_solicitudes():
     except Exception as e:
         logging.exception("Error al listar mis-solicitudes: %s", e)
         return jsonify({"error": "Error al consultar tus solicitudes.", "detalle": str(e)}), 500
+    finally:
+        cursor.close()
+        conexion.close()
+
+
+@solicitud_retroactivo_bp.route('/api/solicitud-retroactivo/dashboard-distribuidor', methods=['GET'])
+@requiere_autenticacion
+@requiere_rol(2, 3)
+@requiere_modulos('usuarios_retroactivos', 'usuarios_solicitudes_retroactivos')
+def dashboard_distribuidor():
+    """Resumen y detalle de solicitudes del cliente del usuario autenticado."""
+    conexion = obtener_conexion()
+    if not conexion:
+        return jsonify({'error': 'No se pudo conectar a la base de datos.'}), 500
+
+    cursor = conexion.cursor(dictionary=True, buffered=True)
+    try:
+        cliente_id = _cliente_id_autenticado(cursor)
+        if cliente_id is None:
+            return jsonify({'error': 'El usuario autenticado no tiene un cliente válido asociado.'}), 403
+
+        solicitudes = data.listar_ventas_por_cliente(cursor, cliente_id)
+        ocultar_montos = _debe_ocultar_montos_retroactivos()
+        totales = {
+            'total_solicitudes': len(solicitudes),
+            'pendientes': 0,
+            'validadas': 0,
+            'rechazadas': 0,
+            'notas_credito_capturadas': 0,
+            'notas_credito_validadas': 0,
+            'bicicletas_aplicadas': 0,
+        }
+        monto_total_estimado = Decimal('0')
+        monto_total_aplicado = Decimal('0')
+        notas_por_numero = {}
+
+        for solicitud in solicitudes:
+            validacion_docs = _parsear_validacion_docs(solicitud.pop('validacion_docs_json'))
+            solicitud['validacion_docs'] = validacion_docs
+            solicitud['historial'] = _parsear_historial(solicitud.pop('historial_json'))
+            solicitud['archivos'] = {}
+            for campo, nombre in (
+                ('ticket_compra_key', 'ticket_compra'), ('voucher_key', 'voucher'),
+                ('factura_pdf_key', 'factura_pdf'), ('factura_xml_key', 'factura_xml'),
+            ):
+                key = solicitud.pop(campo)
+                solicitud['archivos'][nombre] = {
+                    'key': key,
+                    'url': generar_url_firmada_s3(key) if key else None,
+                    'estatus': validacion_docs.get(nombre, 'pendiente')
+                }
+
+            solicitud['estatus'] = _calcular_estatus(
+                validacion_docs,
+                tiene_factura_xml=bool(solicitud['archivos']['factura_xml']['key'])
+            )
+            totales[f"{solicitud['estatus']}s"] += 1
+            monto_solicitud = Decimal(str(solicitud.get('monto_pagar') or 0))
+            monto_total_estimado += monto_solicitud
+
+            if (
+                _tiene_nota_credito(solicitud.get('nota_credito'))
+                and solicitud.get('nota_credito_estatus') == 'validada'
+            ):
+                totales['bicicletas_aplicadas'] += 1
+                monto_total_aplicado += monto_solicitud
+
+            if _tiene_nota_credito(solicitud.get('nota_credito')):
+                numero_nc = str(solicitud['nota_credito']).strip()
+                nota = notas_por_numero.setdefault(numero_nc, {
+                    'numero_nota_credito': numero_nc,
+                    'estatuses': [],
+                    'cantidad_solicitudes_relacionadas': 0,
+                    'monto_asociado_estimado': Decimal('0'),
+                })
+                nota['estatuses'].append(solicitud.get('nota_credito_estatus'))
+                nota['cantidad_solicitudes_relacionadas'] += 1
+                nota['monto_asociado_estimado'] += monto_solicitud
+
+            if ocultar_montos:
+                _redactar_montos_solicitud(solicitud)
+
+        notas_credito = []
+        for nota in notas_por_numero.values():
+            estado = 'validada' if all(estatus == 'validada' for estatus in nota.pop('estatuses')) else 'pendiente'
+            nota['estado'] = estado
+            if ocultar_montos:
+                nota.pop('monto_asociado_estimado')
+            else:
+                nota['monto_asociado_estimado'] = str(nota['monto_asociado_estimado'])
+            notas_credito.append(nota)
+
+        notas_credito.sort(key=lambda nota: nota['numero_nota_credito'])
+        totales['notas_credito_capturadas'] = len(notas_credito)
+        totales['notas_credito_validadas'] = sum(
+            1 for nota in notas_credito if nota['estado'] == 'validada'
+        )
+        if not ocultar_montos:
+            totales['monto_total_estimado'] = str(monto_total_estimado)
+            totales['monto_total_aplicado'] = f'{monto_total_aplicado:.2f}'
+
+        return jsonify({
+            'totales': totales,
+            'notas_credito': notas_credito,
+            'solicitudes': solicitudes,
+        }), 200
+
+    except PermissionError as e:
+        return jsonify({'error': str(e)}), 403
+    except Exception as e:
+        logging.exception('Error al generar el dashboard del distribuidor: %s', e)
+        return jsonify({'error': 'Error al consultar el dashboard del distribuidor.'}), 500
     finally:
         cursor.close()
         conexion.close()
