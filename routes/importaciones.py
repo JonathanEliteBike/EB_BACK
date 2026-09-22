@@ -900,6 +900,21 @@ def dashboard():
         )
         rows = [_serialize(r) for r in cursor.fetchall()]
 
+        # Conteo de productos capturados por embarque (Asignaciones de
+        # Importaciones) -- una sola consulta para todos los embarques del
+        # dashboard, evita N+1. Alimenta el botón "Ver Productos" (gris si el
+        # embarque todavía no tiene productos, azul si ya tiene).
+        _productos_count: dict = {}
+        _ids_embarque = [r["id"] for r in rows]
+        if _ids_embarque:
+            placeholders = ",".join(["%s"] * len(_ids_embarque))
+            cursor.execute(
+                f"SELECT importacion_id, COUNT(*) AS n FROM importacion_productos "
+                f"WHERE importacion_id IN ({placeholders}) GROUP BY importacion_id",
+                _ids_embarque,
+            )
+            _productos_count = {row["importacion_id"]: row["n"] for row in cursor.fetchall()}
+
         # ── KPIs ──────────────────────────────────────────────────────────────
         total      = len(rows)
         activos    = sum(1 for r in rows if r.get("estado") == "activo")
@@ -1265,6 +1280,7 @@ def dashboard():
                 },
                 "lat_total": _days_between(r.get("log_fecha_entrega"), r.get("rec_liberacion_final")),
                 "estado_actual": _estado_actual(r),
+                "tiene_productos": _productos_count.get(r["id"], 0) > 0,
             })
 
         # ── Precio por bicicleta promedio x tipo de caja (calculado en tiempo real) ──
