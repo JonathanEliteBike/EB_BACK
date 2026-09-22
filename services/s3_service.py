@@ -91,3 +91,21 @@ def existe_archivo_s3(key_s3: str) -> bool:
         return True
     except ClientError:
         return False
+
+
+def descargar_archivo_s3(key_s3: str) -> tuple[bytes, str]:
+    """Descarga el objeto completo y su Content-Type.
+
+    Se usa en vez de redirigir al presigned URL porque el bucket no tiene
+    CORS habilitado: un <img>/<a> normal del navegador puede cargar la
+    imagen sin problema, pero una descarga por fetch/XHR (necesaria para
+    mandar el JWT) sí es bloqueada por el navegador al no traer el header
+    Access-Control-Allow-Origin en la respuesta de S3.
+    """
+    if not AWS_S3_BUCKET:
+        raise ValueError("AWS_S3_BUCKET no está configurado")
+
+    obj = _get_s3_client().get_object(Bucket=AWS_S3_BUCKET, Key=key_s3)
+    contenido = obj["Body"].read()
+    content_type = obj.get("ContentType") or "application/octet-stream"
+    return contenido, content_type
