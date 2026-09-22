@@ -4,21 +4,12 @@ from decimal import Decimal
 from datetime import date, datetime
 from collections import defaultdict
 import calendar
-pd = None
-PANDAS_OK = False
-
-def _get_pandas():
-    global pd, PANDAS_OK
-    if pd is not None:
-        return pd
-    try:
-        import pandas as _pd
-        pd = _pd
-        PANDAS_OK = True
-    except Exception:
-        pd = None
-        PANDAS_OK = False
-    return pd
+try:
+    import pandas as pd
+    PANDAS_OK = True
+except Exception:
+    pd = None  # type: ignore
+    PANDAS_OK = False
 from io import BytesIO
 from flask import send_file
 from openpyxl.utils import get_column_letter
@@ -207,9 +198,12 @@ def guardar_valor():
         nombre_concepto = res_nombre[0] if res_nombre else f"Concepto {id_concepto}"
         registrar_auditoria(cursor, 'EDICION_CELDA', 'flujo_valores_unificados', id_concepto, f"Editó {nombre_concepto} a ${monto}")
 
-        # 3. Propagar arrastre hacia todos los meses futuros con datos
+        # 3. CORRECCIÓN: Automatización del recálculo propagado
+        # Usamos la nueva función recalcular_formulas_flujo definida abajo
         f_obj = datetime.strptime(fecha, "%Y-%m-%d")
-        propagar_saldos_hacia_adelante(conexion, f_obj.year, f_obj.month)
+        # # Recalcula desde el mes editado hasta diciembre para propagar saldos iniciales
+        for m in range(f_obj.month, 13):
+            recalcular_formulas_flujo(conexion, f_obj.year, m)
 
         conexion.commit()
         return jsonify({"mensaje": "Valor actualizado y saldos propagados correctamente"}), 200
@@ -334,8 +328,9 @@ def sincronizar_odoo():
             if se_proceso_informacion:
                 actualizar_valor_bd(cursor_update, id_concepto, fecha_inicio, total_real_concepto, 'real')
 
-        # 2. Propagar arrastre hacia todos los meses futuros con datos
-        propagar_saldos_hacia_adelante(conexion, anio, mes)
+        # 2. AUTOMATIZACIÓN: Propagar recálculo
+        for m in range(mes, 13):
+            recalcular_formulas_flujo(conexion, anio, m)
 
         conexion.commit()
         return jsonify({"mensaje": "Sincronización Multi-Código finalizada correctamente"}), 200
@@ -430,6 +425,118 @@ def verificar_permiso_joker(id_usuario):
         if conexion: conexion.close()
 
 # ==============================================================================
+# 6. AUDITORÍA DEL FLUJO DE EFECTIVO
+# ==============================================================================
+@dashboard_flujo_bp.route('/auditoria', methods=['GET'])
+def obtener_auditoria_flujo():
+    conexion = None
+    cursor = None
+
+    try:
+        # ==============================================================
+        # 1. VALIDAR TOKEN
+        # ==============================================================
+        auth_header = request.headers.get('Authorization')
+
+        if not auth_header or " " not in auth_header:
+            return jsonify({
+                "error": "Token no proporcionado"
+            }), 401
+
+        token = auth_header.split(" ")[1]
+        datos_usuario = verificar_token(token)
+
+        if not datos_usuario:
+            return jsonify({
+                "error": "Token inválido o expirado"
+            }), 401
+
+        id_usuario = datos_usuario.get("id")
+
+        if not id_usuario:
+            return jsonify({
+                "error": "No fue posible identificar al usuario"
+            }), 401
+
+        # ==============================================================
+        # 2. CONEXIÓN A BD
+        # ==============================================================
+        conexion = obtener_conexion()
+        cursor = conexion.cursor(dictionary=True)
+
+        # ==============================================================
+        # 3. VALIDAR PERMISO ACTUAL DEL USUARIO
+        # ==============================================================
+        # Se consulta directamente la BD para tomar el permiso vigente.
+        cursor.execute("""
+            SELECT flujo
+            FROM usuarios
+            WHERE id = %s
+            LIMIT 1
+        """, (id_usuario,))
+
+        permiso = cursor.fetchone()
+
+        if not permiso:
+            return jsonify({
+                "error": "Usuario no encontrado"
+            }), 404
+
+        if not permiso.get("flujo"):
+            return jsonify({
+                "error": "No tienes permisos para consultar la auditoría del flujo"
+            }), 403
+
+        # ==============================================================
+        # 4. CONSULTAR MOVIMIENTOS DEL FLUJO
+        # ==============================================================
+        cursor.execute("""
+            SELECT
+                id_auditoria,
+                id_usuario,
+                nombre_usuario,
+                accion,
+                tabla_afectada,
+                id_registro_afectado,
+                descripcion,
+                fecha_hora
+            FROM auditoria_movimientos
+            WHERE tabla_afectada IN (
+                'flujo_valores',
+                'flujo_valores_unificados'
+            )
+            ORDER BY fecha_hora DESC, id_auditoria DESC
+        """)
+
+        registros = cursor.fetchall()
+
+        # ==============================================================
+        # 5. FORMATEAR FECHA PARA JSON
+        # ==============================================================
+        for registro in registros:
+            if registro.get("fecha_hora"):
+                registro["fecha_hora"] = registro["fecha_hora"].strftime(
+                    "%Y-%m-%d %H:%M:%S"
+                )
+
+        # ==============================================================
+        # 6. RESPUESTA
+        # ==============================================================
+        return jsonify(registros), 200
+
+    except Exception as e:
+        logging.exception("Error obteniendo auditoría del flujo")
+        return jsonify({
+            "error": str(e)
+        }), 500
+
+    finally:
+        if cursor:
+            cursor.close()
+        if conexion:
+            conexion.close()
+
+# ==============================================================================
 # LÓGICA DE CÁLCULO DE FÓRMULAS
 # ==============================================================================
 
@@ -449,48 +556,6 @@ def actualizar_valor_bd(cursor, id_concepto, fecha, monto, tipo='real'):
         v_p = monto if tipo == 'proyectado' else 0
         sql_in = "INSERT INTO flujo_valores_unificados (id_concepto, fecha_reporte, monto_real, monto_proyectado) VALUES (%s, %s, %s, %s)"
         cursor.execute(sql_in, (id_concepto, fecha, v_r, v_p))
-
-def propagar_saldos_hacia_adelante(conexion, anio_inicio, mes_inicio):
-    """Recalcula en orden cronológico todos los meses >= anio_inicio/mes_inicio
-    que existan en flujo_valores_unificados. Así el SALDO FINAL Real de cada
-    mes terminado se arrastra como SALDO INICIAL Proy del siguiente,
-    sin importar si el siguiente es de otro año."""
-    cursor = conexion.cursor(dictionary=True)
-    fecha_corte = f"{anio_inicio}-{mes_inicio:02d}-01"
-    cursor.execute(
-        "SELECT DISTINCT fecha_reporte FROM flujo_valores_unificados "
-        "WHERE fecha_reporte >= %s ORDER BY fecha_reporte ASC",
-        (fecha_corte,)
-    )
-    meses = cursor.fetchall()
-    cursor.close()
-    for fila in meses:
-        f = fila['fecha_reporte']
-        recalcular_formulas_flujo(conexion, f.year, f.month)
-
-
-@dashboard_flujo_bp.route('/propagar-saldos', methods=['POST'])
-def propagar_saldos():
-    """Endpoint manual para forzar la propagación de saldos desde un mes dado."""
-    data = request.get_json() or {}
-    hoy = datetime.now()
-    anio = int(data.get('anio', hoy.year))
-    mes = int(data.get('mes', hoy.month))
-    conexion = None
-    try:
-        conexion = obtener_conexion()
-        propagar_saldos_hacia_adelante(conexion, anio, mes)
-        conexion.commit()
-        return jsonify({"mensaje": f"Saldos propagados desde {mes:02d}/{anio} en adelante"}), 200
-    except Exception as e:
-        if conexion:
-            conexion.rollback()
-        logging.exception("Error en propagar_saldos")
-        return jsonify({"error": str(e)}), 500
-    finally:
-        if conexion:
-            conexion.close()
-
 
 def recalcular_formulas_flujo(conexion, anio, mes):
     logging.info("Recalculando UNIFICADO para %s/%s", mes, anio)

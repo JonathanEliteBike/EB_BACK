@@ -1,7 +1,7 @@
 import json as _json
 import logging
 import re
-from flask import Blueprint, jsonify, request
+from flask import Blueprint, jsonify, request, make_response
 from datetime import datetime, date, timedelta
 from decimal import Decimal
 from db_conexion import obtener_conexion
@@ -51,6 +51,8 @@ def _calc_dias(fecha_desde, fecha_hasta):
 
 CAMPOS_LOGISTICA = [
     "log_numero_contenedores",                   # cantidad de contenedores del embarque
+    "log_volumen_m3",                            # volumen total de la importación (m³)
+    "log_cantidad_producto",                     # cantidad total de producto del embarque
     "odoo_importador",                           # pos 1 — Importador (RBF / ROY MORAN)
     "log_fecha_notificacion", "log_fecha_entrega", "log_titulo_correo_salida",
     "log_confirmacion_enterado", "log_origen", "log_tipo_productos",
@@ -143,10 +145,13 @@ CAMPOS_COSTOS = [
 # Campos "proyectado" (fechas plan) — son columnas editables pero no cuentan
 # para el progreso, por eso no están en las listas CAMPOS_*. Deben permitirse
 # explícitamente en INSERT/UPDATE o se filtran silenciosamente al guardar.
+#
+# log_fecha_booking_prog / imp_llegada_contenedor_prog / des_fecha_cruce_prog /
+# des_fecha_entrega_almacen_prog NO están aquí a propósito: se calculan solas
+# en _recalcular_campos() a partir de Entrega + la regla de
+# importaciones_tiempos_estimados (origen+producto+vía) y viven en _CAMPOS_CALC.
 _CAMPOS_PROG = [
-    "log_fecha_entrega_prog", "log_fecha_booking_prog",
-    "imp_llegada_contenedor_prog", "des_fecha_cruce_prog",
-    "des_fecha_entrega_almacen_prog", "rec_recepcion_odoo_prog",
+    "log_fecha_entrega_prog", "rec_recepcion_odoo_prog",
     "alm_envio_info_uva_prog", "alm_liberacion_uva_prog",
     "alm_terminacion_etiquetado_prog",
     "rec_liberacion_verificacion_prog", "rec_liberacion_final_prog",
@@ -173,16 +178,42 @@ _SECCIONES_VALIDAS = {
     "costos",
 }
 
+_ETAPAS_ORDEN = [
+    ("Entrega",      "log_fecha_entrega"),
+    ("Booking",      "log_fecha_booking"),
+    ("Lleg. Puerto", "imp_llegada_contenedor_puerto"),
+    ("Destino",      "des_fecha_cruce_real"),
+    ("Almacén",      "des_llegada_almacen"),
+    ("Verif.",       "alm_liberacion_uva"),
+    ("Etiq.",        "alm_terminacion_etiquetado"),
+    ("Liberado",     "rec_liberacion_final"),
+]
+
+
 def _estado_actual(r: dict) -> str:
-    """Determina la etapa activa del embarque según los campos clave registrados."""
-    if r.get("rec_liberacion_final"):        return "Liberado"
-    if r.get("alm_liberacion_uva"):          return "Verificación"
-    if r.get("des_llegada_almacen"):         return "En Almacén"
-    if r.get("des_fecha_cruce_real"):        return "Tránsito Destino"
-    if r.get("imp_llegada_contenedor_puerto"): return "En Aduana"
-    if r.get("log_fecha_booking"):           return "Tránsito Mar/Aér"
-    if r.get("log_fecha_entrega"):           return "Booking"
-    return "Pendiente"
+    """Determina la etapa activa (en curso) del embarque.
+
+    Mismo campo y mismo nombre que su columna correspondiente en la fila de
+    fechas del pipeline del dashboard (PIPELINE_STAGES / STAGE_CAMPO en el
+    frontend) -- así el badge de arriba y la fila de abajo siempre cuentan la
+    misma historia, en el mismo orden: Entrega, Booking, Lleg. Puerto,
+    Destino, Almacén, Verif., Etiq., Liberado.
+    "Rec. Odoo" no se toma en cuenta para esto (pedido explícito), aunque sí
+    se sigue mostrando en la fila de fechas del pipeline.
+
+    Una etapa con fecha real capturada (en verde) ya quedó atrás: el badge
+    debe avanzar a la siguiente etapa de la secuencia, no quedarse mostrando
+    la que ya se completó."""
+    ultimo_completado = -1
+    for i, (_, campo) in enumerate(_ETAPAS_ORDEN):
+        if r.get(campo):
+            ultimo_completado = i
+
+    if ultimo_completado == -1:
+        return "Pendiente"
+    if ultimo_completado == len(_ETAPAS_ORDEN) - 1:
+        return "Liberado"
+    return _ETAPAS_ORDEN[ultimo_completado + 1][0]
 
 
 # Campos derivados que _recalcular_campos() inyecta en data — deben persistirse
@@ -193,6 +224,10 @@ _CAMPOS_CALC = [
     "des_dias_transito_terrestre",
     "des_fecha_limite_naviera",      # calculada: ETA Puerto + días sin demoras
     "alm_real_dias_etiquetado",      # calculada: terminación - inicio etiquetado
+    # Fechas proyectadas Booking→Almacén: Entrega + regla de
+    # importaciones_tiempos_estimados (origen + tipo_producto + vía)
+    "log_fecha_booking_prog", "imp_llegada_contenedor_prog",
+    "des_fecha_cruce_prog", "des_fecha_entrega_almacen_prog",
     # Conversiones USD: pesos / tipo_cambio_pedimento
     "cos_gastos_forwarder_usd", "cos_seguro_usd", "cos_custodia_usd",
     "cos_maniobras_usd", "cos_cargos_adicionales_usd", "cos_honorarios_usd",
@@ -273,6 +308,8 @@ def inicializar_tablas():
 
                 -- PROCESO DE LOGISTICA (22 items)
                 log_numero_contenedores          INT,
+                log_volumen_m3                   DECIMAL(10,3),
+                log_cantidad_producto            INT,
                 log_fecha_notificacion          DATE,
                 log_fecha_entrega_prog          DATE,
                 log_fecha_entrega               DATE,
@@ -472,6 +509,8 @@ def inicializar_tablas():
         # Migraciones para instancias existentes
         migraciones = [
             "ALTER TABLE importaciones ADD COLUMN IF NOT EXISTS log_numero_contenedores INT AFTER via_transporte",
+            "ALTER TABLE importaciones ADD COLUMN IF NOT EXISTS log_volumen_m3 DECIMAL(10,3) AFTER log_numero_contenedores",
+            "ALTER TABLE importaciones ADD COLUMN IF NOT EXISTS log_cantidad_producto INT AFTER log_volumen_m3",
             "ALTER TABLE importaciones ADD COLUMN IF NOT EXISTS campos_na JSON AFTER borradores",
             "ALTER TABLE importaciones ADD COLUMN IF NOT EXISTS odoo_importador VARCHAR(50) AFTER odoo_folio_orden",
             "ALTER TABLE importaciones ADD COLUMN IF NOT EXISTS alm_liberacion_etiquetado_uva DATE AFTER alm_fecha_limite_etiquetado",
@@ -555,7 +594,194 @@ def inicializar_tablas():
                 logging.warning("Migración falló: %s | %s", sql_plano, e)
         conn.commit()
 
+        # Tabla de reglas de tiempos estimados (origen + tipo_producto + vía →
+        # días entre etapas). Alimenta el cálculo automático de las fechas
+        # proyectadas Booking→Almacén en _recalcular_campos().
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS importaciones_tiempos_estimados (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                origen                  VARCHAR(100) NOT NULL,
+                tipo_producto            VARCHAR(100) NOT NULL,
+                via_transporte           VARCHAR(10)  NOT NULL,
+                dias_hasta_booking       INT NOT NULL DEFAULT 0,
+                dias_booking_a_puerto    INT NOT NULL DEFAULT 0,
+                dias_puerto_a_destino    INT NOT NULL DEFAULT 0,
+                dias_destino_a_almacen   INT NOT NULL DEFAULT 0,
+                created_at               TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at               TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                UNIQUE KEY uq_tiempo_estimado (origen, tipo_producto, via_transporte)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+        """)
+        conn.commit()
+
+        # Semilla inicial (solo inserta si la combinación no existe todavía --
+        # nunca pisa una regla que ya haya sido editada desde la pantalla de
+        # Tiempos Estimados).
+        cursor.executemany(
+            "INSERT IGNORE INTO importaciones_tiempos_estimados "
+            "(origen, tipo_producto, via_transporte, dias_hasta_booking, "
+            " dias_booking_a_puerto, dias_puerto_a_destino, dias_destino_a_almacen) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s)",
+            [
+                ("BELGICA",         "Bicicleta",               "MARITIMO", 15, 21, 15, 2),
+                ("ESPAÑA",          "Bicicleta",               "MARITIMO", 15, 21, 15, 2),
+                ("TAIWAN",          "Bicicleta",               "MARITIMO", 15, 23, 15, 2),
+                ("CAMBOYA",         "Bicicleta",               "MARITIMO", 15, 41, 15, 2),
+                ("CHINA",           "Bicicleta",               "MARITIMO", 15, 41, 15, 2),
+                ("ESTADOS UNIDOS",  "Accesorios y Bicicletas", "MARITIMO",  4,  3, 15, 2),
+                ("VIETNAM",         "Bicicleta",               "MARITIMO", 15, 46, 10, 2),
+                # Vía aérea
+                ("BELGICA",         "Bicicleta",               "AEREO",     1,  5, 10, 2),
+                ("ESPAÑA",          "Bicicleta",               "AEREO",     1,  5, 10, 2),
+                ("TAIWAN",          "Bicicleta",               "AEREO",     7,  5, 10, 2),
+                ("ESPAÑA",          "Accesorios",              "AEREO",     1,  5, 12, 2),
+                ("BELGICA",         "Accesorios",              "AEREO",     1,  5, 12, 2),
+                ("ESPAÑA",          "Accesorios y Bicicletas", "AEREO",     1,  5, 12, 2),
+                ("BELGICA",         "Accesorios y Bicicletas", "AEREO",     1,  5, 12, 2),
+                # Bicicleta eléctrica: únicamente España + Aéreo (ver _validar_payload_tiempo)
+                ("ESPAÑA",          "Bicicleta eléctrica",     "AEREO",    10,  7, 10, 2),
+            ],
+        )
+        conn.commit()
+
         return jsonify({"ok": True, "mensaje": "Tabla importaciones creada/verificada"}), 201
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    finally:
+        conn.close()
+
+
+# ── Reglas de tiempos estimados (origen+producto+vía → días entre etapas) ───
+# Alimentan el cálculo automático de las fechas proyectadas Booking→Almacén.
+# Pantalla de administración en el frontend: /importaciones/tiempos-estimados
+
+_CAMPOS_TIEMPO = [
+    "dias_hasta_booking", "dias_booking_a_puerto",
+    "dias_puerto_a_destino", "dias_destino_a_almacen",
+]
+
+
+def _validar_payload_tiempo(data: dict) -> str | None:
+    for campo in ("origen", "tipo_producto", "via_transporte"):
+        if not str(data.get(campo) or "").strip():
+            return f"Falta el campo '{campo}'"
+    for campo in _CAMPOS_TIEMPO:
+        try:
+            if int(data.get(campo)) < 0:
+                return f"'{campo}' no puede ser negativo"
+        except (TypeError, ValueError):
+            return f"'{campo}' debe ser un número entero de días"
+
+    # "Bicicleta eléctrica" únicamente se trae de España y por vía aérea (pedido explícito).
+    if str(data.get("tipo_producto") or "").strip() == "Bicicleta eléctrica" and (
+        str(data.get("origen") or "").strip() != "ESPAÑA"
+        or str(data.get("via_transporte") or "").strip() != "AEREO"
+    ):
+        return "'Bicicleta eléctrica' solo aplica para origen ESPAÑA y vía AEREO"
+
+    return None
+
+
+@importaciones_bp.route("/tiempos-estimados", methods=["GET"])
+def listar_tiempos_estimados():
+    conn = obtener_conexion()
+    if not conn:
+        return jsonify({"error": "Sin conexion a BD"}), 500
+    try:
+        cursor = conn.cursor(dictionary=True)
+        cursor.execute(
+            "SELECT * FROM importaciones_tiempos_estimados "
+            "ORDER BY origen, tipo_producto, via_transporte"
+        )
+        return jsonify([_serialize(r) for r in cursor.fetchall()]), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    finally:
+        conn.close()
+
+
+@importaciones_bp.route("/tiempos-estimados", methods=["POST"])
+def crear_tiempo_estimado():
+    data = request.get_json() or {}
+    error = _validar_payload_tiempo(data)
+    if error:
+        return jsonify({"error": error}), 400
+
+    conn = obtener_conexion()
+    if not conn:
+        return jsonify({"error": "Sin conexion a BD"}), 500
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            "INSERT INTO importaciones_tiempos_estimados "
+            "(origen, tipo_producto, via_transporte, dias_hasta_booking, "
+            " dias_booking_a_puerto, dias_puerto_a_destino, dias_destino_a_almacen) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s)",
+            (
+                data["origen"].strip(), data["tipo_producto"].strip(), data["via_transporte"].strip(),
+                int(data["dias_hasta_booking"]), int(data["dias_booking_a_puerto"]),
+                int(data["dias_puerto_a_destino"]), int(data["dias_destino_a_almacen"]),
+            ),
+        )
+        conn.commit()
+        return jsonify({"ok": True, "id": cursor.lastrowid}), 201
+    except Exception as e:
+        if "Duplicate entry" in str(e):
+            return jsonify({"error": "Ya existe una regla para esa combinación de origen, producto y vía"}), 409
+        return jsonify({"error": str(e)}), 500
+    finally:
+        conn.close()
+
+
+@importaciones_bp.route("/tiempos-estimados/<int:id_regla>", methods=["PUT"])
+def actualizar_tiempo_estimado(id_regla):
+    data = request.get_json() or {}
+    error = _validar_payload_tiempo(data)
+    if error:
+        return jsonify({"error": error}), 400
+
+    conn = obtener_conexion()
+    if not conn:
+        return jsonify({"error": "Sin conexion a BD"}), 500
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            "UPDATE importaciones_tiempos_estimados SET "
+            "origen = %s, tipo_producto = %s, via_transporte = %s, "
+            "dias_hasta_booking = %s, dias_booking_a_puerto = %s, "
+            "dias_puerto_a_destino = %s, dias_destino_a_almacen = %s "
+            "WHERE id = %s",
+            (
+                data["origen"].strip(), data["tipo_producto"].strip(), data["via_transporte"].strip(),
+                int(data["dias_hasta_booking"]), int(data["dias_booking_a_puerto"]),
+                int(data["dias_puerto_a_destino"]), int(data["dias_destino_a_almacen"]),
+                id_regla,
+            ),
+        )
+        conn.commit()
+        if cursor.rowcount == 0:
+            return jsonify({"error": "No encontrado"}), 404
+        return jsonify({"ok": True}), 200
+    except Exception as e:
+        if "Duplicate entry" in str(e):
+            return jsonify({"error": "Ya existe una regla para esa combinación de origen, producto y vía"}), 409
+        return jsonify({"error": str(e)}), 500
+    finally:
+        conn.close()
+
+
+@importaciones_bp.route("/tiempos-estimados/<int:id_regla>", methods=["DELETE"])
+def eliminar_tiempo_estimado(id_regla):
+    conn = obtener_conexion()
+    if not conn:
+        return jsonify({"error": "Sin conexion a BD"}), 500
+    try:
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM importaciones_tiempos_estimados WHERE id = %s", (id_regla,))
+        conn.commit()
+        if cursor.rowcount == 0:
+            return jsonify({"error": "No encontrado"}), 404
+        return jsonify({"ok": True}), 200
     except Exception as e:
         return jsonify({"error": str(e)}), 500
     finally:
@@ -603,7 +829,7 @@ def obtener(id_imp):
         if not row:
             return jsonify({"error": "No encontrado"}), 404
         row = _serialize(row)
-        row = _recalcular_campos(row)
+        row = _recalcular_campos(row, conn)
         row["progreso"] = _calcular_progreso(row)
         return jsonify(row), 200
     except Exception as e:
@@ -634,6 +860,8 @@ def dashboard():
     estado = request.args.get("estado", "").strip()
     origen = request.args.get("origen", "").strip()
     anio   = request.args.get("anio",   "").strip()
+    fecha_desde = request.args.get("fecha_desde", "").strip()
+    fecha_hasta = request.args.get("fecha_hasta", "").strip()
 
     conn = obtener_conexion()
     if not conn:
@@ -655,6 +883,15 @@ def dashboard():
         if anio:
             where.append("YEAR(COALESCE(log_fecha_booking, created_at)) = %s")
             params.append(int(anio))
+        # Rango de fechas (temporada o rango manual) -- aplica a TODO el
+        # dashboard (KPIs, latencias, costos, embarques) porque filtra las
+        # mismas `rows` de las que se derivan todos los cálculos.
+        if fecha_desde:
+            where.append("COALESCE(log_fecha_booking, created_at) >= %s")
+            params.append(fecha_desde)
+        if fecha_hasta:
+            where.append("COALESCE(log_fecha_booking, created_at) <= %s")
+            params.append(fecha_hasta)
 
         w = " AND ".join(where)
         cursor.execute(
@@ -671,7 +908,28 @@ def dashboard():
 
         fletes = [float(r["cos_flete_internacional_usd"]) for r in rows if r.get("cos_flete_internacional_usd")]
         flete_total = round(sum(fletes), 2)
-        flete_prom  = round(flete_total / len(fletes), 2) if fletes else 0
+
+        # Flete total separado por vía -- mezclar marítimo y aéreo en un solo
+        # número esconde que son escalas de costo muy distintas.
+        flete_total_maritimo = round(sum(
+            float(r["cos_flete_internacional_usd"]) for r in rows
+            if r.get("cos_flete_internacional_usd") and (r.get("via_transporte") or "MARITIMO") == "MARITIMO"
+        ), 2)
+        flete_total_aereo = round(sum(
+            float(r["cos_flete_internacional_usd"]) for r in rows
+            if r.get("cos_flete_internacional_usd") and r.get("via_transporte") == "AEREO"
+        ), 2)
+
+        # Promedio POR CONTENEDOR, no por embarque -- un embarque de 4 contenedores
+        # no debe pesar igual que uno de 1 al promediar el flete.
+        _fletes_cont = [
+            (float(r["cos_flete_internacional_usd"]), int(r["log_numero_contenedores"]))
+            for r in rows
+            if r.get("cos_flete_internacional_usd") and r.get("log_numero_contenedores")
+        ]
+        _flete_cont_total = sum(f for f, _ in _fletes_cont)
+        _contenedores_total = sum(c for _, c in _fletes_cont)
+        flete_prom = round(_flete_cont_total / _contenedores_total, 2) if _contenedores_total else 0
 
         avances = []
         _prog_cache: dict = {}
@@ -722,16 +980,30 @@ def dashboard():
                 label = mes_key
             por_mes_list.append({"mes": mes_key, "label": label, **por_mes[mes_key]})
 
-        # ── Flete promedio por vía ────────────────────────────────────────────
-        f_mar = [float(r["cos_flete_internacional_usd"]) for r in rows
-                 if r.get("cos_flete_internacional_usd") and (r.get("via_transporte") or "MARITIMO") == "MARITIMO"]
-        f_aer = [float(r["cos_flete_internacional_usd"]) for r in rows
-                 if r.get("cos_flete_internacional_usd") and r.get("via_transporte") == "AEREO"]
+        # ── Flete promedio por vía (POR CONTENEDOR, no por embarque) ──────────
+        f_mar_cont = [
+            (float(r["cos_flete_internacional_usd"]), int(r["log_numero_contenedores"]))
+            for r in rows
+            if r.get("cos_flete_internacional_usd") and r.get("log_numero_contenedores")
+            and (r.get("via_transporte") or "MARITIMO") == "MARITIMO"
+        ]
+        f_aer_cont = [
+            (float(r["cos_flete_internacional_usd"]), int(r["log_numero_contenedores"]))
+            for r in rows
+            if r.get("cos_flete_internacional_usd") and r.get("log_numero_contenedores")
+            and r.get("via_transporte") == "AEREO"
+        ]
+        _mar_flete_sum = sum(f for f, _ in f_mar_cont)
+        _mar_cont_sum  = sum(c for _, c in f_mar_cont)
+        _aer_flete_sum = sum(f for f, _ in f_aer_cont)
+        _aer_cont_sum  = sum(c for _, c in f_aer_cont)
         flete_por_via = {
-            "maritimo_avg":   round(sum(f_mar) / len(f_mar), 2) if f_mar else 0,
-            "maritimo_count": len(f_mar),
-            "aereo_avg":      round(sum(f_aer) / len(f_aer), 2) if f_aer else 0,
-            "aereo_count":    len(f_aer),
+            "maritimo_avg":          round(_mar_flete_sum / _mar_cont_sum, 2) if _mar_cont_sum else 0,
+            "maritimo_count":        len(f_mar_cont),
+            "maritimo_contenedores": _mar_cont_sum,
+            "aereo_avg":             round(_aer_flete_sum / _aer_cont_sum, 2) if _aer_cont_sum else 0,
+            "aereo_count":           len(f_aer_cont),
+            "aereo_contenedores":    _aer_cont_sum,
         }
 
         # ── Por estado ────────────────────────────────────────────────────────
@@ -1029,7 +1301,7 @@ def dashboard():
                 v_usd = r.get(campo_u)
                 if v_usd is not None:
                     try: total_usd += float(v_usd); continue
-                    except: pass
+                    except: pass    
                 v_pesos = r.get(campo_p)
                 if v_pesos and tc:
                     try: total_usd += float(v_pesos) / tc
@@ -1056,14 +1328,17 @@ def dashboard():
             }
             return model_prices, round(total_usd / total_bikes, 4)
 
-        # Acumular precio/bici por modelo
+        # Acumular precio/bici por modelo -- y adjuntar el desglose por caja
+        # también a cada embarque individual (embarques_res está en el mismo
+        # orden y con la misma longitud que rows, un elemento por fila).
         _model_vals: dict = {}
         _total_vals: list = []
-        for r in rows:
+        for i, r in enumerate(rows):
             res = _precio_bici_row(r)
             if res is None:
                 continue
             model_prices, total_price = res
+            embarques_res[i]["precio_bici_x_caja"] = model_prices
             for label, price in model_prices.items():
                 _model_vals.setdefault(label, []).append(price)
             _total_vals.append(total_price)
@@ -1090,13 +1365,15 @@ def dashboard():
             if str(r.get("log_fecha_booking") or r.get("created_at", ""))[:4].isdigit()
         }, reverse=True)
 
-        return jsonify({
+        resp = make_response(jsonify({
             "kpis": {
                 "total":                           total,
                 "activos":                         activos,
                 "cerrados":                        cerrados,
                 "cancelados":                      cancelados,
                 "flete_total_usd":                 flete_total,
+                "flete_total_maritimo_usd":        flete_total_maritimo,
+                "flete_total_aereo_usd":            flete_total_aereo,
                 "flete_promedio_usd":              flete_prom,
                 "transito_maritimo_promedio_dias": transito_prom,
                 "transito_maritimo_n":             len(_trans_maritimo),
@@ -1127,7 +1404,11 @@ def dashboard():
                 "origenes": all_origenes,
                 "anios":    all_anios,
             },
-        }), 200
+        }))
+        # Dashboard operativo: nunca servir una copia vieja del navegador --
+        # los datos cambian con cada captura y el usuario espera verlas de inmediato.
+        resp.headers["Cache-Control"] = "no-store"
+        return resp, 200
     except Exception as e:
         import traceback
         traceback.print_exc()
@@ -1149,7 +1430,7 @@ def crear():
         return jsonify({"error": "Sin conexion a BD"}), 500
     try:
         # Calcular campos derivados
-        data = _recalcular_campos(data)
+        data = _recalcular_campos(data, conn)
 
         cols = list(dict.fromkeys(
             [k for k in data if k != "id" and k in _COLS_PERMITIDAS]
@@ -1261,7 +1542,7 @@ def actualizar(id_imp):
                 existing_campos_na.discard(campo)  # Real value overrides N/A
 
         merged = {**{k: v for k, v in existing.items()}, **data}
-        merged = _recalcular_campos(merged)
+        merged = _recalcular_campos(merged, conn)
 
         campos_a_actualizar = (
             [c for c in data.keys() if c in _COLS_PERMITIDAS]
@@ -1309,7 +1590,16 @@ def actualizar(id_imp):
                 )
                 conn.commit()
 
-        return jsonify({"ok": True}), 200
+        return jsonify({
+            "ok": True,
+            # Fechas proyectadas recién calculadas -- evita un segundo round-trip
+            # al frontend solo para refrescar estos 4 campos de solo lectura.
+            "log_fecha_booking_prog":         merged.get("log_fecha_booking_prog"),
+            "imp_llegada_contenedor_prog":    merged.get("imp_llegada_contenedor_prog"),
+            "des_fecha_cruce_prog":           merged.get("des_fecha_cruce_prog"),
+            "des_fecha_entrega_almacen_prog": merged.get("des_fecha_entrega_almacen_prog"),
+            "tiempos_estimados_faltantes":    merged.get("tiempos_estimados_faltantes", False),
+        }), 200
     except Exception as e:
         conn.rollback()
         return jsonify({"error": str(e)}), 500
@@ -1349,7 +1639,29 @@ def resumen():
 
 # ── lógica de cálculos automáticos ───────────────────────────────────────────
 
-def _recalcular_campos(data: dict) -> dict:
+def _buscar_regla_tiempos(conn, origen, tipo_producto, via_transporte):
+    """Busca en importaciones_tiempos_estimados la regla exacta para esta
+    combinación. None si no hay conexión o no existe ninguna regla configurada."""
+    if not conn:
+        return None
+    try:
+        cur = conn.cursor(dictionary=True)
+        cur.execute(
+            """SELECT dias_hasta_booking, dias_booking_a_puerto,
+                      dias_puerto_a_destino, dias_destino_a_almacen
+               FROM importaciones_tiempos_estimados
+               WHERE origen = %s AND tipo_producto = %s AND via_transporte = %s""",
+            (origen, tipo_producto, via_transporte),
+        )
+        regla = cur.fetchone()
+        cur.close()
+        return regla
+    except Exception as e:
+        logging.warning("No se pudo consultar importaciones_tiempos_estimados: %s", e)
+        return None
+
+
+def _recalcular_campos(data: dict, conn=None) -> dict:
     # Días que tardó en salir (Booking - Fecha de entrega Scott)
     data["log_dias_salida_tras_entrega"] = _calc_dias(
         data.get("log_fecha_entrega"),
@@ -1480,5 +1792,46 @@ def _recalcular_campos(data: dict) -> dict:
     data["cos_precio_bici_total"] = (
         round(total_usd_dist / total_bikes, 4) if total_usd_dist > 0 and total_bikes > 0 else None
     )
+
+    # ── Fechas proyectadas Booking→Almacén (solo lectura, calculadas) ──────────
+    # A partir de Entrega (real) + la regla de importaciones_tiempos_estimados
+    # que haga match exacto con origen + tipo de producto + vía. Se recalculan
+    # SIEMPRE que se guarde el embarque, sobre-escribiendo cualquier valor
+    # anterior -- así nunca quedan desfasadas de Entrega/origen/producto/vía.
+    entrega       = data.get("log_fecha_entrega")
+    origen        = data.get("log_origen")
+    tipo_producto = data.get("log_tipo_productos")
+    via           = data.get("via_transporte")
+
+    _CAMPOS_PROY_CADENA = [
+        "log_fecha_booking_prog", "imp_llegada_contenedor_prog",
+        "des_fecha_cruce_prog", "des_fecha_entrega_almacen_prog",
+    ]
+    data["tiempos_estimados_faltantes"] = False
+
+    if entrega and origen and tipo_producto and via:
+        regla = _buscar_regla_tiempos(conn, origen, tipo_producto, via)
+        if regla:
+            try:
+                base = date.fromisoformat(str(entrega)[:10])
+                f_booking = base      + timedelta(days=int(regla["dias_hasta_booking"]))
+                f_puerto  = f_booking + timedelta(days=int(regla["dias_booking_a_puerto"]))
+                f_destino = f_puerto  + timedelta(days=int(regla["dias_puerto_a_destino"]))
+                f_almacen = f_destino + timedelta(days=int(regla["dias_destino_a_almacen"]))
+                data["log_fecha_booking_prog"]         = f_booking.isoformat()
+                data["imp_llegada_contenedor_prog"]    = f_puerto.isoformat()
+                data["des_fecha_cruce_prog"]           = f_destino.isoformat()
+                data["des_fecha_entrega_almacen_prog"] = f_almacen.isoformat()
+            except Exception as e:
+                logging.warning("Error calculando fechas proyectadas: %s", e)
+                for c in _CAMPOS_PROY_CADENA:
+                    data[c] = None
+        else:
+            # Combinación origen+producto+vía sin regla configurada todavía.
+            for c in _CAMPOS_PROY_CADENA:
+                data[c] = None
+            data["tiempos_estimados_faltantes"] = True
+    # Si falta Entrega/origen/producto/vía no se tocan estos campos: en creación
+    # quedan como llegaron (None); en edición conservan lo ya calculado en `merged`.
 
     return data

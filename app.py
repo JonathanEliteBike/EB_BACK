@@ -34,6 +34,13 @@ from routes.asignaciones_importaciones import asignaciones_bp
 from routes.solicitud_retroactivo import solicitud_retroactivo_bp
 from routes.solicitud_retroactivo_campanias import solicitud_retroactivo_campanias_bp
 
+# Blueprints Permisos
+from routes.usuarios_hijos_bp import usuarios_hijos_bp
+from routes.permisos_bp import permisos_bp
+from routes.modulos_bp import modulos_bp
+from routes.acciones_bp import acciones_bp
+from routes.admin_sistema_bp import admin_sistema_bp
+
 # Importamos la instancia de Celery desde celery_worker
 from celery_worker import celery_app as celery
 
@@ -174,6 +181,13 @@ def create_app():
     app.register_blueprint(asignaciones_bp)
     app.register_blueprint(solicitud_retroactivo_bp)
     app.register_blueprint(solicitud_retroactivo_campanias_bp)
+
+    # --- REGISTRO DE PERMISOS ---
+    app.register_blueprint(usuarios_hijos_bp)
+    app.register_blueprint(permisos_bp)
+    app.register_blueprint(modulos_bp)
+    app.register_blueprint(acciones_bp)
+    app.register_blueprint(admin_sistema_bp)
 
     # Iniciar scheduler de sync automático (L-V 08:30 CDMX)
     init_scheduler()

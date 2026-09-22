@@ -1,10 +1,11 @@
-from flask import Blueprint, jsonify, request
+from flask import Blueprint, jsonify, request, g
 from models.user_model import obtener_usuarios
 import re
 import logging
 from utils.seguridad import hash_password, verificar_password, generar_token
 from utils.odoo_utils import get_odoo_models, ODOO_DB, ODOO_PASSWORD, ODOO_COMPANY_ID
 from db_conexion import obtener_conexion
+from utils.auth_decorators import requiere_autenticacion, requiere_rol
 
 def campo_vacio(valor):
     return valor is None or (isinstance(valor, str) and valor.strip() == "")
@@ -370,17 +371,28 @@ def actualizar_usuario(usuario_id):
             conexion.close()
     
 @usuarios_bp.route('/<int:usuario_id>', methods=['DELETE'])
+@requiere_autenticacion
+@requiere_rol(1)
 def eliminar_usuario(usuario_id):
     conexion = obtener_conexion()
+    if not conexion:
+        return jsonify({"error": "No fue posible eliminar el usuario."}), 500
     cursor = conexion.cursor(dictionary=True)
 
     try:
-        # 1. Verificar si el usuario existe
-        cursor.execute("SELECT * FROM usuarios WHERE id = %s", (usuario_id,))
+        # Validar primero el objetivo y las reglas de negocio, sin modificar datos.
+        cursor.execute("SELECT id, usuario, rol_id FROM usuarios WHERE id = %s", (usuario_id,))
         usuario = cursor.fetchone()
 
         if not usuario:
-            return jsonify({"error": "Usuario no encontrado"}), 404
+            return jsonify({"error": "Usuario no encontrado."}), 404
+
+        # Un administrador autenticado nunca puede invalidar la sesión actual
+        # eliminando su propia cuenta.
+        if usuario_id == g.usuario_actual['id']:
+            return jsonify({
+                "error": "No puedes eliminar tu propia cuenta de administrador."
+            }), 409
 
         # 2. Validación: No permitir eliminar el último administrador
         if usuario['rol_id'] == 1:  # Si es administrador
@@ -394,21 +406,82 @@ def eliminar_usuario(usuario_id):
             
             if otros_admins == 0:
                 return jsonify({
-                    "error": "No se puede eliminar al último administrador"
+                    "error": "No se puede eliminar al último administrador."
                 }), 400
 
-        # 3. Eliminación física (PERMANENTE)
+        # Las solicitudes de retroactivo son historial financiero. No se borran
+        # como efecto colateral de eliminar un usuario.
+        cursor.execute(
+            "SELECT COUNT(*) AS total FROM solicitud_retroactivo_venta WHERE id_usuario = %s",
+            (usuario_id,),
+        )
+        if cursor.fetchone()['total'] > 0:
+            return jsonify({
+                "error": "El usuario tiene solicitudes de retroactivo asociadas y no puede eliminarse porque existe información histórica relacionada."
+            }), 409
+
+        # No se eliminan ni reasignan hijos automáticamente: un distribuidor no
+        # puede dejar usuarios hijo huérfanos.
+        if usuario['rol_id'] == 2:
+            cursor.execute(
+                "SELECT COUNT(*) AS total FROM jerarquia_usuarios WHERE padre_id = %s",
+                (usuario_id,),
+            )
+            if cursor.fetchone()['total'] > 0:
+                return jsonify({
+                    "error": "El distribuidor tiene usuarios hijos asociados. Elimine o reasigne sus usuarios hijos antes de eliminarlo."
+                }), 409
+
+        # obtener_conexion() trabaja con autocommit desactivado. Las consultas
+        # de validación anteriores ya abrieron la transacción implícita; volver
+        # a llamar start_transaction() provoca "Transaction already in progress".
+        # Los DELETE siguientes, commit y rollback permanecen en esa misma
+        # transacción atómica.
+
+        # Dependencias individuales (modelo nuevo y compatibilidad antigua).
+        cursor.execute("DELETE FROM usuario_capacidades WHERE usuario_id = %s", (usuario_id,))
+        cursor.execute("DELETE FROM usuario_modulos WHERE usuario_id = %s", (usuario_id,))
+        cursor.execute("DELETE FROM usuario_permisos WHERE usuario_id = %s", (usuario_id,))
+        cursor.execute("DELETE FROM configuracion_montos_usuario_ambito WHERE usuario_id = %s", (usuario_id,))
+        cursor.execute("DELETE FROM configuracion_montos_usuario WHERE usuario_id = %s", (usuario_id,))
+
+        # Bolsa delegable y límite del distribuidor. En otro rol son operaciones
+        # inocuas que también limpian posibles residuos inconsistentes.
+        cursor.execute("DELETE FROM permisos_delegables_capacidades WHERE administrador_id = %s", (usuario_id,))
+        cursor.execute("DELETE FROM permisos_delegables_modulos WHERE administrador_id = %s", (usuario_id,))
+        cursor.execute("DELETE FROM permisos_delegables WHERE administrador_id = %s", (usuario_id,))
+        cursor.execute("DELETE FROM limites_usuario WHERE padre_id = %s", (usuario_id,))
+
+        # Rol 3: borra su relación como hijo. Rol 2: el prechequeo anterior
+        # garantiza que no se eliminará una relación que deje hijos huérfanos.
+        cursor.execute("DELETE FROM jerarquia_usuarios WHERE hijo_id = %s", (usuario_id,))
+        cursor.execute("DELETE FROM jerarquia_usuarios WHERE padre_id = %s", (usuario_id,))
+
+        # Esta relación usa usuarios.usuario (no usuarios.id), pero su FK también
+        # impide la eliminación física si quedan historiales asociados.
+        cursor.execute("DELETE FROM historial_caratulas WHERE usuario_envio = %s", (usuario['usuario'],))
+
+        # Eliminación física final, después de todas las relaciones dependientes.
         cursor.execute("DELETE FROM usuarios WHERE id = %s", (usuario_id,))
-        conexion.commit()  # Confirmar la transacción
+        if cursor.rowcount != 1:
+            raise RuntimeError("No se pudo eliminar el usuario objetivo.")
+        conexion.commit()
 
         return jsonify({
             "mensaje": "Usuario eliminado permanentemente de la base de datos",
         }), 200
 
     except Exception as e:
-        conexion.rollback()  # Revertir en caso de error
+        conexion.rollback()
+        logging.exception("Error al eliminar usuario id=%s", usuario_id)
+        # Defensa ante una dependencia futura no incluida en la limpieza. El
+        # detalle SQL se conserva en el log, nunca se expone al frontend.
+        if getattr(e, 'errno', None) == 1451:
+            return jsonify({
+                "error": "El usuario tiene información relacionada y no puede eliminarse."
+            }), 409
         return jsonify({
-            "error": f"Error al eliminar el usuario: {str(e)}"
+            "error": "No fue posible eliminar el usuario. Intenta nuevamente o contacta al administrador."
         }), 500
     finally:
         if cursor:

@@ -2,7 +2,7 @@ import unicodedata
 import os
 import re
 import logging
-from flask import Blueprint, jsonify, request
+from flask import Blueprint, jsonify, request, g
 from db_conexion import obtener_conexion
 import decimal
 import traceback
@@ -14,6 +14,79 @@ import openpyxl
 retroactivos_bp = Blueprint('retroactivos', __name__, url_prefix='')
 
 from utils.jwt_utils import verificar_token
+from utils.auth_decorators import (
+    requiere_autenticacion,
+    requiere_modulo,
+    requiere_modulos,
+    requiere_rol,
+)
+from services.politica_montos_service import PoliticaMontosService
+
+
+# Los importes de retroactivos son información sensible. Esta lista se aplica
+# antes de responder al portal para que ocultarlos en Angular no sea la única
+# barrera: un usuario sin la capacidad no los recibe en la respuesta HTTP.
+_CAMPOS_MONETARIOS_RETROACTIVOS = {
+    'compra_minima_anual',
+    'compra_minima_apparel',
+    'compras_totales_crudo',
+    'compra_global_scott',
+    'compra_global_apparel',
+    'compra_global_bold',
+    'total_acumulado',
+    'compra_anual_crudo',
+    'compra_adicional',
+    'notas_credito',
+    'garantias',
+    'productos_ofertados',
+    'bicicleta_demo',
+    'bicicletas_bold',
+    'importe_final',
+    'importe',
+    'acumulado_global_calculado',
+    'total_bicis_deduccion',
+}
+
+
+def _ocultar_montos_retroactivos(datos):
+    """Elimina importes y acumulados de una fila antes de serializarla."""
+    for campo in list(datos):
+        nombre = str(campo).lower()
+        if (
+            nombre in _CAMPOS_MONETARIOS_RETROACTIVOS
+            or nombre.startswith(('compra_', 'acumulado_', 'avance_'))
+            or 'monto' in nombre
+            or 'importe' in nombre
+            or 'costo' in nombre
+            or 'precio' in nombre
+            or 'deduccion' in nombre
+        ):
+            datos.pop(campo, None)
+    return datos
+
+
+def _debe_ocultar_montos_retroactivos():
+    return PoliticaMontosService.debe_ocultar_montos(g.usuario_actual['id'], 'retroactivos')
+
+
+def _clave_cliente_autenticado(cursor):
+    """Resuelve la clave del cliente del JWT para no aceptar claves ajenas."""
+    if int(g.usuario_actual['rol']) == 1:
+        return None
+
+    cursor.execute(
+        """
+        SELECT c.clave
+        FROM usuarios u
+        INNER JOIN clientes c ON c.id = u.cliente_id
+        WHERE u.id = %s AND u.activo = 1
+        """,
+        (g.usuario_actual['id'],),
+    )
+    cliente = cursor.fetchone()
+    if not cliente or not cliente.get('clave'):
+        raise PermissionError('El usuario autenticado no tiene un cliente válido asociado.')
+    return cliente['clave']
 
 
 def _fecha_corte_temporada_abierta():
@@ -3076,6 +3149,8 @@ def obtener_claves_retroactivos():
 # 3B. ENDPOINT GET GLOBAL
 # ==============================================================================
 @retroactivos_bp.route('/retroactivos', methods=['GET'])
+@requiere_autenticacion
+@requiere_rol(1)
 def obtener_retroactivos():
 
     conexion = obtener_conexion()
@@ -3283,7 +3358,17 @@ def cerrar_retroactivos_temporada_endpoint():
         return jsonify({'error': str(e)}), 500
 
 
+@retroactivos_bp.route('/api/retroactivos/calculadora/acceso', methods=['GET'])
+@requiere_autenticacion
+@requiere_modulos('usuarios_retroactivos', 'usuarios_calculadora_retroactivos')
+def verificar_acceso_calculadora_retroactivos():
+    """Verificación de servidor para la calculadora, que hoy es local en Angular."""
+    return jsonify({'acceso': True}), 200
+
+
 @retroactivos_bp.route('/retroactivos_temporadas_disponibles', methods=['GET'])
+@requiere_autenticacion
+@requiere_modulo('usuarios_retroactivos')
 def retroactivos_temporadas_disponibles():
     """Temporadas con snapshot en tabla_retroactivos_historico.
 
@@ -3308,6 +3393,8 @@ def retroactivos_temporadas_disponibles():
 
 
 @retroactivos_bp.route('/retroactivos_historico', methods=['GET'])
+@requiere_autenticacion
+@requiere_modulo('usuarios_retroactivos')
 def retroactivos_historico():
     temporada = request.args.get('temporada')
     if not temporada:
@@ -3316,16 +3403,32 @@ def retroactivos_historico():
     conexion = obtener_conexion()
     try:
         cursor = conexion.cursor(dictionary=True)
-        cursor.execute(
-            "SELECT * FROM tabla_retroactivos_historico WHERE temporada = %s ORDER BY CLAVE",
-            (temporada,)
-        )
+        clave_cliente = _clave_cliente_autenticado(cursor)
+        if clave_cliente:
+            cursor.execute(
+                """
+                SELECT * FROM tabla_retroactivos_historico
+                WHERE temporada = %s AND UPPER(TRIM(CLAVE)) = UPPER(TRIM(%s))
+                ORDER BY CLAVE
+                """,
+                (temporada, clave_cliente),
+            )
+        else:
+            cursor.execute(
+                "SELECT * FROM tabla_retroactivos_historico WHERE temporada = %s ORDER BY CLAVE",
+                (temporada,),
+            )
         resultados = cursor.fetchall()
+        debe_ocultar_montos = _debe_ocultar_montos_retroactivos()
         for fila in resultados:
             for clave, valor in fila.items():
                 fila[clave] = convertir_decimal_y_fecha(valor)
+            if debe_ocultar_montos:
+                _ocultar_montos_retroactivos(fila)
         cursor.close()
         return jsonify(resultados), 200
+    except PermissionError as e:
+        return jsonify({'error': str(e)}), 403
     except Exception as e:
         logging.exception('Error en retroactivos_historico')
         return jsonify({'error': str(e)}), 500
@@ -3636,12 +3739,17 @@ def cerrar_temporada_masiva_pendientes_endpoint():
 # 6. ENDPOINT GET INDIVIDUAL
 # ==============================================================================
 @retroactivos_bp.route('/retroactivo_cliente/<string:identificador>', methods=['GET'])
+@requiere_autenticacion
+@requiere_modulo('usuarios_retroactivos')
 def obtener_retroactivo_individual(identificador):
 
     conexion = obtener_conexion()
     cursor = conexion.cursor(dictionary=True)
 
     try:
+        clave_cliente = _clave_cliente_autenticado(cursor)
+        if clave_cliente:
+            identificador = clave_cliente
         query = """
             SELECT
                 tr.CLAVE, tr.ZONA, tr.CLIENTE, tr.CATEGORIA,
@@ -3745,8 +3853,13 @@ def obtener_retroactivo_individual(identificador):
             cliente_data.get('garantias', 0)
         )
 
+        if _debe_ocultar_montos_retroactivos():
+            _ocultar_montos_retroactivos(cliente_data)
+
         return jsonify(cliente_data), 200
 
+    except PermissionError as e:
+        return jsonify({'error': str(e)}), 403
     except Exception as e:
         print("[ERROR] Error al obtener cliente:", str(e))
         traceback.print_exc()

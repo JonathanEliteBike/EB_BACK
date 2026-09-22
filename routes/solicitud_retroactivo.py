@@ -4,12 +4,14 @@ import json
 import logging
 import os
 
-from flask import Blueprint, jsonify, request
+from flask import Blueprint, jsonify, request, g
 from db_conexion import obtener_conexion
 from services.s3_service import generar_url_firmada_s3, subir_archivo_s3
 from services import solicitud_retroactivo_service as data
 from utils.jwt_utils import verificar_token
 from utils.auditoria_utils import verificar_codigo_auditoria
+from utils.auth_decorators import requiere_autenticacion, requiere_modulos, requiere_rol
+from services.politica_montos_service import PoliticaMontosService
 
 solicitud_retroactivo_bp = Blueprint('solicitud-retroactivo', __name__)
 
@@ -48,6 +50,37 @@ def _requiere_admin(request):
         return int(payload.get('rol')) == 1
     except (TypeError, ValueError):
         return False
+
+
+def _debe_ocultar_montos_retroactivos():
+    return PoliticaMontosService.debe_ocultar_montos(g.usuario_actual['id'], 'retroactivos')
+
+
+def _redactar_montos_solicitud(fila):
+    for campo in list(fila):
+        nombre = str(campo).lower()
+        if 'precio' in nombre or 'monto' in nombre or 'importe' in nombre or 'costo' in nombre:
+            fila.pop(campo, None)
+    return fila
+
+
+def _cliente_id_autenticado(cursor):
+    """Resuelve el cliente real del JWT; nunca acepta el cliente del body."""
+    if int(g.usuario_actual.get('rol', 0)) == 1:
+        return None
+
+    cursor.execute(
+        """
+        SELECT cliente_id
+        FROM usuarios
+        WHERE id = %s AND activo = 1
+        """,
+        (g.usuario_actual['id'],),
+    )
+    usuario = cursor.fetchone()
+    if not usuario or not usuario.get('cliente_id'):
+        raise PermissionError('El usuario autenticado no tiene un cliente válido asociado.')
+    return int(usuario['cliente_id'])
 
 
 def _parsear_validacion_docs(raw):
@@ -107,6 +140,8 @@ def _calcular_estatus(validacion_docs, tiene_factura_xml=False):
     return 'pendiente'
 
 @solicitud_retroactivo_bp.route('/api/solicitud-retroactivo/registrar/venta', methods=['POST'])
+@requiere_autenticacion
+@requiere_modulos('usuarios_retroactivos', 'usuarios_solicitudes_retroactivos')
 def registrar_venta():
     # 1. Recuperar los campos del formulario
     campos_obligatorios = [
@@ -122,8 +157,7 @@ def registrar_venta():
     datos['nombre_completo'] = request.form.get('nombre_completo')
     datos['nombre_sucursal'] = request.form.get('nombre_sucursal')
 
-    usuario_actual = _usuario_desde_token(request)
-    nombre_usuario = usuario_actual.get('nombre') or usuario_actual.get('usuario') if usuario_actual else None
+    nombre_usuario = g.usuario_actual.get('nombre') or g.usuario_actual.get('usuario')
 
     # 2. Validar que los archivos obligatorios estén presentes (PDF y XML son opcionales)
     for key_archivo in ARCHIVOS_REQUERIDOS.keys():
@@ -174,6 +208,11 @@ def registrar_venta():
     cursor = conexion.cursor(dictionary=True, buffered=True)
 
     try:
+        cliente_id_autenticado = _cliente_id_autenticado(cursor)
+        if cliente_id_autenticado is not None:
+            datos['id_usuario'] = str(g.usuario_actual['id'])
+            datos['id_cliente'] = str(cliente_id_autenticado)
+
         # Resolver nombre_completo y nombre_sucursal si se enviaron IDs de cliente/tienda
         if datos.get('id_cliente') or datos.get('id_tienda'):
             nom_cli, nom_suc = data.obtener_nombres_cliente_y_tienda(cursor, datos.get('id_cliente'), datos.get('id_tienda'))
@@ -181,6 +220,14 @@ def registrar_venta():
                 datos['nombre_completo'] = nom_cli
             if nom_suc:
                 datos['nombre_sucursal'] = nom_suc
+
+        if cliente_id_autenticado is not None and datos.get('id_tienda'):
+            cursor.execute(
+                "SELECT 1 FROM tiendas WHERE id = %s AND cliente_id = %s",
+                (datos['id_tienda'], cliente_id_autenticado),
+            )
+            if not cursor.fetchone():
+                return jsonify({'error': 'La tienda no pertenece al cliente autenticado.'}), 403
 
         if not datos.get('nombre_completo'):
             datos['nombre_completo'] = request.form.get('nombre_completo') or 'Cliente'
@@ -244,13 +291,19 @@ def registrar_venta():
             )
             conexion.commit()
 
-        return jsonify({
+        respuesta = {
             "respuesta": True,
             "mensaje": "Venta y archivos registrados exitosamente",
             "datos_venta": datos,
             "archivos": archivos_procesados
-        }), 200
+        }
+        if _debe_ocultar_montos_retroactivos():
+            _redactar_montos_solicitud(respuesta['datos_venta'])
+        return jsonify(respuesta), 200
 
+    except PermissionError as e:
+        conexion.rollback()
+        return jsonify({'error': str(e)}), 403
     except Exception as e:
         conexion.rollback()
         logging.exception("Error en BD al registrar la venta: %s", e)
@@ -260,6 +313,8 @@ def registrar_venta():
         conexion.close()
 
 @solicitud_retroactivo_bp.route('/api/solicitud-retroactivo/msi', methods=['GET'])
+@requiere_autenticacion
+@requiere_modulos('usuarios_retroactivos', 'usuarios_solicitudes_retroactivos')
 def buscar_msi():
     conexion = obtener_conexion()
     if not conexion:
@@ -279,6 +334,8 @@ def buscar_msi():
         conexion.close()
 
 @solicitud_retroactivo_bp.route('/api/solicitud-retroactivo/marca', methods=['GET'])
+@requiere_autenticacion
+@requiere_modulos('usuarios_retroactivos', 'usuarios_solicitudes_retroactivos')
 def buscar_marca():
     conexion = obtener_conexion()
     if not conexion:
@@ -298,6 +355,8 @@ def buscar_marca():
         conexion.close()
 
 @solicitud_retroactivo_bp.route('/api/solicitud-retroactivo/formulario', methods=['GET'])
+@requiere_autenticacion
+@requiere_modulos('usuarios_retroactivos', 'usuarios_solicitudes_retroactivos')
 def buscar_formulario():
     """GUÍA: antes leía del catálogo viejo (solicitud_retroactivo_formulario,
     solo 2 filas fijas vía SP). Ahora regresa las campañas del módulo de
@@ -322,6 +381,8 @@ def buscar_formulario():
 
 
 @solicitud_retroactivo_bp.route('/api/solicitud-retroactivo/campania/<int:id_campania>/msi', methods=['GET'])
+@requiere_autenticacion
+@requiere_modulos('usuarios_retroactivos', 'usuarios_solicitudes_retroactivos')
 def msi_por_campania(id_campania):
     """Plazos MSI ligados a una campaña, cada uno con SU % propio -- el
     formulario de venta los carga en cuanto el usuario elige la campaña."""
@@ -344,6 +405,8 @@ def msi_por_campania(id_campania):
 
 
 @solicitud_retroactivo_bp.route('/api/solicitud-retroactivo/campania/<int:id_campania>/productos', methods=['GET'])
+@requiere_autenticacion
+@requiere_modulos('usuarios_retroactivos', 'usuarios_solicitudes_retroactivos')
 def productos_por_campania(id_campania):
     """Productos ligados a una campaña -- el formulario de venta los carga en
     cuanto el usuario elige la campaña, para que "Modelo" solo ofrezca lo que
@@ -367,6 +430,8 @@ def productos_por_campania(id_campania):
 
 
 @solicitud_retroactivo_bp.route('/api/solicitud-retroactivo/campania/<int:id_campania>/marcas', methods=['GET'])
+@requiere_autenticacion
+@requiere_modulos('usuarios_retroactivos', 'usuarios_solicitudes_retroactivos')
 def marcas_por_campania(id_campania):
     """Marcas distintas entre los productos de una campaña -- el selector de
     "Marca" solo se activa en el formulario de venta si hay 2 o más."""
@@ -389,6 +454,8 @@ def marcas_por_campania(id_campania):
 
 
 @solicitud_retroactivo_bp.route('/api/solicitud-retroactivo/razones-sociales', methods=['GET'])
+@requiere_autenticacion
+@requiere_modulos('usuarios_retroactivos', 'usuarios_solicitudes_retroactivos')
 def buscar_razones_sociales():
     conexion = obtener_conexion()
     if not conexion:
@@ -398,8 +465,13 @@ def buscar_razones_sociales():
     
     try:
         datos = data.buscar_razones_sociales(cursor)
+        cliente_id_autenticado = _cliente_id_autenticado(cursor)
+        if cliente_id_autenticado is not None:
+            datos = [cliente for cliente in datos if cliente['id'] == cliente_id_autenticado]
         return jsonify(datos), 200
 
+    except PermissionError as e:
+        return jsonify({'error': str(e)}), 403
     except Exception as e:
         return jsonify({"error": "Error al consultar las razones sociales.", "detalle": str(e)}), 500
 
@@ -409,6 +481,8 @@ def buscar_razones_sociales():
 
 
 @solicitud_retroactivo_bp.route('/api/solicitud-retroactivo/tiendas/<int:cliente_id>', methods=['GET'])
+@requiere_autenticacion
+@requiere_modulos('usuarios_retroactivos', 'usuarios_solicitudes_retroactivos')
 def buscar_tiendas(cliente_id):
     conexion = obtener_conexion()
     if not conexion:
@@ -417,9 +491,14 @@ def buscar_tiendas(cliente_id):
     cursor = conexion.cursor(dictionary=True, buffered=True) 
     
     try:
+        cliente_id_autenticado = _cliente_id_autenticado(cursor)
+        if cliente_id_autenticado is not None:
+            cliente_id = cliente_id_autenticado
         datos = data.buscar_tiendas_por_cliente(cursor, cliente_id)
         return jsonify(datos), 200
 
+    except PermissionError as e:
+        return jsonify({'error': str(e)}), 403
     except Exception as e:
         return jsonify({"error": "Error al consultar las tiendas.", "detalle": str(e)}), 500
 
@@ -429,6 +508,8 @@ def buscar_tiendas(cliente_id):
 
 
 @solicitud_retroactivo_bp.route('/api/solicitud-retroactivo/listar', methods=['GET'])
+@requiere_autenticacion
+@requiere_rol(1)
 def listar_solicitudes():
     # if not _requiere_admin(request):
     #     return jsonify({"error": "No autorizado"}), 403
@@ -458,6 +539,8 @@ def listar_solicitudes():
                     "estatus": validacion_docs.get(nombre, 'pendiente')
                 }
             fila['estatus'] = _calcular_estatus(validacion_docs, tiene_factura_xml=bool(fila['archivos']['factura_xml']['key']))
+            if _debe_ocultar_montos_retroactivos():
+                _redactar_montos_solicitud(fila)
 
         return jsonify(filas), 200
 
@@ -470,6 +553,8 @@ def listar_solicitudes():
 
 
 @solicitud_retroactivo_bp.route('/api/solicitud-retroactivo/dashboard', methods=['GET'])
+@requiere_autenticacion
+@requiere_rol(1)
 def dashboard_solicitudes():
     # if not _requiere_admin(request):
         # return jsonify({"error": "No autorizado"}), 403
@@ -519,6 +604,8 @@ def dashboard_solicitudes():
 
 
 @solicitud_retroactivo_bp.route('/api/solicitud-retroactivo/validar-documento/<int:id_venta>', methods=['POST'])
+@requiere_autenticacion
+@requiere_rol(1)
 def validar_documento(id_venta):
     # if not _requiere_admin(request):
         # return jsonify({"error": "No autorizado"}), 403
@@ -596,6 +683,8 @@ def validar_documento(id_venta):
 # rechazo/reenvío de archivos. Recalcula monto_pagar/monto_aplicar con el
 # mismo porcentaje ya guardado (el % depende del plan MSI, no del precio).
 @solicitud_retroactivo_bp.route('/api/solicitud-retroactivo/nota-credito/<int:id_venta>', methods=['POST'])
+@requiere_autenticacion
+@requiere_rol(1)
 def corregir_nota_credito(id_venta):
     # if not _requiere_admin(request):
     #     return jsonify({"error": "No autorizado"}), 403
@@ -659,6 +748,8 @@ def corregir_nota_credito(id_venta):
 # este endpoint pide un código numérico (ver utils/auditoria_utils.py) en
 # vez de solo requerir estar logueado como admin.
 @solicitud_retroactivo_bp.route('/api/solicitud-retroactivo/nota-credito/<int:id_venta>/validar', methods=['POST'])
+@requiere_autenticacion
+@requiere_rol(1)
 def validar_nota_credito(id_venta):
     body = request.get_json(force=True, silent=True) or {}
     codigo = body.get('codigo')
@@ -710,6 +801,8 @@ def validar_nota_credito(id_venta):
 
 
 @solicitud_retroactivo_bp.route('/api/solicitud-retroactivo/precio/<int:id_venta>', methods=['POST'])
+@requiere_autenticacion
+@requiere_rol(1)
 def corregir_precio(id_venta):
     # if not _requiere_admin(request):
     #     return jsonify({"error": "No autorizado"}), 403
@@ -772,18 +865,16 @@ def corregir_precio(id_venta):
 
 
 @solicitud_retroactivo_bp.route('/api/solicitud-retroactivo/mis-solicitudes', methods=['GET'])
+@requiere_autenticacion
+@requiere_modulos('usuarios_retroactivos', 'usuarios_solicitudes_retroactivos')
 def mis_solicitudes():
-    payload = _usuario_desde_token(request)
-    if not payload:
-        return jsonify({"error": "No autorizado"}), 401
-
     conexion = obtener_conexion()
     if not conexion:
         return jsonify({"error": "No se pudo conectar a la base de datos."}), 500
 
     cursor = conexion.cursor(dictionary=True, buffered=True)
     try:
-        filas = data.listar_mis_ventas(cursor, payload.get('id'))
+        filas = data.listar_mis_ventas(cursor, g.usuario_actual['id'])
 
         # GUÍA: el cliente ve exactamente lo mismo que el admin en el Gestor
         # (todos los campos, estatus por archivo con su URL para previsualizar
@@ -808,6 +899,9 @@ def mis_solicitudes():
                 }
             fila['estatus'] = _calcular_estatus(validacion_docs, tiene_factura_xml=bool(fila['archivos']['factura_xml']['key']))
 
+            if _debe_ocultar_montos_retroactivos():
+                _redactar_montos_solicitud(fila)
+
         return jsonify(filas), 200
     except Exception as e:
         logging.exception("Error al listar mis-solicitudes: %s", e)
@@ -818,11 +912,9 @@ def mis_solicitudes():
 
 
 @solicitud_retroactivo_bp.route('/api/solicitud-retroactivo/venta/<int:id_venta>', methods=['PUT'])
+@requiere_autenticacion
+@requiere_modulos('usuarios_retroactivos', 'usuarios_solicitudes_retroactivos')
 def editar_venta(id_venta):
-    payload = _usuario_desde_token(request)
-    if not payload:
-        return jsonify({"error": "No autorizado"}), 401
-
     campos_obligatorios = [
         'id_formulario', 'id_msi', 'nombre_sucursal',
         'correo_electronico', 'nombre_completo', 'fecha_venta',
@@ -849,7 +941,7 @@ def editar_venta(id_venta):
         fila = data.obtener_venta_para_edicion(cursor, id_venta)
         if not fila:
             return jsonify({"error": "Solicitud no encontrada."}), 404
-        if fila['id_usuario'] != payload.get('id'):
+        if fila['id_usuario'] != g.usuario_actual['id']:
             return jsonify({"error": "No autorizado"}), 403
 
         validacion_docs = _parsear_validacion_docs(fila['validacion_docs_json'])
