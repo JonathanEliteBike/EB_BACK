@@ -51,7 +51,7 @@ def create_app():
     app = Flask(__name__)
 
     # Límite de tamaño para uploads: 500 MB
-    app.config['MAX_CONTENT_LENGTH'] = 500 * 1024 * 1024
+    app.config['MAX_CONTENT_LENGTH'] = 1000 * 1024 * 1024
 
     # Vinculamos y configuramos Celery después de crear la app
     celery.conf.update(
