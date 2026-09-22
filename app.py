@@ -39,6 +39,7 @@ from routes.permisos_bp import permisos_bp
 from routes.modulos_bp import modulos_bp
 from routes.acciones_bp import acciones_bp
 from routes.admin_sistema_bp import admin_sistema_bp
+from routes.permisos_internos_bp import permisos_internos_bp
 
 # Importamos la instancia de Celery desde celery_worker
 from celery_worker import celery_app as celery
@@ -186,6 +187,7 @@ def create_app():
     app.register_blueprint(modulos_bp)
     app.register_blueprint(acciones_bp)
     app.register_blueprint(admin_sistema_bp)
+    app.register_blueprint(permisos_internos_bp)
 
     # Iniciar scheduler de sync automático (L-V 08:30 CDMX)
     init_scheduler()

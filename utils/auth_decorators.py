@@ -127,6 +127,37 @@ def requiere_permiso(modulo_identificador, accion_identificador):
     return decorator
 
 
+def requiere_permiso_interno(modulo_identificador, accion_identificador):
+    """Exige un permiso de la capa aislada para usuarios internos.
+
+    El rol 1 conserva su bypass total. El rol 4 se valida exclusivamente en
+    ``usuario_permisos_internos``; los demás roles no usan esta capa.
+    """
+    def decorator(f):
+        @wraps(f)
+        def decorated_function(*args, **kwargs):
+            payload = getattr(g, "usuario_actual", None)
+            if not payload or not payload.get("id"):
+                return jsonify({"error": "Token de autenticación requerido."}), 401
+
+            from services.permisos_internos_service import PermisosInternosService
+
+            permitido = PermisosInternosService.validar_permiso_usuario(
+                payload["id"], modulo_identificador, accion_identificador
+            )
+            if permitido:
+                return f(*args, **kwargs)
+
+            return jsonify({
+                "error": (
+                    f"Acceso denegado: Sin permiso interno de "
+                    f"'{accion_identificador}' en '{modulo_identificador}'."
+                )
+            }), 403
+        return decorated_function
+    return decorator
+
+
 def _usuario_actual_activo():
     """Obtiene el usuario activo respaldado por el JWT, sin confiar en su rol."""
     payload = getattr(g, "usuario_actual", None)
