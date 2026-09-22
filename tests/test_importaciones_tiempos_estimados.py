@@ -5,6 +5,8 @@ _estado_actual() (avance de etapa una vez que la anterior ya tiene fecha real).
 No golpean MySQL real: el `conn`/cursor que necesita _recalcular_campos() para
 consultar la tabla de reglas se mockea con unittest.mock.
 """
+from __future__ import annotations
+
 from unittest.mock import MagicMock
 
 from routes.importaciones import (
