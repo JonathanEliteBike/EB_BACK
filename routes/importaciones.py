@@ -149,14 +149,22 @@ CAMPOS_COSTOS = [
 # explícitamente en INSERT/UPDATE o se filtran silenciosamente al guardar.
 #
 # log_fecha_booking_prog / imp_llegada_contenedor_prog / des_fecha_cruce_prog /
-# des_fecha_entrega_almacen_prog NO están aquí a propósito: se calculan solas
-# en _recalcular_campos() a partir de Entrega + la regla de
-# importaciones_tiempos_estimados (origen+producto+vía) y viven en _CAMPOS_CALC.
+# des_fecha_entrega_almacen_prog SÍ están aquí (además de en _CAMPOS_CALC):
+# _recalcular_campos() las sobre-escribe con el cálculo automático SOLO
+# cuando existe una regla en importaciones_tiempos_estimados que matchee
+# origen+producto+vía; si no hay regla, las deja tal cual -- lo que permite
+# capturarlas a mano como excepción (embarques con texto libre en origen/tipo
+# de producto que nunca van a matchear una regla exacta). Ver el incidente
+# 2026-09-23 en docs/superpowers/specs: antes de este comentario estos 4
+# campos NO estaban aquí y _recalcular_campos() los forzaba a NULL cada vez
+# que no había regla, borrando en silencio fechas capturadas a mano.
 _CAMPOS_PROG = [
     "log_fecha_entrega_prog", "rec_recepcion_odoo_prog",
     "alm_envio_info_uva_prog", "alm_liberacion_uva_prog",
     "alm_terminacion_etiquetado_prog",
     "rec_liberacion_verificacion_prog", "rec_liberacion_final_prog",
+    "log_fecha_booking_prog", "imp_llegada_contenedor_prog",
+    "des_fecha_cruce_prog", "des_fecha_entrega_almacen_prog",
 ]
 
 _COLS_PERMITIDAS: set = (
@@ -1814,17 +1822,18 @@ def _recalcular_campos(data: dict, conn=None) -> dict:
     # ── Fechas proyectadas Booking→Almacén (solo lectura, calculadas) ──────────
     # A partir de Entrega (real) + la regla de importaciones_tiempos_estimados
     # que haga match exacto con origen + tipo de producto + vía. Se recalculan
-    # SIEMPRE que se guarde el embarque, sobre-escribiendo cualquier valor
-    # anterior -- así nunca quedan desfasadas de Entrega/origen/producto/vía.
+    # SIEMPRE que se guarde el embarque -- PERO solo se sobre-escriben cuando
+    # SÍ hay una regla que aplique. Si no hay regla, NO se tocan: muchos
+    # embarques (los de antes de que existiera esta función, con origen/tipo
+    # de producto en texto libre) ya traían estas fechas capturadas a mano, y
+    # machacarlas a NULL en cuanto alguien guardaba cualquier otro campo del
+    # embarque las borraba en silencio -- eso pasó de verdad en producción
+    # (ver incidente 2026-09-23, docs/superpowers/specs).
     entrega       = data.get("log_fecha_entrega")
     origen        = data.get("log_origen")
     tipo_producto = data.get("log_tipo_productos")
     via           = data.get("via_transporte")
 
-    _CAMPOS_PROY_CADENA = [
-        "log_fecha_booking_prog", "imp_llegada_contenedor_prog",
-        "des_fecha_cruce_prog", "des_fecha_entrega_almacen_prog",
-    ]
     data["tiempos_estimados_faltantes"] = False
 
     if entrega and origen and tipo_producto and via:
@@ -1841,15 +1850,15 @@ def _recalcular_campos(data: dict, conn=None) -> dict:
                 data["des_fecha_cruce_prog"]           = f_destino.isoformat()
                 data["des_fecha_entrega_almacen_prog"] = f_almacen.isoformat()
             except Exception as e:
+                # Fallo real de cálculo (p.ej. Entrega mal formada): no se puede
+                # confiar en el resultado, pero tampoco se borra lo que ya había.
                 logging.warning("Error calculando fechas proyectadas: %s", e)
-                for c in _CAMPOS_PROY_CADENA:
-                    data[c] = None
         else:
-            # Combinación origen+producto+vía sin regla configurada todavía.
-            for c in _CAMPOS_PROY_CADENA:
-                data[c] = None
+            # Combinación origen+producto+vía sin regla configurada todavía --
+            # se avisa en la UI, pero NO se toca ningún campo existente.
             data["tiempos_estimados_faltantes"] = True
-    # Si falta Entrega/origen/producto/vía no se tocan estos campos: en creación
-    # quedan como llegaron (None); en edición conservan lo ya calculado en `merged`.
+    # Si falta Entrega/origen/producto/vía, o no hay regla, no se tocan estos
+    # campos: en creación quedan como llegaron (None); en edición conservan lo
+    # que ya hubiera en `merged` (valor calculado antes, o capturado a mano).
 
     return data
