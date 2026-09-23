@@ -95,7 +95,7 @@ def test_recalcular_campos_calcula_cadena_completa_con_regla():
     assert out["tiempos_estimados_faltantes"] is False
 
 
-def test_recalcular_campos_sin_regla_deja_fechas_vacias_y_marca_alerta():
+def test_recalcular_campos_sin_regla_marca_alerta_sin_tocar_las_fechas():
     conn = _mock_conn_con_regla(None)
     data = {
         "log_fecha_entrega": "2026-01-01",
@@ -104,10 +104,32 @@ def test_recalcular_campos_sin_regla_deja_fechas_vacias_y_marca_alerta():
         "via_transporte": "MARITIMO",
     }
     out = _recalcular_campos(data, conn)
-    assert out["log_fecha_booking_prog"] is None
-    assert out["imp_llegada_contenedor_prog"] is None
-    assert out["des_fecha_cruce_prog"] is None
-    assert out["des_fecha_entrega_almacen_prog"] is None
+    # No hay regla -> no se agregan/sobre-escriben las 4 fechas (si no venían
+    # en `data`, siguen sin venir; ver el siguiente test para el caso en que
+    # un embarque viejo ya las traía capturadas a mano).
+    assert "log_fecha_booking_prog" not in out
+    assert "imp_llegada_contenedor_prog" not in out
+    assert "des_fecha_cruce_prog" not in out
+    assert "des_fecha_entrega_almacen_prog" not in out
+    assert out["tiempos_estimados_faltantes"] is True
+
+
+def test_recalcular_campos_sin_regla_no_borra_fecha_capturada_a_mano():
+    # Embarque de antes de que existiera el cálculo automático: alguien ya
+    # había capturado Booking (Proyectado) a mano. Si la combinación
+    # origen+producto+vía no matchea ninguna regla, esa fecha NO debe
+    # perderse -- este es el bug real que se detectó en producción
+    # (2026-09-23): guardar cualquier otro campo del embarque la borraba.
+    conn = _mock_conn_con_regla(None)
+    data = {
+        "log_fecha_entrega": "2026-01-01",
+        "log_origen": "TAIWAN",
+        "log_tipo_productos": "BICICLETAS SPARK Y FOIL Y ADDICT RC",
+        "via_transporte": "MARITIMO",
+        "log_fecha_booking_prog": "2026-01-20",
+    }
+    out = _recalcular_campos(data, conn)
+    assert out["log_fecha_booking_prog"] == "2026-01-20"
     assert out["tiempos_estimados_faltantes"] is True
 
 
