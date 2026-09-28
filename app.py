@@ -51,6 +51,20 @@ from services.sync_scheduler import init_scheduler
 def create_app():
     app = Flask(__name__)
 
+    # Diagnóstico local y opt-in para decisiones 403 del rol interno. Nunca
+    # registra tokens ni encabezados de autenticación.
+    app.config['PERMISOS_INTERNOS_LOG_403'] = (
+        os.getenv('PERMISOS_INTERNOS_LOG_403', '').strip().lower()
+        in {'1', 'true', 'yes'}
+    )
+    app.config['ODOO_TRACE_VENTAS'] = (
+        os.getenv('ODOO_TRACE_VENTAS', '').strip().lower()
+        in {'1', 'true', 'yes'}
+    )
+
+    from services.contexto_permisos_internos import registrar_capa_interna
+    registrar_capa_interna(app)
+
     # Límite de tamaño para uploads: 500 MB
     app.config['MAX_CONTENT_LENGTH'] = 500 * 1024 * 1024
 
@@ -85,7 +99,7 @@ def create_app():
             "origins": allowed_origins,
             "supports_credentials": True,
             "expose_headers": ["Content-Disposition", "Content-Type"],
-            "allow_headers": ["Authorization", "Content-Type"],
+            "allow_headers": ["Authorization", "Content-Type", "X-Ruta-Interna"],
             "methods": ["GET", "POST", "PUT", "DELETE", "OPTIONS"]
         }
     })
@@ -103,7 +117,7 @@ def create_app():
                 response = make_response('', 204)
                 response.headers['Access-Control-Allow-Origin'] = origin
                 response.headers['Access-Control-Allow-Methods'] = 'GET,POST,PUT,DELETE,OPTIONS'
-                response.headers['Access-Control-Allow-Headers'] = 'Authorization, Content-Type'
+                response.headers['Access-Control-Allow-Headers'] = 'Authorization, Content-Type, X-Ruta-Interna'
                 response.headers['Access-Control-Allow-Credentials'] = 'true'
                 response.headers['Access-Control-Expose-Headers'] = 'Content-Disposition, Content-Type'
                 response.headers['Vary'] = 'Origin'
@@ -130,7 +144,7 @@ def create_app():
             response.headers['Vary'] = 'Origin'
             response.headers['Access-Control-Allow-Credentials'] = 'true'
             response.headers['Access-Control-Expose-Headers'] = 'Content-Disposition, Content-Type'
-            response.headers['Access-Control-Allow-Headers'] = 'Authorization, Content-Type'
+            response.headers['Access-Control-Allow-Headers'] = 'Authorization, Content-Type, X-Ruta-Interna'
             response.headers['Access-Control-Allow-Methods'] = 'GET,POST,PUT,DELETE,OPTIONS'
 
             # Chrome Private Network Access

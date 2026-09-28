@@ -191,6 +191,7 @@ def precalentar_monitor_async(host='http://localhost:5000'):
     import sys as _sys
     _sys.path.insert(0, BASE_DIR)
     from db_conexion import obtener_conexion
+    from utils.jwt_utils import generar_token_prewarm_interno
 
     try:
         conn = obtener_conexion()
@@ -206,11 +207,18 @@ def precalentar_monitor_async(host='http://localhost:5000'):
         logging.error('precalentar_monitor_async: no se pudo leer clientes: %s', e)
         return {'status': 'error', 'mensaje': str(e)}
 
+    token = generar_token_prewarm_interno()
+    if not token:
+        logging.warning('precalentar_monitor_async: omitido; no hay administrador activo para autenticarlo')
+        return {'status': 'error', 'mensaje': 'No hay administrador activo para autenticar el precalentamiento'}
+    headers = {'Authorization': f'Bearer {token}'}
+
     def _cargar(clave):
         try:
             _req.get(
                 f'{host}/detalle-compras-odoo',
                 params={'cliente': clave, 'ref_exacta': '1'},
+                headers=headers,
                 timeout=120,
             )
             return 'ok'

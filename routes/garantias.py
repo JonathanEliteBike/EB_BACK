@@ -16,6 +16,7 @@ from utils.auth_decorators import (
     requiere_autenticacion,
     requiere_rol,
     requiere_modulo,
+    requiere_permiso_interno,
     usuario_actual_tiene_modulo,
 )
 
@@ -40,7 +41,7 @@ def _usuario_actual_puede_ver_formulario(cursor, formulario_id):
     usuario = cursor.fetchone()
     if not usuario:
         return False
-    if usuario['rol_id'] == 1:
+    if usuario['rol_id'] in (1, 4):
         return True
 
     nombre_cliente = None
@@ -80,6 +81,7 @@ def _usuario_actual_puede_descargar_archivo(cursor, nombre_archivo):
 @garantias_bp.route("/dashboard", methods=["GET"])
 @requiere_autenticacion
 @requiere_rol(1)
+@requiere_permiso_interno("garantias", "ver")
 def dashboard():
     try:
         desde = request.args.get('desde') or None
@@ -94,6 +96,7 @@ def dashboard():
 @garantias_bp.route("/exportar", methods=["GET"])
 @requiere_autenticacion
 @requiere_rol(1)
+@requiere_permiso_interno("garantias", "ver")
 def exportar():
     try:
         distribuidor = request.args.get('distribuidor') or None
@@ -117,6 +120,7 @@ def exportar():
 @garantias_bp.route("/refrescar", methods=["POST"])
 @requiere_autenticacion
 @requiere_rol(1)
+@requiere_permiso_interno("garantias", "editar")
 def refrescar():
     invalidar_cache()
     return jsonify({"ok": True, "mensaje": "Cache invalidado"})
@@ -217,6 +221,7 @@ def inicializar_tablas():
 @garantias_bp.route("/formulario/enviar", methods=["POST"])
 @requiere_autenticacion
 @requiere_modulo("usuarios_garantias")
+@requiere_permiso_interno("garantias", "crear")
 def enviar_formulario():
     conn = obtener_conexion()
     if not conn:
@@ -281,6 +286,7 @@ def enviar_formulario():
 @garantias_bp.route("/formulario/lista", methods=["GET"])
 @requiere_autenticacion
 @requiere_rol(1)
+@requiere_permiso_interno("garantias", "ver")
 def lista_formularios():
     conn = obtener_conexion()
     if not conn:
@@ -442,18 +448,13 @@ def mis_tickets():
 @garantias_bp.route("/formulario/<int:form_id>", methods=["DELETE"])
 @requiere_autenticacion
 @requiere_rol(1)
+@requiere_permiso_interno("garantias", "eliminar")
 def eliminar_formulario(form_id):
     """Elimina un ticket y renumera los folios consecutivamente. Solo admins."""
     conn = obtener_conexion()
     if not conn:
         return jsonify({"error": "Sin conexion a BD"}), 500
     try:
-        cursor_u = conn.cursor(dictionary=True)
-        cursor_u.execute("SELECT rol_id FROM usuarios WHERE id = %s", (g.usuario_actual['id'],))
-        user = cursor_u.fetchone()
-        if not user or user.get('rol_id') != 1:
-            return jsonify({"error": "Solo administradores pueden eliminar tickets"}), 403
-
         cursor = conn.cursor()
         cursor.execute("DELETE FROM garantia_comentarios WHERE formulario_id = %s", (form_id,))
         cursor.execute("DELETE FROM garantia_formularios WHERE id = %s", (form_id,))
@@ -483,6 +484,7 @@ def eliminar_formulario(form_id):
 @garantias_bp.route("/formulario/<int:form_id>", methods=["GET"])
 @requiere_autenticacion
 @requiere_modulo("usuarios_garantias")
+@requiere_permiso_interno("garantias", "ver")
 def obtener_formulario(form_id):
     conn = obtener_conexion()
     if not conn:
@@ -518,6 +520,7 @@ def obtener_formulario(form_id):
 @garantias_bp.route("/formulario/<int:form_id>/estatus", methods=["PUT"])
 @requiere_autenticacion
 @requiere_rol(1)
+@requiere_permiso_interno("garantias", "editar")
 def actualizar_estatus(form_id):
     conn = obtener_conexion()
     if not conn:
@@ -547,6 +550,7 @@ def actualizar_estatus(form_id):
 @garantias_bp.route("/formulario/<int:form_id>/fecha-estatus", methods=["PUT"])
 @requiere_autenticacion
 @requiere_rol(1)
+@requiere_permiso_interno("garantias", "editar")
 def actualizar_fecha_estatus(form_id):
     """Edita solo la fecha del estatus actual sin cambiar el estatus."""
     conn = obtener_conexion()
@@ -576,6 +580,7 @@ def actualizar_fecha_estatus(form_id):
 @garantias_bp.route("/formulario/<int:form_id>/fecha-creacion", methods=["PUT"])
 @requiere_autenticacion
 @requiere_rol(1)
+@requiere_permiso_interno("garantias", "editar")
 def actualizar_fecha_creacion(form_id):
     """Corrige la fecha de alta (creación) del ticket cuando se registró mal, sin borrar y recrear."""
     conn = obtener_conexion()
@@ -605,6 +610,7 @@ def actualizar_fecha_creacion(form_id):
 @garantias_bp.route("/formulario/<int:form_id>/pieza-reemplazo", methods=["PUT"])
 @requiere_autenticacion
 @requiere_rol(1)
+@requiere_permiso_interno("garantias", "editar")
 def actualizar_pieza_reemplazo(form_id):
     conn = obtener_conexion()
     if not conn:
@@ -633,6 +639,7 @@ def actualizar_pieza_reemplazo(form_id):
 @garantias_bp.route("/formulario/<int:form_id>/pieza", methods=["PUT"])
 @requiere_autenticacion
 @requiere_rol(1)
+@requiere_permiso_interno("garantias", "editar")
 def actualizar_pieza(form_id):
     conn = obtener_conexion()
     if not conn:
@@ -662,6 +669,7 @@ def actualizar_pieza(form_id):
 @garantias_bp.route("/formulario/<int:form_id>/fecha-pieza", methods=["PUT"])
 @requiere_autenticacion
 @requiere_rol(1)
+@requiere_permiso_interno("garantias", "editar")
 def actualizar_fecha_pieza(form_id):
     """Edita solo la fecha del estatus de pieza sin cambiar el estatus."""
     conn = obtener_conexion()
@@ -691,6 +699,7 @@ def actualizar_fecha_pieza(form_id):
 @garantias_bp.route("/formulario/<int:form_id>/validacion-doc", methods=["PUT"])
 @requiere_autenticacion
 @requiere_rol(1)
+@requiere_permiso_interno("garantias", "editar")
 def actualizar_validacion_doc(form_id):
     """Valida o rechaza un documento individual. body: {campo, estado, nombre_legible}"""
     conn = obtener_conexion()
@@ -756,6 +765,7 @@ def actualizar_validacion_doc(form_id):
 @garantias_bp.route("/formulario/<int:form_id>/validacion", methods=["PUT"])
 @requiere_autenticacion
 @requiere_rol(1)
+@requiere_permiso_interno("garantias", "editar")
 def actualizar_validacion(form_id):
     conn = obtener_conexion()
     if not conn:
@@ -805,6 +815,7 @@ def actualizar_validacion(form_id):
 @garantias_bp.route("/estructura", methods=["GET"])
 @requiere_autenticacion
 @requiere_modulo("usuarios_garantias")
+@requiere_permiso_interno("garantias", "ver")
 def obtener_estructura():
     conn = obtener_conexion()
     if not conn:
@@ -830,6 +841,7 @@ def obtener_estructura():
 @garantias_bp.route("/estructura", methods=["POST"])
 @requiere_autenticacion
 @requiere_rol(1)
+@requiere_permiso_interno("garantias", "editar")
 def guardar_estructura():
     conn = obtener_conexion()
     if not conn:
@@ -859,6 +871,7 @@ def guardar_estructura():
 @garantias_bp.route("/stats", methods=["GET"])
 @requiere_autenticacion
 @requiere_rol(1)
+@requiere_permiso_interno("garantias", "ver")
 def get_stats():
     conn = obtener_conexion()
     if not conn:
@@ -896,12 +909,13 @@ def get_stats():
 @garantias_bp.route("/ticket/<int:formulario_id>/comentarios", methods=["GET"])
 @requiere_autenticacion
 @requiere_modulo("usuarios_garantias")
+@requiere_permiso_interno("garantias", "ver")
 def get_comentarios(formulario_id):
     conn = obtener_conexion()
     if not conn:
         return jsonify({"error": "Sin conexion a BD"}), 500
     try:
-        es_admin = int(g.usuario_actual.get('rol', 0)) == 1
+        es_admin = int(g.usuario_actual.get('rol', 0)) in (1, 4)
 
         cursor = conn.cursor(dictionary=True)
         if not _usuario_actual_puede_ver_formulario(cursor, formulario_id):
@@ -932,6 +946,7 @@ def get_comentarios(formulario_id):
 @garantias_bp.route("/ticket/<int:formulario_id>/comentarios", methods=["POST"])
 @requiere_autenticacion
 @requiere_modulo("usuarios_garantias")
+@requiere_permiso_interno("garantias", "crear")
 def add_comentario(formulario_id):
     conn = obtener_conexion()
     if not conn:
@@ -977,6 +992,7 @@ def add_comentario(formulario_id):
 @garantias_bp.route("/latencias", methods=["GET"])
 @requiere_autenticacion
 @requiere_rol(1)
+@requiere_permiso_interno("garantias", "ver")
 def get_latencias():
     """Devuelve latencia de atención y de cierre por ticket individual."""
     conn = obtener_conexion()
@@ -1017,6 +1033,7 @@ def get_latencias():
 @garantias_bp.route("/piezas", methods=["GET"])
 @requiere_autenticacion
 @requiere_rol(1)
+@requiere_permiso_interno("garantias", "ver")
 def listar_piezas():
     conn = obtener_conexion()
     if not conn:
@@ -1058,6 +1075,7 @@ def listar_piezas():
 @garantias_bp.route("/piezas", methods=["POST"])
 @requiere_autenticacion
 @requiere_rol(1)
+@requiere_permiso_interno("garantias", "crear")
 def agregar_pieza():
     conn = obtener_conexion()
     if not conn:
@@ -1083,6 +1101,7 @@ def agregar_pieza():
 @garantias_bp.route("/piezas/uso", methods=["GET"])
 @requiere_autenticacion
 @requiere_rol(1)
+@requiere_permiso_interno("garantias", "ver")
 def contar_uso_pieza():
     """Cuántos tickets tienen asignada esta pieza actualmente -- para avisar
     antes de quitarla del catálogo (no se tocan esos tickets, solo informa)."""
@@ -1110,6 +1129,7 @@ def contar_uso_pieza():
 @garantias_bp.route("/piezas", methods=["DELETE"])
 @requiere_autenticacion
 @requiere_rol(1)
+@requiere_permiso_interno("garantias", "eliminar")
 def eliminar_pieza():
     """Quita una pieza del catálogo (soft-delete via activo=0) -- para
     duplicados o nombres capturados por error (ej. 'MAUBRIO'). No afecta los
@@ -1178,12 +1198,15 @@ def _requiere_admin(request):
         user = cursor.fetchone()
     finally:
         conn.close()
-    if not user or user.get('rol_id') != 1:
+    if not user or user.get('rol_id') not in (1, 4):
         return None, (jsonify({"error": "Solo administradores"}), 403)
     return payload, None
 
 
 @garantias_bp.route("/importar/plantilla", methods=["GET"])
+@requiere_autenticacion
+@requiere_rol(1)
+@requiere_permiso_interno("garantias", "crear")
 def descargar_plantilla_importacion():
     """Genera y devuelve el Excel plantilla para importación masiva de garantías."""
     from openpyxl import Workbook
@@ -1309,6 +1332,9 @@ def descargar_plantilla_importacion():
 
 
 @garantias_bp.route("/importar", methods=["POST"])
+@requiere_autenticacion
+@requiere_rol(1)
+@requiere_permiso_interno("garantias", "crear")
 def importar_garantias():
     """Recibe el Excel completado y hace la inserción masiva."""
     from openpyxl import load_workbook
@@ -1503,14 +1529,16 @@ def importar_garantias():
 
 @garantias_bp.route("/archivo/subir", methods=["POST"])
 @requiere_autenticacion
+@requiere_permiso_interno("garantias", "crear")
 def subir_archivo():
     accion = request.form.get('accion')
     if accion not in {'crear', 'editar'}:
         return jsonify({"error": "Debe indicar si el archivo corresponde a crear o editar una garantía."}), 400
 
-    permitido, error = usuario_actual_tiene_modulo('usuarios_garantias')
-    if not permitido:
-        return error
+    if int(g.usuario_actual.get('rol', 0)) != 4:
+        permitido, error = usuario_actual_tiene_modulo('usuarios_garantias')
+        if not permitido:
+            return error
 
     if 'archivo' not in request.files:
         return jsonify({"error": "No se recibio archivo"}), 400
@@ -1543,6 +1571,7 @@ def subir_archivo():
 @garantias_bp.route("/archivo/<path:nombre>", methods=["GET"])
 @requiere_autenticacion
 @requiere_modulo("usuarios_garantias")
+@requiere_permiso_interno("garantias", "ver")
 def descargar_archivo(nombre):
     conn = obtener_conexion()
     if not conn:

@@ -71,7 +71,9 @@ def _debe_ocultar_montos_retroactivos():
 
 def _clave_cliente_autenticado(cursor):
     """Resuelve la clave del cliente del JWT para no aceptar claves ajenas."""
-    if int(g.usuario_actual['rol']) == 1:
+    # El rol interno consulta la carátula como una pantalla administrativa;
+    # sólo el flujo histórico de distribuidores queda restringido a su clave.
+    if int(g.usuario_actual['rol']) in (1, 4):
         return None
 
     cursor.execute(

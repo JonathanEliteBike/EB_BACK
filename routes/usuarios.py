@@ -5,14 +5,59 @@ import logging
 from utils.seguridad import hash_password, verificar_password, generar_token
 from utils.odoo_utils import get_odoo_models, ODOO_DB, ODOO_PASSWORD, ODOO_COMPANY_ID
 from db_conexion import obtener_conexion
-from utils.auth_decorators import requiere_autenticacion, requiere_rol
+from utils.auth_decorators import (
+    requiere_autenticacion,
+    requiere_rol,
+    requiere_permiso_interno_dinamico,
+)
+from services.permisos_internos_service import PermisosInternosService
 
 def campo_vacio(valor):
     return valor is None or (isinstance(valor, str) and valor.strip() == "")
 
+
+def nombre_rol(rol_id):
+    if rol_id == 1:
+        return "Administrador"
+    if rol_id == 4:
+        return "Usuario Interno"
+    return "Usuario"
+
+
+def resolver_rol(data, rol_actual=None):
+    roles_validos = {"Administrador": 1, "Usuario": 2, "Usuario Interno": 4}
+    rol_recibido = data.get('rol')
+    rol_id_recibido = data.get('rol_id')
+
+    if rol_recibido is None and rol_id_recibido is None:
+        return rol_actual, None
+
+    if rol_recibido is not None:
+        if not isinstance(rol_recibido, str) or rol_recibido.strip() not in roles_validos:
+            return None, "Rol inválido"
+        rol_id = roles_validos[rol_recibido.strip()]
+    else:
+        try:
+            rol_id = int(rol_id_recibido)
+        except (TypeError, ValueError):
+            return None, "rol_id inválido"
+        if rol_id not in roles_validos.values():
+            return None, "Rol inválido"
+
+    if rol_id_recibido is not None:
+        try:
+            if int(rol_id_recibido) != rol_id:
+                return None, "El rol y rol_id no coinciden"
+        except (TypeError, ValueError):
+            return None, "rol_id inválido"
+
+    return rol_id, None
+
 usuarios_bp = Blueprint('usuarios', __name__, url_prefix='/usuarios')
 
 @usuarios_bp.route('/para-monitor', methods=['GET'])
+@requiere_autenticacion
+@requiere_permiso_interno_dinamico
 def usuarios_para_monitor():
     """Devuelve los clientes dados de alta correctamente en el monitor (tienen evac,
     nivel y f_inicio configurados) junto con su grupo. Los registros importados
@@ -160,11 +205,14 @@ def listar_usuarios():
         consulta = """
         SELECT 
             u.id, u.nombre, u.correo, u.usuario, u.contrasena, 
-            u.activo, u.rol_id, u.cliente_id, c.nombre_cliente
+            u.activo, u.rol_id, u.cliente_id, c.nombre_cliente, u.area_id,
+            a.nombre AS area_nombre
         FROM 
             usuarios u
         LEFT JOIN 
             clientes c ON u.cliente_id = c.id
+        LEFT JOIN
+            areas a ON u.area_id = a.id
         """
         cursor.execute(consulta)
         usuarios = cursor.fetchall()
@@ -178,9 +226,11 @@ def listar_usuarios():
                 "usuario": u["usuario"],
                 # "contrasena": u["contrasena"],  # opcional ocultar
                 "activo": u["activo"],
-                "rol": "Administrador" if u["rol_id"] == 1 else "Usuario",
+                "rol": nombre_rol(u["rol_id"]),
                 "cliente_id": u.get("cliente_id"),
-                "cliente_nombre": u["nombre_cliente"]  # ya viene desde la consulta
+                "cliente_nombre": u["nombre_cliente"],
+                "area_id": u.get("area_id"),
+                "area_nombre": u.get("area_nombre")
             }
             usuarios_filtrados.append(usuario_filtrado)
 
@@ -243,6 +293,10 @@ def actualizar_usuario(usuario_id):
 
         campos_actualizar = {}
         errores = []
+        reemplazar_permisos_area = False
+        asignar_permisos_base = False
+        limpiar_permisos_internos = False
+        permisos_base_asignados = 0
 
         # Validación y actualización del nombre
         if 'nombre' in data:
@@ -287,18 +341,44 @@ def actualizar_usuario(usuario_id):
                     else:
                         campos_actualizar['usuario'] = usuario
 
-        # Validación y actualización del rol
-        if 'rol' in data:
-            rol = data['rol'].strip() if data['rol'] else ""
-            if rol == "Administrador":
-                rol_id = 1
-            elif rol == "Usuario":
-                rol_id = 2
+        # El rol 4 tiene un área principal activa; los demás roles no la conservan.
+        rol_id, error_rol = resolver_rol(data, usuario_existente['rol_id'])
+        if error_rol:
+            errores.append(error_rol)
+        elif rol_id != usuario_existente['rol_id']:
+            campos_actualizar['rol_id'] = rol_id
+
+        if not error_rol:
+            if rol_id == 4:
+                area_id = data.get('area_id', usuario_existente.get('area_id'))
+                if area_id in [None, "", "null"]:
+                    errores.append("El área principal es obligatoria para un Usuario Interno")
+                else:
+                    try:
+                        area_id = int(area_id)
+                        cursor.execute("SELECT id FROM areas WHERE id = %s AND activo = 1", (area_id,))
+                        if not cursor.fetchone():
+                            errores.append("El área principal no existe o está inactiva")
+                        elif area_id != usuario_existente.get('area_id'):
+                            cambio_area_usuario_interno = usuario_existente['rol_id'] == 4
+                            if cambio_area_usuario_interno and data.get('confirmar_cambio_area') is not True:
+                                errores.append(
+                                    "Confirma el cambio de área para reemplazar los permisos internos actuales."
+                                )
+                            else:
+                                # También al volver al rol interno se descarta
+                                # cualquier matriz histórica antes de sembrar
+                                # la base del área seleccionada.
+                                reemplazar_permisos_area = True
+                                asignar_permisos_base = True
+                            campos_actualizar['area_id'] = area_id
+                    except (TypeError, ValueError):
+                        errores.append("area_id inválido")
             else:
-                errores.append("Rol inválido, debe ser 'Administrador' o 'Usuario'")
-            
-            if rol_id != usuario_existente['rol_id']:
-                campos_actualizar['rol_id'] = rol_id
+                if usuario_existente.get('area_id') is not None:
+                    campos_actualizar['area_id'] = None
+                if usuario_existente['rol_id'] == 4:
+                    limpiar_permisos_internos = True
 
         # Validación y actualización de la contraseña
         if 'contrasena' in data:
@@ -333,8 +413,8 @@ def actualizar_usuario(usuario_id):
         if errores:
             return jsonify({"errores": errores}), 400
 
-        # Si no hay campos para actualizar
-        if not campos_actualizar:
+        # Si no hay campos para actualizar ni permisos que sembrar.
+        if not campos_actualizar and not asignar_permisos_base:
             return jsonify({"mensaje": "No se detectaron cambios para actualizar"}), 200
 
         # Construir y ejecutar la consulta de actualización
@@ -342,8 +422,18 @@ def actualizar_usuario(usuario_id):
         valores = list(campos_actualizar.values())
         valores.append(usuario_id)
 
-        query = f"UPDATE usuarios SET {set_clause} WHERE id = %s"
-        cursor.execute(query, valores)
+        if campos_actualizar:
+            query = f"UPDATE usuarios SET {set_clause} WHERE id = %s"
+            cursor.execute(query, valores)
+        if limpiar_permisos_internos:
+            cursor.execute(
+                "DELETE FROM usuario_permisos_internos WHERE usuario_id = %s",
+                (usuario_id,),
+            )
+        if asignar_permisos_base:
+            permisos_base_asignados = PermisosInternosService.asignar_permisos_base_area(
+                cursor, usuario_id, campos_actualizar['area_id'], reemplazar_permisos_area
+            )
         conexion.commit()
 
         # Obtener los nuevos valores para emitir el evento
@@ -352,13 +442,18 @@ def actualizar_usuario(usuario_id):
             "nombre": campos_actualizar.get('nombre', usuario_existente['nombre']),
             "correo": campos_actualizar.get('correo', usuario_existente['correo']),
             "usuario": campos_actualizar.get('usuario', usuario_existente['usuario']),
-            "rol": "Administrador" if campos_actualizar.get('rol_id', usuario_existente['rol_id']) == 1 else "Usuario",
+            "rol": nombre_rol(campos_actualizar.get('rol_id', usuario_existente['rol_id'])),
             "cliente_id": campos_actualizar.get('cliente_id', usuario_existente.get('cliente_id')),
+            "area_id": campos_actualizar.get('area_id', usuario_existente.get('area_id')),
         }
 
+        mensaje = "Usuario actualizado con éxito"
+        if asignar_permisos_base and permisos_base_asignados == 0:
+            mensaje += ". El área no tiene permisos base configurados."
         return jsonify({
-            "mensaje": "Usuario actualizado con éxito",
-            "campos_actualizados": list(campos_actualizar.keys())
+            "mensaje": mensaje,
+            "campos_actualizados": list(campos_actualizar.keys()),
+            "permisos_base_asignados": permisos_base_asignados,
         }), 200
 
     except Exception as e:

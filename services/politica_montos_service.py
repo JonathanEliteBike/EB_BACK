@@ -23,6 +23,15 @@ class PoliticaMontosService:
                 return True
             if usuario['rol_id'] in (1, 2):
                 return False
+            if usuario['rol_id'] == 4:
+                from flask import has_request_context, g
+                from services.contexto_permisos_internos import puede_ver_montos
+                if has_request_context() and hasattr(g, '_modulos_internos_autorizados'):
+                    return not puede_ver_montos(usuario_id)
+                from services.permisos_internos_service import PermisosInternosService
+                return not PermisosInternosService.validar_permiso_usuario(
+                    usuario_id, ambito_identificador, 'ver_montos'
+                )
             if usuario['rol_id'] != 3:
                 return True
 
