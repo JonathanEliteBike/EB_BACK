@@ -120,6 +120,14 @@ CAMPOS_MONETARIOS_CARATULAS = {
     'compbici', 'compapp', 'avbici', 'avapp', 'faltbici', 'faltapp',
 }
 
+# Proyecciones MY27 mezcla cantidades y costos. Sólo los campos definidos aquí
+# se redactan; meses, unidades, SKUs y distribuidores permanecen disponibles.
+CAMPOS_MONETARIOS_PROYECCIONES_MY27 = {
+    'precio_dist', 'costo_unitario', 'costo_total',
+    'total_costo_general', 'inversion_total', 'inversion_promedio',
+}
+MAPAS_MONETARIOS_PROYECCIONES_MY27 = {'costos_mes', 'total_costo_mes'}
+
 
 def redactar_montos(datos, blueprint):
     if isinstance(datos, list):
@@ -144,10 +152,17 @@ def redactar_montos(datos, blueprint):
                 isinstance(valor, (int, float))
             )
             sensible |= nombre.startswith(('compra_', 'compras_', 'acumulado_', 'compromiso_', 'avance_'))
+        if blueprint == 'proyecciones_my27':
+            sensible |= nombre in CAMPOS_MONETARIOS_PROYECCIONES_MY27
         if blueprint == 'ventas':
             sensible |= nombre in {'total', 'total1', 'total2', 'global_total', 'delta'}
         if blueprint == 'retroactivos':
             sensible |= nombre.startswith(('compra_', 'compras_', 'acumulado_')) or nombre == 'garantias'
+        if blueprint == 'proyecciones_my27' and nombre in MAPAS_MONETARIOS_PROYECCIONES_MY27:
+            # Se conserva el mapa por mes para que la tabla no pierda su
+            # estructura, pero nunca se serializan sus importes.
+            resultado[campo] = {clave: None for clave in valor} if isinstance(valor, dict) else None
         # Mantener la estructura de listas/objetos y los conteos.
-        resultado[campo] = None if sensible and not isinstance(valor, (dict, list)) else redactar_montos(valor, blueprint)
+        else:
+            resultado[campo] = None if sensible and not isinstance(valor, (dict, list)) else redactar_montos(valor, blueprint)
     return resultado

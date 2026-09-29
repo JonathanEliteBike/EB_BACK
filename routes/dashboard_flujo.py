@@ -503,7 +503,11 @@ def obtener_auditoria_flujo():
             FROM auditoria_movimientos
             WHERE tabla_afectada IN (
                 'flujo_valores',
-                'flujo_valores_unificados'
+                'flujo_valores_unificados',
+                'gastos_operativos',
+                'ingresos_cobranza',
+                'embarques_logistica',
+                'ordenes_compra'
             )
             ORDER BY fecha_hora DESC, id_auditoria DESC
         """)
@@ -513,11 +517,20 @@ def obtener_auditoria_flujo():
         # ==============================================================
         # 5. FORMATEAR FECHA PARA JSON
         # ==============================================================
+        categorias = {
+            'flujo_valores': 'Tablero Maestro',
+            'flujo_valores_unificados': 'Tablero Maestro',
+            'gastos_operativos': 'Gastos Operativos',
+            'ingresos_cobranza': 'Ingresos y Cobranza',
+            'embarques_logistica': 'Logística y Aduanas',
+            'ordenes_compra': 'Órdenes de Compra',
+        }
         for registro in registros:
             if registro.get("fecha_hora"):
                 registro["fecha_hora"] = registro["fecha_hora"].strftime(
                     "%Y-%m-%d %H:%M:%S"
                 )
+            registro['categoria'] = categorias.get(registro['tabla_afectada'], 'Flujo de Efectivo')
 
         # ==============================================================
         # 6. RESPUESTA

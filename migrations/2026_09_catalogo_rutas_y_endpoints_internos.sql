@@ -75,6 +75,25 @@ WHERE pie.ruta_patron = '/sincronizar-odoo'
   AND modulo.identificador = 'flujo_dashboard'
   AND accion.identificador = 'editar';
 
+-- Proyecciones MY27 tiene una pantalla Angular propia. Contabilidad requiere
+-- lectura para consultar el monitor y las acciones de escritura quedan
+-- disponibles sólo para asignación explícita, sin concederlas a usuarios.
+INSERT IGNORE INTO modulo_areas (modulo_id, area_id)
+SELECT modulo.id, area.id
+FROM modulos modulo
+INNER JOIN areas area
+    ON LOWER(TRIM(area.nombre)) = 'contabilidad' AND area.activo = 1
+WHERE modulo.identificador = 'proyecciones_my27' AND modulo.activo = 1;
+
+INSERT IGNORE INTO modulo_area_acciones (modulo_id, area_id, accion_id)
+SELECT modulo.id, area.id, accion.id
+FROM modulos modulo
+INNER JOIN areas area
+    ON LOWER(TRIM(area.nombre)) = 'contabilidad' AND area.activo = 1
+INNER JOIN acciones accion
+    ON accion.identificador IN ('ver', 'crear', 'editar') AND accion.activo = 1
+WHERE modulo.identificador = 'proyecciones_my27' AND modulo.activo = 1;
+
 -- INSERT IGNORE conserva reglas existentes y permite varias reglas para el
 -- mismo endpoint cuando X-Ruta-Interna identifica una pantalla distinta.
 INSERT IGNORE INTO permisos_internos_endpoints
@@ -180,14 +199,44 @@ FROM (
     UNION ALL SELECT '/api/solicitud-retroactivo/nota-credito/<int:id_venta>/validar', 'POST', 'usuarios_solicitud_retroactivo_gestor', 'editar'
     UNION ALL SELECT '/api/solicitud-retroactivo/precio/<int:id_venta>', 'POST', 'usuarios_solicitud_retroactivo_gestor', 'editar'
 
-    -- Proyección de Compras.
+    -- Proyección de Compras MY27: lecturas de la pantalla /proyeccion.
+    UNION ALL SELECT '/proyecciones', 'GET', 'proyeccion_compra', 'ver'
+    UNION ALL SELECT '/proyecciones-limpias', 'GET', 'proyeccion_compra', 'ver'
+    UNION ALL SELECT '/proyecciones/resumen-global', 'GET', 'proyeccion_compra', 'ver'
+    UNION ALL SELECT '/proyecciones/detalles/<int:id_proyeccion>', 'GET', 'proyeccion_compra', 'ver'
+    UNION ALL SELECT '/proyecciones/buscar/<int:id>', 'GET', 'proyeccion_compra', 'ver'
+    UNION ALL SELECT '/disponibilidades', 'GET', 'proyeccion_compra', 'ver'
+    UNION ALL SELECT '/proyecciones/nueva', 'POST', 'proyeccion_compra', 'crear'
+    UNION ALL SELECT '/proyecciones/editar/<int:id>', 'PUT', 'proyeccion_compra', 'editar'
+    UNION ALL SELECT '/proyecciones/eliminar/<int:id>', 'DELETE', 'proyeccion_compra', 'eliminar'
+
+    -- Proyecciones MY27: monitor, inventario entrante y reserva Odoo.
+    UNION ALL SELECT '/proyecciones-my27', 'GET', 'proyecciones_my27', 'ver'
+    UNION ALL SELECT '/proyecciones-my27/exportar', 'GET', 'proyecciones_my27', 'ver'
+    UNION ALL SELECT '/proyecciones-my27/inventario-megamo', 'GET', 'proyecciones_my27', 'ver'
+    UNION ALL SELECT '/proyecciones-my27/cobertura-megamo', 'GET', 'proyecciones_my27', 'ver'
+    UNION ALL SELECT '/proyecciones-my27/exportar-cobertura', 'GET', 'proyecciones_my27', 'ver'
+    UNION ALL SELECT '/proyecciones-my27/distribucion-prioritaria', 'GET', 'proyecciones_my27', 'ver'
+    UNION ALL SELECT '/proyecciones-my27/inventario-megamo', 'POST', 'proyecciones_my27', 'editar'
+    UNION ALL SELECT '/proyecciones-my27/generar-orden-odoo', 'POST', 'proyecciones_my27', 'crear'
+
+    -- Proyección histórica de usuarios: se conserva aislada de /proyeccion.
     UNION ALL SELECT '/clientes/info', 'GET', 'usuarios_proyeccion_compras', 'ver'
     UNION ALL SELECT '/forecast/catalogo-excel', 'DELETE', 'usuarios_proyeccion_compras', 'eliminar'
 
     -- Monitor de Ventas.
     UNION ALL SELECT '/ventas/listar-clientes', 'GET', 'ventas_monitor', 'ver'
 
-    -- Monitor de Pedidos: la pantalla consulta el estado de sincronización.
+    -- Monitor de Pedidos: Forecast se resuelve por el contexto /monitor-pedidos.
+    UNION ALL SELECT '/forecast/periodos', 'GET', 'monitor_pedidos', 'ver'
+    UNION ALL SELECT '/forecast/precios-catalogo', 'GET', 'monitor_pedidos', 'ver'
+    UNION ALL SELECT '/forecast', 'GET', 'monitor_pedidos', 'ver'
+    UNION ALL SELECT '/forecast/avance', 'GET', 'monitor_pedidos', 'ver'
+    UNION ALL SELECT '/forecast/buscar-producto', 'GET', 'monitor_pedidos', 'ver'
+    UNION ALL SELECT '/forecast/importar', 'POST', 'monitor_pedidos', 'crear'
+    UNION ALL SELECT '/forecast/guardar', 'POST', 'monitor_pedidos', 'editar'
+    UNION ALL SELECT '/forecast/<int:fid>', 'DELETE', 'monitor_pedidos', 'eliminar'
+    -- La pantalla consulta el estado de sincronización.
     UNION ALL SELECT '/usuarios/sync-odoo', 'POST', 'monitor_pedidos', 'editar'
 
     -- Multimarcas: la pantalla calcula desde el monitor local y persiste el
@@ -257,6 +306,26 @@ INNER JOIN areas area
    AND area.activo = 1
 INNER JOIN modulos modulo ON modulo.identificador IN ('caratula_global', 'caratula_evac_a') AND modulo.activo = 1
 INNER JOIN acciones accion ON accion.identificador = 'ver_montos' AND accion.activo = 1
+WHERE usuario.rol_id = 4 AND usuario.activo = 1
+  AND EXISTS (
+      SELECT 1 FROM modulo_area_acciones maa
+      WHERE maa.modulo_id = modulo.id
+        AND maa.area_id = usuario.area_id
+        AND maa.accion_id = accion.id
+  );
+
+-- Se habilita la consulta MY27 para los usuarios internos activos de
+-- Contabilidad. Crear reservas y subir inventario permanecen sin conceder y
+-- requieren que se asignen explícitamente crear o editar.
+INSERT IGNORE INTO usuario_permisos_internos (usuario_id, modulo_id, area_id, accion_id)
+SELECT usuario.id, modulo.id, usuario.area_id, accion.id
+FROM usuarios usuario
+INNER JOIN areas area
+    ON area.id = usuario.area_id
+   AND LOWER(TRIM(area.nombre)) = 'contabilidad'
+   AND area.activo = 1
+INNER JOIN modulos modulo ON modulo.identificador = 'proyecciones_my27' AND modulo.activo = 1
+INNER JOIN acciones accion ON accion.identificador = 'ver' AND accion.activo = 1
 WHERE usuario.rol_id = 4 AND usuario.activo = 1
   AND EXISTS (
       SELECT 1 FROM modulo_area_acciones maa

@@ -35,24 +35,36 @@ proyecciones_bp = Blueprint('proyecciones', __name__, url_prefix='')
 
 _CAMPOS_MONETARIOS_PROYECCIONES = {
     'precio_aplicado', 'precio_distribuidor_sin_iva', 'precio_partner_sin_iva',
-    'precio_elite_sin_iva', 'precio_elite_plus_sin_iva', 'precio_publico_sin_iva',
+    'precio_elite_sin_iva', 'precio_elite_plus_sin_iva',
     'precio_distribuidor_con_iva', 'precio_partner_con_iva',
-    'precio_elite_con_iva', 'precio_elite_plus_con_iva', 'orden_total_importe',
-    'importe_total', 'total_proyeccion', 'subtotal',
+    'precio_elite_con_iva', 'precio_elite_plus_con_iva',
+    'orden_total_importe', 'importe_total', 'total_proyeccion', 'subtotal',
 }
 
 
 def _redactar_montos_proyecciones(filas):
-    """Elimina precios internos e importes, conservando precio publico con IVA."""
+    """Elimina precios internos e importes, conservando precios públicos."""
     for fila in filas:
         for campo in list(fila):
             nombre = str(campo).lower()
             if (
                 nombre in _CAMPOS_MONETARIOS_PROYECCIONES
-                or ('precio' in nombre and nombre not in {'precio_publico', 'precio_publico_con_iva', 'precio_publico_con_iva_my26'})
-                or 'importe' in nombre or 'costo' in nombre or 'inversion' in nombre
+                or (
+                    'precio' in nombre and nombre not in {
+                        'precio_publico', 'precio_publico_con_iva',
+                        'precio_publico_con_iva_my26', 'precio_publico_sin_iva',
+                    }
+                )
+                or 'importe' in nombre
+                or 'costo' in nombre or 'inversion' in nombre
             ):
                 fila.pop(campo, None)
+        productos = fila.get('productos')
+        if isinstance(productos, list):
+            _redactar_montos_proyecciones(productos)
+        historial = fila.get('historial_clientes')
+        if isinstance(historial, list):
+            _redactar_montos_proyecciones(historial)
     return filas
 
 
@@ -497,7 +509,8 @@ def detalles_proyeccion(id_proyeccion):
         else:
             resultado["historial_clientes"] = []
 
-        return jsonify(resultado), 200
+        respuesta = _redactar_montos_proyecciones([resultado])[0] if _debe_ocultar_montos_proyecciones() else resultado
+        return jsonify(respuesta), 200
 
     except Exception as e:
         print("Error completo al obtener detalles:", str(e))
@@ -910,7 +923,10 @@ def resumen_global_proyecciones():
 
             agrupado[id_cliente]["productos"].append(producto)
 
-        return jsonify(list(agrupado.values())), 200
+        respuesta = list(agrupado.values())
+        if _debe_ocultar_montos_proyecciones():
+            respuesta = _redactar_montos_proyecciones(respuesta)
+        return jsonify(respuesta), 200
 
     except Exception as e:
         print("Error al obtener el resumen global:", str(e))

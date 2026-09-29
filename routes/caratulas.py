@@ -2549,7 +2549,16 @@ def detalle_compras_odoo():
     try:
         _conexion_contexto = obtener_conexion()
         _cursor_contexto = _conexion_contexto.cursor(dictionary=True)
-        contexto = _contexto_cliente_autenticado(_cursor_contexto)
+        # Monitor de Pedidos ya eligió explícitamente el cliente o grupo a
+        # consultar. Sólo ese contexto interno omite el cliente personal
+        # reservado para los usuarios de portal.
+        contexto = _contexto_cliente_autenticado(
+            _cursor_contexto,
+            permitir_usuario_interno=(
+                request.headers.get('X-Ruta-Interna', '').rstrip('/')
+                in ('/monitor-pedidos', '/ventas-monitor')
+),
+        )
         if contexto:
             if grupo_odoo:
                 if not contexto.get('id_grupo'):
