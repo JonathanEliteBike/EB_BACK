@@ -19,6 +19,13 @@ from utils.temporada_utils import rangos_bimestres_temporada
 
 monitor_odoo_bp = Blueprint('monitor_odoo', __name__, url_prefix='')
 
+# Cuenta analítica "Retroactivo DM26" en Odoo. Las notas de crédito que Contabilidad
+# genera para liquidar retroactivos de temporadas cerradas quedan marcadas con esta
+# cuenta y dejan a la factura original en payment_state='reversed'. Esa venta sí
+# ocurrió y sí debe contar para la carátula del cliente, así que se rescata de la
+# exclusión general de facturas revertidas (ver dominio de sync_monitor_odoo).
+RETROACTIVO_ANALYTIC_ACCOUNT_ID = 174
+
 @monitor_odoo_bp.route('/monitor_odoo', methods=['GET'])
 def obtener_monitor():
     """Sin ?temporada: comportamiento histórico, sin filtrar (usado por las
@@ -612,6 +619,9 @@ def sync_monitor_odoo():
             return jsonify({'success': False, 'error': f'No se pudo conectar a Odoo: {odoo_err}'}), 500
 
         # ── 1. Facturas posted desde la temporada ─────────────────────────────
+        # payment_state='reversed' se excluye salvo que la nota de crédito que la
+        # revirtió sea de Retroactivo DM26 (ver RETROACTIVO_ANALYTIC_ACCOUNT_ID):
+        # esas ventas sí ocurrieron y deben seguir contando en la carátula.
         facturas = models.execute_kw(
             ODOO_DB, uid, ODOO_PASSWORD,
             'account.move', 'search_read',
@@ -620,7 +630,10 @@ def sync_monitor_odoo():
                 ['move_type', '=', 'out_invoice'],
                 ['state', '=', 'posted'],
                 ['invoice_date', '>=', FECHA_INICIO],
-                ['payment_state', 'not in', ['reversed', 'invoicing_legacy']],
+                '|',
+                    ['payment_state', 'not in', ['reversed', 'invoicing_legacy']],
+                    ['reversal_move_id.invoice_line_ids.distribution_analytic_account_ids',
+                     'in', [RETROACTIVO_ANALYTIC_ACCOUNT_ID]],
             ]],
             {'fields': ['id', 'name', 'invoice_date', 'partner_id', 'partner_shipping_id', 'invoice_line_ids'], 'limit': 0}
         )
