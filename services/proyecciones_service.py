@@ -513,6 +513,15 @@ def reservar_en_odoo(clave_cliente: str, mes_ym: str, lineas: list,
         if estado_orden == 'draft':
             models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD,
                 'sale.order', 'action_confirm', [[order_id]])
+            if not ordenes:
+                # Orden recien creada: Odoo la bloquea automaticamente al
+                # confirmarla (config "Lock Confirmed Orders"). Almacen
+                # necesita poder agregarle la linea de flete despues, asi
+                # que se desbloquea explicitamente solo para las que
+                # acabamos de crear (las reutilizadas ya manejan su propio
+                # locked/unlocked arriba).
+                models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD,
+                    'sale.order', 'write', [[order_id], {'locked': False}])
 
         return {'order_id': order_id, 'order_name': order_name}
 

@@ -117,12 +117,16 @@ def test_reservar_en_odoo_crea_orden_nueva_con_vendedor_y_actividad(mocker):
         ("mail.activity.type", 5),                          # ir.model.data check_object_reference
         9001,                                                # mail.activity create
         True,                                                # sale.order action_confirm
+        True,                                                # sale.order write (locked: False) -- orden recien creada
     ]
     mocker.patch("services.proyecciones_service.get_odoo_models", return_value=(1, models, None))
 
     resultado = reservar_en_odoo("lc657", "2026-10", [{"sku": "SKU-1", "cantidad": 3}])
 
     assert resultado == {"order_id": 3001, "order_name": "S00042"}
+    unlock_call = [c for c in models.execute_kw.call_args_list
+                   if c.args[3] == "sale.order" and c.args[4] == "write" and c.args[5][1] == {"locked": False}][0]
+    assert unlock_call.args[5][0] == [3001]
     create_call = [c for c in models.execute_kw.call_args_list if c.args[3] == "sale.order" and c.args[4] == "create"][0]
     order_vals = create_call.args[5][0]
     assert order_vals["partner_id"] == 501
@@ -193,6 +197,7 @@ def test_reservar_en_odoo_reintento_con_orden_borrada_crea_una_nueva(mocker):
         3002,                                                          # sale.order create -> order_id
         [{"name": "S00099", "state": "draft"}],                       # sale.order read -> name + state
         True,                                                          # sale.order action_confirm
+        True,                                                          # sale.order write (locked: False)
     ]
     mocker.patch("services.proyecciones_service.get_odoo_models", return_value=(1, models, None))
     mocker.patch("services.proyecciones_service._crear_actividad_revisar_reserva")
