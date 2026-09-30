@@ -343,6 +343,60 @@ def test_auditoria_dos_hitos_con_mismo_campo_dato_usa_el_de_menor_id():
     assert dependiente["fecha_esperada"] == "2026-01-05"
 
 
+def test_auditoria_campo_con_valor_previo_sin_historial_queda_sin_historial():
+    # El campo ya tiene un valor en la tabla importaciones (se llenó antes de
+    # que existiera esta auditoria), pero nunca se registró en el historial
+    # -- no se debe mostrar como "en_espera" (daría a entender que sigue
+    # vacío cuando en realidad ya está lleno, solo que no sabemos cuándo).
+    embarque = {"id": 1, "created_at": date(2026, 1, 1), "odoo_importador": "ACME SA"}
+    hitos = [{"id": 1, "seccion": "logistica", "orden_hito": 1, "etiqueta": "1. Importador",
+              "campo_dato": "odoo_importador", "campo_ancla": None, "dias_esperados": 0}]
+    historial = []
+    conn, _ = _conn_mock_auditoria(embarque, hitos, historial)
+
+    resultado = _calcular_auditoria(1, conn)
+
+    assert resultado[0]["estado"] == "sin_historial"
+    assert resultado[0]["dias_diferencia"] is None
+    assert resultado[0]["fecha_real"] is None
+
+
+def test_auditoria_campo_vacio_sin_historial_sigue_en_espera():
+    embarque = {"id": 1, "created_at": date(2026, 1, 1), "odoo_importador": None}
+    hitos = [{"id": 1, "seccion": "logistica", "orden_hito": 1, "etiqueta": "1. Importador",
+              "campo_dato": "odoo_importador", "campo_ancla": None, "dias_esperados": 0}]
+    conn, _ = _conn_mock_auditoria(embarque, hitos, [])
+
+    resultado = _calcular_auditoria(1, conn)
+
+    assert resultado[0]["estado"] == "en_espera"
+
+
+def test_auditoria_campo_marcado_na_sigue_en_espera():
+    embarque = {"id": 1, "created_at": date(2026, 1, 1), "odoo_importador": "__NA__"}
+    hitos = [{"id": 1, "seccion": "logistica", "orden_hito": 1, "etiqueta": "1. Importador",
+              "campo_dato": "odoo_importador", "campo_ancla": None, "dias_esperados": 0}]
+    conn, _ = _conn_mock_auditoria(embarque, hitos, [])
+
+    resultado = _calcular_auditoria(1, conn)
+
+    assert resultado[0]["estado"] == "en_espera"
+
+
+def test_auditoria_consulta_hitos_ordenados_por_id_no_por_seccion():
+    # El usuario llena los 20 hitos en el orden en que se los dieron
+    # (mezclando secciones), no agrupados por seccion -- la vista tiene que
+    # respetar ese orden de captura, no reagruparlo.
+    embarque = {"id": 1, "created_at": date(2026, 1, 1)}
+    conn, cursor = _conn_mock_auditoria(embarque, [], [])
+
+    _calcular_auditoria(1, conn)
+
+    sql_hitos = cursor.execute.call_args_list[1].args[0]
+    assert "ORDER BY id" in sql_hitos
+    assert "ORDER BY seccion" not in sql_hitos
+
+
 def test_get_auditoria_devuelve_200_con_lista(mocker):
     conn = MagicMock()
     mocker.patch("routes.importaciones.obtener_conexion", return_value=conn)
@@ -410,7 +464,7 @@ def test_resumen_auditoria_cuenta_por_estado(mocker):
         {"id": 2, "referencia": "R26-0002", "nombre": "Embarque 2", "created_at": date(2026, 1, 2)},
     ]
     hitos_emb1 = [{"estado": "atrasado"}, {"estado": "atrasado"}, {"estado": "a_tiempo"}]
-    hitos_emb2 = [{"estado": "adelantado"}, {"estado": "pendiente"}, {"estado": "en_espera"}]
+    hitos_emb2 = [{"estado": "adelantado"}, {"estado": "pendiente"}, {"estado": "en_espera"}, {"estado": "sin_historial"}]
     mocker.patch(
         "routes.importaciones._calcular_auditoria",
         side_effect=[hitos_emb1, hitos_emb2],
@@ -420,12 +474,12 @@ def test_resumen_auditoria_cuenta_por_estado(mocker):
 
     assert resultado[0] == {
         "id": 1, "referencia": "R26-0001", "nombre": "Embarque 1",
-        "atrasados": 2, "adelantados": 0, "a_tiempo": 1, "pendientes": 0, "en_espera": 0,
+        "atrasados": 2, "adelantados": 0, "a_tiempo": 1, "pendientes": 0, "en_espera": 0, "sin_historial": 0,
         "hitos": hitos_emb1,
     }
     assert resultado[1] == {
         "id": 2, "referencia": "R26-0002", "nombre": "Embarque 2",
-        "atrasados": 0, "adelantados": 1, "a_tiempo": 0, "pendientes": 1, "en_espera": 1,
+        "atrasados": 0, "adelantados": 1, "a_tiempo": 0, "pendientes": 1, "en_espera": 1, "sin_historial": 1,
         "hitos": hitos_emb2,
     }
 

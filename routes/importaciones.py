@@ -33,6 +33,10 @@ def _serialize(row: dict) -> dict:
     return row
 
 
+def _es_valor_vacio(v) -> bool:
+    return v in (None, "", "__NA__")
+
+
 def _registrar_primera_captura(cursor, importacion_id: int, existing: dict, merged: dict,
                                 campos_a_actualizar: list) -> None:
     """Inserta en importaciones_historial_campos la PRIMERA vez que cada
@@ -48,12 +52,10 @@ def _registrar_primera_captura(cursor, importacion_id: int, existing: dict, merg
         if campo not in _COLS_PERMITIDAS:
             continue
         valor_antes = existing.get(campo)
-        tenia_valor = valor_antes not in (None, "", "__NA__")
-        if tenia_valor:
+        if not _es_valor_vacio(valor_antes):
             continue
         valor_despues = merged.get(campo)
-        tiene_valor_ahora = valor_despues not in (None, "", "__NA__")
-        if not tiene_valor_ahora:
+        if _es_valor_vacio(valor_despues):
             continue
         cursor.execute(
             "INSERT INTO importaciones_historial_campos "
@@ -82,13 +84,17 @@ def _calcular_auditoria(importacion_id: int, conn) -> list[dict]:
     docs/superpowers/specs/2026-09-30-auditoria-llenado-embarque-design.md
     §4 para las 3 reglas de resolucion de fecha esperada."""
     cursor = conn.cursor(dictionary=True)
-    cursor.execute("SELECT id, created_at FROM importaciones WHERE id = %s", (importacion_id,))
+    cursor.execute("SELECT * FROM importaciones WHERE id = %s", (importacion_id,))
     embarque = cursor.fetchone()
     if not embarque:
         return []
 
+    # ORDER BY id, no por seccion/orden_hito: el usuario llena los hitos en
+    # el orden en que se los dieron (mezclando secciones), y la vista debe
+    # respetar ese orden de captura -- los hitos se sembraron en ese mismo
+    # orden, asi que su id ascendente ES ese orden original.
     cursor.execute(
-        "SELECT * FROM importaciones_hitos_auditoria WHERE activo = 1 ORDER BY seccion, orden_hito"
+        "SELECT * FROM importaciones_hitos_auditoria WHERE activo = 1 ORDER BY id"
     )
     hitos = cursor.fetchall()
     if not hitos:
@@ -169,7 +175,16 @@ def _calcular_auditoria(importacion_id: int, conn) -> list[dict]:
         if esperada is None:
             estado, dias_diferencia = "pendiente", None
         elif real_date is None:
-            estado, dias_diferencia = "en_espera", None
+            # No hay registro de CUANDO se llenó, pero puede que el campo ya
+            # tenga un valor de antes de que existiera esta auditoría (dato
+            # capturado antes de que el rastreo de historial arrancara) --
+            # no reportarlo como "en_espera" (daría a entender que sigue
+            # vacío) cuando en realidad ya está lleno, solo que no se sabe
+            # la fecha exacta de captura.
+            if not _es_valor_vacio(embarque.get(hito["campo_dato"])):
+                estado, dias_diferencia = "sin_historial", None
+            else:
+                estado, dias_diferencia = "en_espera", None
         else:
             dias_diferencia = (esperada - real_date).days
             if dias_diferencia > 0:
@@ -207,10 +222,10 @@ def _calcular_auditoria_resumen(conn) -> list[dict]:
     resumen = []
     for emb in embarques:
         hitos = _calcular_auditoria(emb["id"], conn)
-        conteo = {"atrasados": 0, "adelantados": 0, "a_tiempo": 0, "pendientes": 0, "en_espera": 0}
+        conteo = {"atrasados": 0, "adelantados": 0, "a_tiempo": 0, "pendientes": 0, "en_espera": 0, "sin_historial": 0}
         clave_por_estado = {
             "atrasado": "atrasados", "adelantado": "adelantados", "a_tiempo": "a_tiempo",
-            "pendiente": "pendientes", "en_espera": "en_espera",
+            "pendiente": "pendientes", "en_espera": "en_espera", "sin_historial": "sin_historial",
         }
         for h in hitos:
             clave = clave_por_estado.get(h["estado"])
