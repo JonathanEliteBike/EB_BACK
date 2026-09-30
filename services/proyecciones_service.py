@@ -371,19 +371,26 @@ def _crear_actividad_revisar_reserva(models, uid, order_id: int, vendedor_id: in
         logging.exception('[reservar_en_odoo] no se pudo crear la actividad en la orden %s', order_id)
 
 
-def reservar_en_odoo(clave_cliente: str, mes_ym: str, lineas: list) -> dict:
-    """Crea o completa (find-or-append) la orden de venta MY27 de `clave_cliente`
-    para el mes `mes_ym` ('YYYY-MM'), agregando `lineas` ([{sku, cantidad}]) como
-    order_line.
+def reservar_en_odoo(clave_cliente: str, mes_ym: str, lineas: list,
+                      order_id_conocido: int | None = None) -> dict:
+    """Crea la orden de venta MY27 de `clave_cliente` para el mes `mes_ym`
+    ('YYYY-MM'), agregando `lineas` ([{sku, cantidad}]) como order_line.
 
-    Si ya existe una orden en estado 'draft' de ese partner con la etiqueta del
-    mes (p. ej. 'MY27 OCT'), le agrega/incrementa las líneas en vez de crear una
-    nueva -- así una reserva de varios SKU hecha en llamadas separadas (una por
-    producto, ver services/asignaciones_service.py:_persistir_reservas) termina
-    en UNA sola orden por (cliente, mes), no una por SKU.
+    Cada reserva nueva va en su PROPIA orden -- no se busca ni se reutiliza
+    ninguna orden existente en Odoo por (cliente, mes), porque distintas
+    reservas (de embarques/SKU distintos) para el mismo cliente y mes no
+    deben terminar mezcladas en una sola orden.
+
+    La única reutilización válida es la de reintento: si el caller ya sabe
+    (por su propio registro local, ver services/asignaciones_service.py:
+    _persistir_reservas -> importacion_asignaciones.odoo_order_id) que ESTA
+    MISMA reserva ya había creado una orden en un intento anterior, pasa ese
+    id en `order_id_conocido` y se le agregan/incrementan las líneas ahí en
+    vez de crear una orden duplicada. Si esa orden ya no existe en Odoo (fue
+    borrada), se crea una nueva como si no se hubiera pasado el id.
 
     Asigna vendedor según VENDEDOR_POR_CLIENTE y crea la actividad de
-    seguimiento la primera vez que se crea la orden (no en cada append).
+    seguimiento solo cuando se crea la orden (no al reutilizar por reintento).
 
     Lanza OdooReservaError si algo falla -- el caller (Asignaciones) revierte la
     reserva local: la orden de venta es la fuente de verdad de que la reserva ya
@@ -427,10 +434,15 @@ def reservar_en_odoo(clave_cliente: str, mes_ym: str, lineas: list) -> dict:
 
         vendedor_id = VENDEDOR_POR_CLIENTE.get(clave)
 
-        ordenes = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD,
-            'sale.order', 'search_read',
-            [[['partner_id', '=', partner_id], ['tag_ids', 'in', [tag_id]], ['state', 'in', ['draft', 'sale']]]],
-            {'fields': ['id', 'name', 'order_line', 'state', 'locked'], 'limit': 1})
+        # Solo se reutiliza la orden de un intento anterior de ESTA MISMA
+        # reserva (ver docstring) -- nunca se busca en Odoo por partner+tag,
+        # eso mezclaría reservas distintas del mismo cliente/mes en una orden.
+        ordenes = []
+        if order_id_conocido:
+            ordenes = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD,
+                'sale.order', 'search_read',
+                [[['id', '=', order_id_conocido], ['state', 'in', ['draft', 'sale']]]],
+                {'fields': ['id', 'name', 'order_line', 'state', 'locked'], 'limit': 1})
 
         if ordenes:
             order_id, order_name = ordenes[0]['id'], ordenes[0]['name']

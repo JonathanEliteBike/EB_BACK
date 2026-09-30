@@ -806,6 +806,7 @@ def _persistir_reservas(producto_id: int, reservas: list, *, origen: str, estado
                 409,
             )
 
+        order_ids_conocidos: dict = {}
         for item in reservas:
             clave = item["clave_cliente"].strip().upper()
             cantidad = item["cantidad"]
@@ -814,12 +815,14 @@ def _persistir_reservas(producto_id: int, reservas: list, *, origen: str, estado
             prio_info = _PRIORIDAD_MAP.get(clave, (999, clave))
 
             cursor.execute(
-                "SELECT id FROM importacion_asignaciones "
+                "SELECT id, odoo_order_id FROM importacion_asignaciones "
                 "WHERE importacion_producto_id = %s AND clave_cliente = %s "
                 f"AND (mes_objetivo <=> %s) AND origen = '{origen}' FOR UPDATE",
                 (producto_id, clave, mes_fecha),
             )
             existente = cursor.fetchone()
+            if mes_fecha is not None and existente and existente.get("odoo_order_id"):
+                order_ids_conocidos[(clave, mes_fecha)] = existente["odoo_order_id"]
             if existente:
                 if proyectado is not None:
                     cursor.execute(
@@ -865,7 +868,10 @@ def _persistir_reservas(producto_id: int, reservas: list, *, origen: str, estado
         ordenes_odoo = []
         for (clave, mes_fecha), cantidad_total in grupos_odoo.items():
             try:
-                orden = reservar_en_odoo(clave, _fecha_a_ym(mes_fecha), [{"sku": producto["sku"], "cantidad": cantidad_total}])
+                orden = reservar_en_odoo(
+                    clave, _fecha_a_ym(mes_fecha), [{"sku": producto["sku"], "cantidad": cantidad_total}],
+                    order_id_conocido=order_ids_conocidos.get((clave, mes_fecha)),
+                )
             except OdooReservaError as e:
                 raise AsignacionesError("ODOO_ERROR", f"No se pudo reservar en Odoo: {e}", 502)
             ordenes_odoo.append({
