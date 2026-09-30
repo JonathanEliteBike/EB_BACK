@@ -191,10 +191,11 @@ def _calcular_auditoria(importacion_id: int, conn) -> list[dict]:
 
 def _calcular_auditoria_resumen(conn) -> list[dict]:
     """Auditoria de TODOS los embarques (menos los eliminados) de un
-    vistazo: cuenta cuantos hitos de cada uno estan atrasados/adelantados/
-    a_tiempo/pendientes/en_espera, reutilizando _calcular_auditoria() por
-    embarque. Pensado para la vista general que revisa un supervisor sin
-    tener que entrar embarque por embarque."""
+    vistazo: para cada uno agrega el conteo por estado y el desglose
+    completo de hitos (mismo shape que _calcular_auditoria), reutilizando
+    _calcular_auditoria() por embarque. El desglose completo es lo que usa
+    el frontend para pintar la tarjeta de pipeline por embarque; el conteo
+    queda para badges/orden rapido."""
     cursor = conn.cursor(dictionary=True)
     cursor.execute("""
         SELECT id, referencia, nombre FROM importaciones
@@ -218,6 +219,7 @@ def _calcular_auditoria_resumen(conn) -> list[dict]:
         resumen.append({
             "id": emb["id"], "referencia": emb["referencia"], "nombre": emb["nombre"],
             **conteo,
+            "hitos": hitos,
         })
     return resumen
 
