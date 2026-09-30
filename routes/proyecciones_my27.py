@@ -17,7 +17,7 @@ from db_conexion import obtener_conexion
 from routes.forecast import (SKU_CATALOG, FORECAST_SKU_WHITELIST,
                              _SCOTT_CORRECT_NAMES, _SCOTT_COLORS, _SCOTT_TALLAS,
                              _ensure_scott_names, _redis_get, _redis_set)
-from utils.odoo_utils import get_odoo_models, ODOO_DB, ODOO_PASSWORD
+from utils.odoo_utils import get_odoo_models, ODOO_DB, ODOO_PASSWORD, ODOO_COMPANY_ID
 
 try:
     import openpyxl
@@ -105,7 +105,7 @@ def _get_stock_disponible_odoo() -> dict:
         # virtual_available = qty_on_hand + incoming_qty - outgoing_qty
         prods = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD,
             'product.product', 'search_read',
-            [[['default_code', 'in', skus]]],
+            [[['default_code', 'in', skus], ['company_id', 'in', [ODOO_COMPANY_ID, False]]]],
             {'fields': ['id', 'default_code', 'virtual_available'], 'limit': 0})
 
         result: dict = {}
@@ -163,7 +163,7 @@ def _get_megamo_precios_por_nivel() -> dict:
 
         prods = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD,
             'product.product', 'search_read',
-            [[['default_code', 'in', megamo_skus]]],
+            [[['default_code', 'in', megamo_skus], ['company_id', 'in', [ODOO_COMPANY_ID, False]]]],
             {'fields': ['id', 'default_code'], 'limit': 0})
         prod_id_map = {p['default_code']: p['id'] for p in prods}
         id_to_sku   = {v: k for k, v in prod_id_map.items()}
@@ -234,7 +234,7 @@ def _get_costos_odoo() -> dict:
         # Búsqueda en product.product (variantes) — standard_price con list_price como fallback
         productos_pp = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD,
             'product.product', 'search_read',
-            [[['default_code', 'in', skus]]],
+            [[['default_code', 'in', skus], ['company_id', 'in', [ODOO_COMPANY_ID, False]]]],
             {'fields': ['default_code', 'standard_price', 'list_price'], 'limit': 0})
 
         # Normalizar: strip + mapear código → costo.
@@ -255,7 +255,7 @@ def _get_costos_odoo() -> dict:
         if skus_sin_costo:
             productos_pt = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD,
                 'product.template', 'search_read',
-                [[['default_code', 'in', skus_sin_costo]]],
+                [[['default_code', 'in', skus_sin_costo], ['company_id', 'in', [ODOO_COMPANY_ID, False]]]],
                 {'fields': ['default_code', 'standard_price', 'list_price'], 'limit': 0})
             for p in productos_pt:
                 code = (p.get('default_code') or '').strip()
@@ -270,7 +270,7 @@ def _get_costos_odoo() -> dict:
         if megamo_sin_precio:
             prods_mh = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD,
                 'product.product', 'search_read',
-                [[['default_code', 'in', megamo_sin_precio]]],
+                [[['default_code', 'in', megamo_sin_precio], ['company_id', 'in', [ODOO_COMPANY_ID, False]]]],
                 {'fields': ['id', 'default_code'], 'limit': 0})
             mh_id_map = {p['id']: p['default_code'] for p in prods_mh}
             if mh_id_map:
@@ -1617,7 +1617,7 @@ def generar_orden_odoo():
         # 1. Partner por ref = clave_cliente
         partners = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD,
             'res.partner', 'search_read',
-            [[['ref', '=', clave_cliente]]],
+            [[['ref', '=', clave_cliente], ['company_id', 'in', [ODOO_COMPANY_ID, False]]]],
             {'fields': ['id', 'name'], 'limit': 1})
         if not partners:
             return jsonify({'error': f'No se encontró contacto en Odoo con ref={clave_cliente}'}), 404
@@ -1638,7 +1638,7 @@ def generar_orden_odoo():
         skus = [(l.get('sku') or '').strip() for l in lineas]
         prods = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD,
             'product.product', 'search_read',
-            [[['default_code', 'in', skus]]],
+            [[['default_code', 'in', skus], ['company_id', 'in', [ODOO_COMPANY_ID, False]]]],
             {'fields': ['id', 'default_code', 'lst_price'], 'limit': 0})
         sku_to_prod = {(p.get('default_code') or '').strip(): p for p in prods}
 

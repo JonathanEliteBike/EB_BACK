@@ -9,7 +9,7 @@ import re
 import time
 
 from db_conexion import obtener_conexion
-from utils.odoo_utils import get_odoo_models, ODOO_DB, ODOO_PASSWORD
+from utils.odoo_utils import get_odoo_models, ODOO_DB, ODOO_PASSWORD, ODOO_COMPANY_ID
 
 # Lista de prioridad para distribución de inventario.
 # Los clientes no en esta lista reciben stock después de la prioridad 27.
@@ -402,7 +402,8 @@ def reservar_en_odoo(clave_cliente: str, mes_ym: str, lineas: list) -> dict:
 
         partners = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD,
             'res.partner', 'search_read',
-            [[['ref', '=', clave]]], {'fields': ['id', 'name'], 'limit': 1})
+            [[['ref', '=', clave], ['company_id', 'in', [ODOO_COMPANY_ID, False]]]],
+            {'fields': ['id', 'name'], 'limit': 1})
         if not partners:
             raise OdooReservaError(f'No se encontró contacto en Odoo con ref={clave}')
         partner_id = partners[0]['id']
@@ -410,7 +411,7 @@ def reservar_en_odoo(clave_cliente: str, mes_ym: str, lineas: list) -> dict:
         skus = [(l.get('sku') or '').strip() for l in lineas]
         prods = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD,
             'product.product', 'search_read',
-            [[['default_code', 'in', skus]]],
+            [[['default_code', 'in', skus], ['company_id', 'in', [ODOO_COMPANY_ID, False]]]],
             {'fields': ['id', 'default_code'], 'limit': 0})
         sku_to_prod = {(p.get('default_code') or '').strip(): p for p in prods}
         no_encontrados = sorted({s for s in skus if s not in sku_to_prod})

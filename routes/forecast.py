@@ -759,7 +759,7 @@ def _ensure_scott_names():
     if _SCOTT_NAMES_LOADED:
         return
     try:
-        from utils.odoo_utils import get_odoo_models, ODOO_DB, ODOO_PASSWORD
+        from utils.odoo_utils import get_odoo_models, ODOO_DB, ODOO_PASSWORD, ODOO_COMPANY_ID
         uid_s, models_s, err_s = get_odoo_models()
         if err_s or not uid_s:
             return
@@ -767,7 +767,7 @@ def _ensure_scott_names():
         _ctx = {'lang': 'es_MX'}
         odoo_prods = models_s.execute_kw(ODOO_DB, uid_s, ODOO_PASSWORD,
             'product.product', 'search_read',
-            [[['default_code', 'in', all_scott_skus]]],
+            [[['default_code', 'in', all_scott_skus], ['company_id', 'in', [ODOO_COMPANY_ID, False]]]],
             {'fields': ['id', 'default_code', 'name',
                         'product_template_attribute_value_ids'],
              'limit': 300, 'context': _ctx}
@@ -1107,7 +1107,7 @@ def _get_odoo_prices_for_skus(refs: list) -> dict:
     if not refs:
         return result
     try:
-        from utils.odoo_utils import get_odoo_models, ODOO_DB, ODOO_PASSWORD
+        from utils.odoo_utils import get_odoo_models, ODOO_DB, ODOO_PASSWORD, ODOO_COMPANY_ID
         uid, models, err = get_odoo_models()
         if not uid:
             logging.warning('[prices] Cannot connect to Odoo: %s', err)
@@ -1115,7 +1115,7 @@ def _get_odoo_prices_for_skus(refs: list) -> dict:
 
         prods = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD,
             'product.product', 'search_read',
-            [[['default_code', 'in', refs]]],
+            [[['default_code', 'in', refs], ['company_id', 'in', [ODOO_COMPANY_ID, False]]]],
             {'fields': ['id', 'default_code', 'lst_price', 'product_tmpl_id']}
         )
         prod_id_by_ref = {}
@@ -1229,7 +1229,7 @@ def _get_single_pricelist_prices(pricelist_id: int, refs: list) -> dict:
     if not refs or not pricelist_id:
         return result
     try:
-        from utils.odoo_utils import get_odoo_models, ODOO_DB, ODOO_PASSWORD
+        from utils.odoo_utils import get_odoo_models, ODOO_DB, ODOO_PASSWORD, ODOO_COMPANY_ID
         uid, models, err = get_odoo_models()
         if not uid:
             logging.warning('[prices] No Odoo connection for pricelist %s: %s', pricelist_id, err)
@@ -1237,7 +1237,7 @@ def _get_single_pricelist_prices(pricelist_id: int, refs: list) -> dict:
 
         prods = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD,
             'product.product', 'search_read',
-            [[['default_code', 'in', refs]]],
+            [[['default_code', 'in', refs], ['company_id', 'in', [ODOO_COMPANY_ID, False]]]],
             {'fields': ['id', 'default_code', 'lst_price', 'product_tmpl_id']}
         )
         prod_id_by_ref    = {}
@@ -1353,7 +1353,7 @@ def _sync_catalogo_odoo_task():
     """Fetch all active product variants from Odoo and upsert into odoo_catalogo."""
     global _catalogo_syncing
     try:
-        from utils.odoo_utils import get_odoo_models, ODOO_DB, ODOO_PASSWORD
+        from utils.odoo_utils import get_odoo_models, ODOO_DB, ODOO_PASSWORD, ODOO_COMPANY_ID
         uid, models, err = get_odoo_models()
         if not uid:
             logging.warning('[catalogo_sync] Could not connect to Odoo: %s', err)
@@ -1369,7 +1369,7 @@ def _sync_catalogo_odoo_task():
             records = models.execute_kw(
                 ODOO_DB, uid, ODOO_PASSWORD,
                 'product.product', 'search_read',
-                [[['active', '=', True]]],
+                [[['active', '=', True], ['company_id', 'in', [ODOO_COMPANY_ID, False]]]],
                 {'fields': ['id', 'default_code', 'name', 'categ_id',
                             'product_template_attribute_value_ids', 'lst_price'],
                  'limit': batch_size, 'offset': offset,
@@ -2454,7 +2454,7 @@ def descargar_template_global_scott():
     ]
 
     # Consultar Odoo para obtener nombre, marca, talla por variante
-    from utils.odoo_utils import get_odoo_models, ODOO_DB, ODOO_PASSWORD
+    from utils.odoo_utils import get_odoo_models, ODOO_DB, ODOO_PASSWORD, ODOO_COMPANY_ID
     uid, models_obj, err = get_odoo_models()
     products = []
     if uid and not err:
@@ -2462,7 +2462,7 @@ def descargar_template_global_scott():
             _ODOO_CTX = {'lang': 'es_MX'}  # nombres en español (traducción activa en Odoo)
             prods = models_obj.execute_kw(ODOO_DB, uid, ODOO_PASSWORD,
                 'product.product', 'search_read',
-                [[['default_code', 'in', SCOTT_SKUS_LIST]]],
+                [[['default_code', 'in', SCOTT_SKUS_LIST], ['company_id', 'in', [ODOO_COMPANY_ID, False]]]],
                 {'fields': ['id', 'default_code', 'name', 'list_price',
                             'product_tmpl_id',
                             'product_template_attribute_value_ids'],
@@ -3861,14 +3861,14 @@ def avance_forecast():
             logging.debug('avance_forecast: caché L2 (Redis) HIT para %s/%s', clave, periodo)
         else:
           try:
-            from utils.odoo_utils import get_odoo_models, ODOO_DB, ODOO_PASSWORD
+            from utils.odoo_utils import get_odoo_models, ODOO_DB, ODOO_PASSWORD, ODOO_COMPANY_ID
             uid_oo, models_oo, err_oo = get_odoo_models()
             if uid_oo and models_oo:
                 # Find partner(s) matching the client reference code
                 partner_ids = models_oo.execute_kw(
                     ODOO_DB, uid_oo, ODOO_PASSWORD,
                     'res.partner', 'search',
-                    [[['ref', '=', clave]]]
+                    [[['ref', '=', clave], ['company_id', 'in', [ODOO_COMPANY_ID, False]]]]
                 )
                 if partner_ids:
                     # Get confirmed sale orders in the commercial period
@@ -3876,6 +3876,7 @@ def avance_forecast():
                         ODOO_DB, uid_oo, ODOO_PASSWORD,
                         'sale.order', 'search',
                         [[['partner_id', 'in', partner_ids],
+                          ['company_id', '=', ODOO_COMPANY_ID],
                           ['state', 'in', ['sale', 'done']],
                           ['date_order', '>=', fecha_inicio],
                           ['date_order', '<=', fecha_fin + ' 23:59:59']]]
@@ -4164,7 +4165,7 @@ def avance_forecast_integral():
             orders_by_sku = _cached[1]
         else:
             try:
-                from utils.odoo_utils import get_odoo_models, ODOO_DB, ODOO_PASSWORD
+                from utils.odoo_utils import get_odoo_models, ODOO_DB, ODOO_PASSWORD, ODOO_COMPANY_ID
                 uid_oo, models_oo, err_oo = get_odoo_models()
                 if uid_oo and models_oo:
                     # Buscar todos los partners del grupo por su ref
@@ -4173,7 +4174,7 @@ def avance_forecast_integral():
                         pids = models_oo.execute_kw(
                             ODOO_DB, uid_oo, ODOO_PASSWORD,
                             'res.partner', 'search',
-                            [[['ref', '=', clave]]]
+                            [[['ref', '=', clave], ['company_id', 'in', [ODOO_COMPANY_ID, False]]]]
                         )
                         partner_ids.extend(pids)
 
@@ -4182,6 +4183,7 @@ def avance_forecast_integral():
                             ODOO_DB, uid_oo, ODOO_PASSWORD,
                             'sale.order', 'search',
                             [[['partner_id', 'in', partner_ids],
+                              ['company_id', '=', ODOO_COMPANY_ID],
                               ['state', 'in', ['sale', 'done']],
                               ['date_order', '>=', fecha_inicio],
                               ['date_order', '<=', fecha_fin + ' 23:59:59']]]

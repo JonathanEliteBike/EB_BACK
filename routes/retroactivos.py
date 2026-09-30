@@ -7,7 +7,7 @@ from db_conexion import obtener_conexion
 import decimal
 import traceback
 from datetime import date, datetime
-from utils.odoo_utils import get_odoo_models, ODOO_DB, ODOO_PASSWORD
+from utils.odoo_utils import get_odoo_models, ODOO_DB, ODOO_PASSWORD, ODOO_COMPANY_ID
 from utils.temporada_utils import rangos_bimestres_temporada
 import openpyxl
 
@@ -458,7 +458,7 @@ def obtener_productos_por_referencias(models, uid, referencias):
             ODOO_PASSWORD,
             'product.product',
             'search_read',
-            [[('default_code', 'in', lote_refs)]],
+            [[('default_code', 'in', lote_refs), ('company_id', 'in', [ODOO_COMPANY_ID, False])]],
             {
                 'fields': ['id', 'name', 'display_name', 'default_code', 'product_tmpl_id', 'categ_id'],
                 'limit': 1000
