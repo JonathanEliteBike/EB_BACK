@@ -654,6 +654,44 @@ def inicializar_tablas():
         )
         conn.commit()
 
+        # Historial de primera captura por campo -- alimenta la auditoria de
+        # llenado del embarque. Tabla de proposito general: sirve para estos
+        # hitos y para cualquier auditoria futura ("quien capturo que y
+        # cuando"), no se acopla a los hitos configurados.
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS importaciones_historial_campos (
+                id               INT AUTO_INCREMENT PRIMARY KEY,
+                importacion_id   INT NOT NULL,
+                campo            VARCHAR(100) NOT NULL,
+                valor_anterior   TEXT,
+                valor_nuevo      TEXT,
+                capturado_en     TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                usuario_id       INT,
+                INDEX idx_importacion_campo (importacion_id, campo),
+                FOREIGN KEY (importacion_id) REFERENCES importaciones(id) ON DELETE CASCADE
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+        """)
+        conn.commit()
+
+        # Hitos configurables de la auditoria (seccion -> campo esperado en N
+        # dias desde un ancla). Editable desde /importaciones/hitos-auditoria,
+        # mismo patron que importaciones_tiempos_estimados.
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS importaciones_hitos_auditoria (
+                id               INT AUTO_INCREMENT PRIMARY KEY,
+                seccion          VARCHAR(30) NOT NULL,
+                orden_hito       INT NOT NULL,
+                etiqueta         VARCHAR(150) NOT NULL,
+                campo_dato       VARCHAR(100) NOT NULL,
+                campo_ancla      VARCHAR(100),
+                dias_esperados   INT NOT NULL DEFAULT 0,
+                activo           TINYINT(1) NOT NULL DEFAULT 1,
+                created_at       TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at       TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+        """)
+        conn.commit()
+
         return jsonify({"ok": True, "mensaje": "Tabla importaciones creada/verificada"}), 201
     except Exception as e:
         return jsonify({"error": str(e)}), 500
