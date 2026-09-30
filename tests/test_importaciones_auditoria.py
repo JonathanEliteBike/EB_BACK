@@ -394,3 +394,59 @@ def test_seed_hitos_iniciales():
     )
     conn.commit()
     conn.close()
+
+
+# ── Resumen de auditoria (todos los embarques, contador por estado) ──────────
+
+from routes.importaciones import _calcular_auditoria_resumen
+
+
+def test_resumen_auditoria_cuenta_por_estado(mocker):
+    conn = MagicMock()
+    cursor = MagicMock()
+    conn.cursor.return_value = cursor
+    cursor.fetchall.return_value = [
+        {"id": 1, "referencia": "R26-0001", "nombre": "Embarque 1", "created_at": date(2026, 1, 1)},
+        {"id": 2, "referencia": "R26-0002", "nombre": "Embarque 2", "created_at": date(2026, 1, 2)},
+    ]
+    mocker.patch(
+        "routes.importaciones._calcular_auditoria",
+        side_effect=[
+            [{"estado": "atrasado"}, {"estado": "atrasado"}, {"estado": "a_tiempo"}],
+            [{"estado": "adelantado"}, {"estado": "pendiente"}, {"estado": "en_espera"}],
+        ],
+    )
+
+    resultado = _calcular_auditoria_resumen(conn)
+
+    assert resultado[0] == {
+        "id": 1, "referencia": "R26-0001", "nombre": "Embarque 1",
+        "atrasados": 2, "adelantados": 0, "a_tiempo": 1, "pendientes": 0, "en_espera": 0,
+    }
+    assert resultado[1] == {
+        "id": 2, "referencia": "R26-0002", "nombre": "Embarque 2",
+        "atrasados": 0, "adelantados": 1, "a_tiempo": 0, "pendientes": 1, "en_espera": 1,
+    }
+
+
+def test_resumen_auditoria_sin_embarques_devuelve_lista_vacia(mocker):
+    conn = MagicMock()
+    cursor = MagicMock()
+    conn.cursor.return_value = cursor
+    cursor.fetchall.return_value = []
+
+    assert _calcular_auditoria_resumen(conn) == []
+
+
+def test_get_auditoria_resumen_devuelve_200(mocker):
+    conn = MagicMock()
+    mocker.patch("routes.importaciones.obtener_conexion", return_value=conn)
+    mocker.patch("routes.importaciones._calcular_auditoria_resumen", return_value=[
+        {"id": 1, "referencia": "R26-0001", "nombre": "Embarque 1",
+         "atrasados": 2, "adelantados": 0, "a_tiempo": 1, "pendientes": 0, "en_espera": 0},
+    ])
+
+    resp = _cliente_test().get("/importaciones/auditoria-resumen")
+
+    assert resp.status_code == 200
+    assert resp.get_json()[0]["atrasados"] == 2

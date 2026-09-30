@@ -189,6 +189,39 @@ def _calcular_auditoria(importacion_id: int, conn) -> list[dict]:
     return salida
 
 
+def _calcular_auditoria_resumen(conn) -> list[dict]:
+    """Auditoria de TODOS los embarques (menos los eliminados) de un
+    vistazo: cuenta cuantos hitos de cada uno estan atrasados/adelantados/
+    a_tiempo/pendientes/en_espera, reutilizando _calcular_auditoria() por
+    embarque. Pensado para la vista general que revisa un supervisor sin
+    tener que entrar embarque por embarque."""
+    cursor = conn.cursor(dictionary=True)
+    cursor.execute("""
+        SELECT id, referencia, nombre FROM importaciones
+        WHERE estado != 'eliminado'
+        ORDER BY created_at DESC
+    """)
+    embarques = cursor.fetchall()
+
+    resumen = []
+    for emb in embarques:
+        hitos = _calcular_auditoria(emb["id"], conn)
+        conteo = {"atrasados": 0, "adelantados": 0, "a_tiempo": 0, "pendientes": 0, "en_espera": 0}
+        clave_por_estado = {
+            "atrasado": "atrasados", "adelantado": "adelantados", "a_tiempo": "a_tiempo",
+            "pendiente": "pendientes", "en_espera": "en_espera",
+        }
+        for h in hitos:
+            clave = clave_por_estado.get(h["estado"])
+            if clave:
+                conteo[clave] += 1
+        resumen.append({
+            "id": emb["id"], "referencia": emb["referencia"], "nombre": emb["nombre"],
+            **conteo,
+        })
+    return resumen
+
+
 
 
 # ── Porcentajes de avance por sección ────────────────────────────────────────
@@ -1121,6 +1154,20 @@ def obtener_auditoria(id_imp):
     except Exception as e:
         logging.exception("Error calculando auditoria del embarque %s: %s", id_imp, e)
         return jsonify({"error": "No se pudo calcular la auditoría"}), 500
+    finally:
+        conn.close()
+
+
+@importaciones_bp.route("/auditoria-resumen", methods=["GET"])
+def obtener_auditoria_resumen():
+    conn = obtener_conexion()
+    if not conn:
+        return jsonify({"error": "Sin conexion a BD"}), 500
+    try:
+        return jsonify(_calcular_auditoria_resumen(conn)), 200
+    except Exception as e:
+        logging.exception("Error calculando el resumen de auditoria: %s", e)
+        return jsonify({"error": "No se pudo calcular el resumen de auditoría"}), 500
     finally:
         conn.close()
 
