@@ -33,6 +33,36 @@ def _serialize(row: dict) -> dict:
     return row
 
 
+def _registrar_primera_captura(cursor, importacion_id: int, existing: dict, merged: dict,
+                                campos_a_actualizar: list) -> None:
+    """Inserta en importaciones_historial_campos la PRIMERA vez que cada
+    campo rastreado pasa de vacio a tener valor. No se llama dentro de una
+    transaccion propia -- corre en la misma conexion/commit que el UPDATE
+    principal de actualizar().
+
+    Solo registra columnas en _COLS_PERMITIDAS (los campos capturables del
+    formulario); un valor vacio se define como None, cadena vacia o
+    '__NA__'. Si el campo YA tenia un valor real antes de este guardado, es
+    una correccion, no una primera captura -- no se toca el historial."""
+    for campo in campos_a_actualizar:
+        if campo not in _COLS_PERMITIDAS:
+            continue
+        valor_antes = existing.get(campo)
+        tenia_valor = valor_antes not in (None, "", "__NA__")
+        if tenia_valor:
+            continue
+        valor_despues = merged.get(campo)
+        tiene_valor_ahora = valor_despues not in (None, "", "__NA__")
+        if not tiene_valor_ahora:
+            continue
+        cursor.execute(
+            "INSERT INTO importaciones_historial_campos "
+            "(importacion_id, campo, valor_anterior, valor_nuevo) VALUES (%s, %s, %s, %s)",
+            (importacion_id, campo, str(valor_antes) if valor_antes is not None else None,
+             str(valor_despues)),
+        )
+
+
 def _calc_dias(fecha_desde, fecha_hasta):
     if fecha_desde and fecha_hasta:
         try:
@@ -1631,6 +1661,9 @@ def actualizar(id_imp):
 
         vals.append(id_imp)
         cursor.execute(f"UPDATE importaciones SET {set_clause} WHERE id = %s", vals)
+        conn.commit()
+
+        _registrar_primera_captura(cursor, id_imp, existing, merged, campos_a_actualizar)
         conn.commit()
 
         # ── Auto-transición de estado según progreso global ───────────────────
