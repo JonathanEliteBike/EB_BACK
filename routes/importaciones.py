@@ -76,6 +76,119 @@ def _calc_dias(fecha_desde, fecha_hasta):
     return None
 
 
+def _calcular_auditoria(importacion_id: int, conn) -> list[dict]:
+    """Resuelve cada hito activo de importaciones_hitos_auditoria contra su
+    ancla y devuelve el resultado de la auditoria de llenado. Ver
+    docs/superpowers/specs/2026-09-30-auditoria-llenado-embarque-design.md
+    §4 para las 3 reglas de resolucion de fecha esperada."""
+    cursor = conn.cursor(dictionary=True)
+    cursor.execute("SELECT id, created_at FROM importaciones WHERE id = %s", (importacion_id,))
+    embarque = cursor.fetchone()
+    if not embarque:
+        return []
+
+    cursor.execute(
+        "SELECT * FROM importaciones_hitos_auditoria WHERE activo = 1 ORDER BY seccion, orden_hito"
+    )
+    hitos = cursor.fetchall()
+    if not hitos:
+        return []
+
+    cursor.execute(
+        "SELECT campo, capturado_en FROM importaciones_historial_campos WHERE importacion_id = %s",
+        (importacion_id,),
+    )
+    capturado_en = {}
+    for fila in cursor.fetchall():
+        # Si un campo se capturo mas de una vez por error de datos viejos,
+        # se queda con la mas antigua (la primera captura real).
+        actual = capturado_en.get(fila["campo"])
+        if actual is None or fila["capturado_en"] < actual:
+            capturado_en[fila["campo"]] = fila["capturado_en"]
+
+    # Un campo_dato puede repetirse entre hitos activos por error de
+    # configuracion -- se usa el de menor id como el "dueño" de la fecha
+    # esperada para que otros hitos que anclen en el mismo campo_dato
+    # resuelvan de forma deterministica.
+    hito_por_campo_dato: dict = {}
+    for h in sorted(hitos, key=lambda x: x["id"]):
+        hito_por_campo_dato.setdefault(h["campo_dato"], h)
+
+    # OJO: memoizado por ID de hito, NO por campo_dato. Si dos hitos activos
+    # comparten el mismo campo_dato (config invalida), cada uno igual debe
+    # mostrar SU PROPIA fecha esperada (su propio ancla/dias) en la salida;
+    # solo la resolucion de "quien es el ancla de un dependiente" usa el
+    # hito canonico (hito_por_campo_dato, el de menor id). Memoizar por
+    # campo_dato colapsaria ambos usos y el primero en resolverse "ganaria"
+    # para todos los demas que compartan ese campo_dato.
+    fecha_esperada_resuelta: dict = {}
+
+    def resolver_esperada(hito, visitados=None):
+        hito_id = hito["id"]
+        if hito_id in fecha_esperada_resuelta:
+            return fecha_esperada_resuelta[hito_id]
+        visitados = visitados or set()
+        if hito_id in visitados:
+            fecha_esperada_resuelta[hito_id] = None  # referencia circular -- no resoluble
+            return None
+        visitados = visitados | {hito_id}
+
+        ancla = hito["campo_ancla"]
+        if not ancla:
+            base = embarque["created_at"]
+            if isinstance(base, str):
+                base = date.fromisoformat(base[:10])
+            elif hasattr(base, "date") and not isinstance(base, date):
+                base = base.date()
+        elif ancla in hito_por_campo_dato:
+            base = resolver_esperada(hito_por_campo_dato[ancla], visitados)
+            if base is None:
+                fecha_esperada_resuelta[hito_id] = None
+                return None
+        else:
+            # Ancla "disparador": no es un hito con fecha esperada propia --
+            # se usa su fecha REAL capturada, si existe.
+            real_ancla = capturado_en.get(ancla)
+            if real_ancla is None:
+                fecha_esperada_resuelta[hito_id] = None
+                return None
+            base = real_ancla if isinstance(real_ancla, date) else date.fromisoformat(str(real_ancla)[:10])
+
+        resultado = base + timedelta(days=int(hito["dias_esperados"]))
+        fecha_esperada_resuelta[hito_id] = resultado
+        return resultado
+
+    salida = []
+    for hito in hitos:
+        esperada = resolver_esperada(hito)
+        real = capturado_en.get(hito["campo_dato"])
+        real_date = None
+        if real is not None:
+            real_date = real if isinstance(real, date) else date.fromisoformat(str(real)[:10])
+
+        if esperada is None:
+            estado, dias_diferencia = "pendiente", None
+        elif real_date is None:
+            estado, dias_diferencia = "en_espera", None
+        else:
+            dias_diferencia = (esperada - real_date).days
+            if dias_diferencia > 0:
+                estado = "adelantado"
+            elif dias_diferencia < 0:
+                estado = "atrasado"
+            else:
+                estado = "a_tiempo"
+
+        salida.append({
+            "id": hito["id"], "seccion": hito["seccion"], "orden_hito": hito["orden_hito"],
+            "etiqueta": hito["etiqueta"], "campo_dato": hito["campo_dato"],
+            "fecha_esperada": esperada.isoformat() if esperada else None,
+            "fecha_real": real_date.isoformat() if real_date else None,
+            "estado": estado, "dias_diferencia": dias_diferencia,
+        })
+    return salida
+
+
 
 
 # ── Porcentajes de avance por sección ────────────────────────────────────────
@@ -994,6 +1107,20 @@ def eliminar_hito_auditoria(id_hito):
         return jsonify({"ok": True}), 200
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+    finally:
+        conn.close()
+
+
+@importaciones_bp.route("/<int:id_imp>/auditoria", methods=["GET"])
+def obtener_auditoria(id_imp):
+    conn = obtener_conexion()
+    if not conn:
+        return jsonify({"error": "Sin conexion a BD"}), 500
+    try:
+        return jsonify(_calcular_auditoria(id_imp, conn)), 200
+    except Exception as e:
+        logging.exception("Error calculando auditoria del embarque %s: %s", id_imp, e)
+        return jsonify({"error": "No se pudo calcular la auditoría"}), 500
     finally:
         conn.close()
 

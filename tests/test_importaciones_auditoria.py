@@ -202,6 +202,160 @@ def test_eliminar_hito_auditoria_ok(mocker):
     assert resp.status_code == 200
 
 
+from routes.importaciones import _calcular_auditoria
+
+
+def _conn_mock_auditoria(embarque_row, hitos_rows, historial_rows):
+    conn = MagicMock()
+    cursor = MagicMock()
+    conn.cursor.return_value = cursor
+    # 3 llamadas en orden: embarque, hitos activos, historial del embarque
+    cursor.fetchone.side_effect = [embarque_row]
+    cursor.fetchall.side_effect = [hitos_rows, historial_rows]
+    return conn, cursor
+
+
+def test_auditoria_hito_desde_alta_de_embarque_a_tiempo():
+    embarque = {"id": 1, "created_at": date(2026, 1, 1)}
+    hitos = [{"id": 1, "seccion": "logistica", "orden_hito": 1, "etiqueta": "1. Importador",
+              "campo_dato": "odoo_importador", "campo_ancla": None, "dias_esperados": 0}]
+    historial = [{"campo": "odoo_importador", "capturado_en": date(2026, 1, 1)}]
+    conn, _ = _conn_mock_auditoria(embarque, hitos, historial)
+
+    resultado = _calcular_auditoria(1, conn)
+
+    assert len(resultado) == 1
+    assert resultado[0]["estado"] == "a_tiempo"
+    assert resultado[0]["dias_diferencia"] == 0
+
+
+def test_auditoria_hito_capturado_antes_sale_verde():
+    embarque = {"id": 1, "created_at": date(2026, 1, 1)}
+    hitos = [{"id": 1, "seccion": "logistica", "orden_hito": 2, "etiqueta": "9. Confirmacion",
+              "campo_dato": "log_confirmacion_cotizacion", "campo_ancla": None, "dias_esperados": 7}]
+    # esperada = 2026-01-08; real 2 dias antes = 2026-01-06
+    historial = [{"campo": "log_confirmacion_cotizacion", "capturado_en": date(2026, 1, 6)}]
+    conn, _ = _conn_mock_auditoria(embarque, hitos, historial)
+
+    resultado = _calcular_auditoria(1, conn)
+
+    assert resultado[0]["estado"] == "adelantado"
+    assert resultado[0]["dias_diferencia"] == 2
+
+
+def test_auditoria_hito_capturado_despues_sale_rojo():
+    embarque = {"id": 1, "created_at": date(2026, 1, 1)}
+    hitos = [{"id": 1, "seccion": "logistica", "orden_hito": 2, "etiqueta": "9. Confirmacion",
+              "campo_dato": "log_confirmacion_cotizacion", "campo_ancla": None, "dias_esperados": 7}]
+    # esperada = 2026-01-08; real 3 dias tarde = 2026-01-11
+    historial = [{"campo": "log_confirmacion_cotizacion", "capturado_en": date(2026, 1, 11)}]
+    conn, _ = _conn_mock_auditoria(embarque, hitos, historial)
+
+    resultado = _calcular_auditoria(1, conn)
+
+    assert resultado[0]["estado"] == "atrasado"
+    assert resultado[0]["dias_diferencia"] == -3
+
+
+def test_auditoria_hito_anclado_en_otro_hito_usa_esperada_no_real():
+    embarque = {"id": 1, "created_at": date(2026, 1, 1)}
+    hitos = [
+        {"id": 1, "seccion": "odoo", "orden_hito": 1, "etiqueta": "1. Recepcion de documentos",
+         "campo_dato": "log_recepcion_documentos", "campo_ancla": "log_fecha_entrega", "dias_esperados": 2},
+        {"id": 2, "seccion": "odoo", "orden_hito": 2, "etiqueta": "6. Folios de orden de compra",
+         "campo_dato": "odoo_folio_orden", "campo_ancla": "log_recepcion_documentos", "dias_esperados": 10},
+    ]
+    # log_fecha_entrega (disparador) se captura TARDE el 2026-01-20 en vez de a tiempo.
+    # El hito 1 (Recepcion de documentos) por lo tanto tiene esperada = 2026-01-22,
+    # y se captura justo a tiempo el 2026-01-22.
+    # El hito 2 (Folios) debe esperar 10 dias desde la ESPERADA del hito 1
+    # (2026-01-22), no desde el 2026-01-20 del disparador ni desde otra fecha:
+    # esperada del hito 2 = 2026-02-01.
+    historial = [
+        {"campo": "log_fecha_entrega", "capturado_en": date(2026, 1, 20)},
+        {"campo": "log_recepcion_documentos", "capturado_en": date(2026, 1, 22)},
+        {"campo": "odoo_folio_orden", "capturado_en": date(2026, 2, 1)},
+    ]
+    conn, _ = _conn_mock_auditoria(embarque, hitos, historial)
+
+    resultado = _calcular_auditoria(1, conn)
+
+    folios = next(h for h in resultado if h["campo_dato"] == "odoo_folio_orden")
+    assert folios["fecha_esperada"] == "2026-02-01"
+    assert folios["estado"] == "a_tiempo"
+
+
+def test_auditoria_hito_sin_disparador_capturado_queda_pendiente():
+    embarque = {"id": 1, "created_at": date(2026, 1, 1)}
+    hitos = [{"id": 1, "seccion": "logistica", "orden_hito": 3, "etiqueta": "18. Contenedores",
+              "campo_dato": "log_contenedor", "campo_ancla": "log_fecha_entrega", "dias_esperados": 1}]
+    historial = []  # log_fecha_entrega nunca se capturo
+    conn, _ = _conn_mock_auditoria(embarque, hitos, historial)
+
+    resultado = _calcular_auditoria(1, conn)
+
+    assert resultado[0]["estado"] == "pendiente"
+    assert resultado[0]["fecha_esperada"] is None
+
+
+def test_auditoria_sin_hitos_activos_devuelve_lista_vacia():
+    embarque = {"id": 1, "created_at": date(2026, 1, 1)}
+    conn, _ = _conn_mock_auditoria(embarque, [], [])
+
+    assert _calcular_auditoria(1, conn) == []
+
+
+def test_auditoria_referencia_circular_queda_no_resoluble_sin_crashear():
+    embarque = {"id": 1, "created_at": date(2026, 1, 1)}
+    # A ancla en B y B ancla en A -- config invalida (error de captura en el
+    # admin de hitos), pero el motor no debe crashear ni colgarse.
+    hitos = [
+        {"id": 1, "seccion": "logistica", "orden_hito": 1, "etiqueta": "A",
+         "campo_dato": "campo_a", "campo_ancla": "campo_b", "dias_esperados": 1},
+        {"id": 2, "seccion": "logistica", "orden_hito": 2, "etiqueta": "B",
+         "campo_dato": "campo_b", "campo_ancla": "campo_a", "dias_esperados": 1},
+    ]
+    conn, _ = _conn_mock_auditoria(embarque, hitos, [])
+
+    resultado = _calcular_auditoria(1, conn)
+
+    assert len(resultado) == 2
+    assert all(h["estado"] == "pendiente" for h in resultado)
+
+
+def test_auditoria_dos_hitos_con_mismo_campo_dato_usa_el_de_menor_id():
+    embarque = {"id": 1, "created_at": date(2026, 1, 1)}
+    hitos = [
+        {"id": 5, "seccion": "logistica", "orden_hito": 1, "etiqueta": "Version vieja",
+         "campo_dato": "log_contenedor", "campo_ancla": None, "dias_esperados": 10},
+        {"id": 2, "seccion": "logistica", "orden_hito": 1, "etiqueta": "Version nueva (id menor)",
+         "campo_dato": "log_contenedor", "campo_ancla": None, "dias_esperados": 3},
+        {"id": 9, "seccion": "importacion", "orden_hito": 1, "etiqueta": "Depende de Contenedores",
+         "campo_dato": "imp_fecha_traduccion", "campo_ancla": "log_contenedor", "dias_esperados": 1},
+    ]
+    conn, _ = _conn_mock_auditoria(embarque, hitos, [])
+
+    resultado = _calcular_auditoria(1, conn)
+
+    dependiente = next(h for h in resultado if h["campo_dato"] == "imp_fecha_traduccion")
+    # esperada de log_contenedor debe resolverse con el hito id=2 (dias_esperados=3),
+    # no con el id=5 (dias_esperados=10): 2026-01-01 + 3 + 1 = 2026-01-05.
+    assert dependiente["fecha_esperada"] == "2026-01-05"
+
+
+def test_get_auditoria_devuelve_200_con_lista(mocker):
+    conn = MagicMock()
+    mocker.patch("routes.importaciones.obtener_conexion", return_value=conn)
+    mocker.patch("routes.importaciones._calcular_auditoria", return_value=[
+        {"id": 1, "seccion": "logistica", "estado": "a_tiempo"},
+    ])
+
+    resp = _cliente_test().get("/importaciones/123/auditoria")
+
+    assert resp.status_code == 200
+    assert resp.get_json()[0]["estado"] == "a_tiempo"
+
+
 import pytest as _pytest
 
 _HITOS_INICIALES = [
