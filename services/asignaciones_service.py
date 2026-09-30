@@ -821,8 +821,22 @@ def _persistir_reservas(producto_id: int, reservas: list, *, origen: str, estado
                 (producto_id, clave, mes_fecha),
             )
             existente = cursor.fetchone()
-            if mes_fecha is not None and existente and existente.get("odoo_order_id"):
-                order_ids_conocidos[(clave, mes_fecha)] = existente["odoo_order_id"]
+            if mes_fecha is not None and (clave, mes_fecha) not in order_ids_conocidos:
+                # La orden de Odoo se comparte por (embarque, cliente, mes) --
+                # no por producto individual: busca en CUALQUIER producto de
+                # este mismo embarque si ya se genero una orden para este
+                # cliente+mes (sin importar el origen INICIAL/REASIGNACION),
+                # para reutilizarla en vez de crear una nueva por cada SKU.
+                cursor.execute(
+                    "SELECT a.odoo_order_id FROM importacion_asignaciones a "
+                    "JOIN importacion_productos p2 ON p2.id = a.importacion_producto_id "
+                    "WHERE p2.importacion_id = %s AND a.clave_cliente = %s "
+                    "AND (a.mes_objetivo <=> %s) AND a.odoo_order_id IS NOT NULL LIMIT 1",
+                    (producto["importacion_id"], clave, mes_fecha),
+                )
+                fila_orden = cursor.fetchone()
+                if fila_orden:
+                    order_ids_conocidos[(clave, mes_fecha)] = fila_orden["odoo_order_id"]
             if existente:
                 if proyectado is not None:
                     cursor.execute(
@@ -855,7 +869,11 @@ def _persistir_reservas(producto_id: int, reservas: list, *, origen: str, estado
         # Reserva en Odoo (todo o nada por línea): si falla, se revierte la
         # reserva local -- la orden de venta es la fuente de verdad de que la
         # reserva ya "cuenta" de verdad para ventas. Se agrupa por (cliente, mes)
-        # porque varios items de esta llamada pueden compartir cliente y mes.
+        # porque varios items de esta llamada pueden compartir cliente y mes --
+        # y order_ids_conocidos (arriba) ya se encargo de que, si ya existe una
+        # orden para este mismo (embarque, cliente, mes), se reutilice esa en
+        # vez de crear una nueva por cada SKU. Un embarque distinto para el
+        # mismo cliente/mes SIEMPRE crea su propia orden (lotes separados).
         # Sin mes_objetivo no hay forma de etiquetar la orden (MY27 <MES>), así
         # que esos items quedan solo en la BD local, como antes de esta función.
         grupos_odoo: dict = {}

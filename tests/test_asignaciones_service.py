@@ -402,6 +402,7 @@ def test_confirmar_reasignacion_crea_fila_pendiente_y_movimiento_reasignacion(mo
         {"id": 10, "importacion_id": 1, "periodo": "2026-2027", "sku": "SKU-1", "sku_norm": "SKU1"},
         {"clave": "LC657"},   # cliente existe
         None,                 # no hay reserva REASIGNACION previa
+        None,                 # no hay orden Odoo previa para este embarque+cliente+mes
     ]
     _mock_conn(mocker, cursor)
     mocker.patch("services.asignaciones_service._disponible_producto", return_value=10)
@@ -598,7 +599,8 @@ def test_asignar_agrupa_items_del_mismo_cliente_y_mes_en_una_sola_llamada_a_odoo
     cursor.fetchone.side_effect = [
         {"id": 10, "importacion_id": 1, "periodo": "2026-2027", "sku": "SKU-1", "sku_norm": "SKU1"},
         {"clave": "LC657"}, {"clave": "LC657"},  # cliente existe, item 1 y 2
-        None, None,                              # sin asignación previa, item 1 y 2
+        None, None,                              # item1: sin fila previa, sin orden Odoo previa del embarque
+        None, None,                              # item2: idem
     ]
     _mock_conn(mocker, cursor)
     mocker.patch("services.asignaciones_service._disponible_producto", return_value=10)
@@ -620,14 +622,15 @@ def test_asignar_agrupa_items_del_mismo_cliente_y_mes_en_una_sola_llamada_a_odoo
 
 
 def test_asignar_pasa_el_odoo_order_id_ya_guardado_como_order_id_conocido(mocker):
-    # Si esta reserva (mismo producto+cliente+mes) ya tenía una orden de Odoo
-    # asignada de un intento anterior, reservar_en_odoo debe recibir ese id
-    # para reutilizarla -- nunca debe crear una orden nueva de la nada.
+    # Si en este MISMO embarque (aunque sea otro producto/SKU) ya se genero
+    # una orden de Odoo para este cliente+mes, reservar_en_odoo debe recibir
+    # ese id para reutilizarla -- nunca debe crear una orden nueva de la nada.
     cursor = MagicMock()
     cursor.fetchone.side_effect = [
         {"id": 10, "importacion_id": 1, "periodo": "2026-2027", "sku": "SKU-1", "sku_norm": "SKU1"},
         {"clave": "LC657"},
-        {"id": 55, "odoo_order_id": 3001},  # ya existía una asignación con orden Odoo
+        {"id": 55},                        # fila local previa de este producto (sin odoo_order_id propio)
+        {"odoo_order_id": 3001},           # pero el embarque YA tiene orden para este cliente+mes (otro SKU)
     ]
     _mock_conn(mocker, cursor)
     mocker.patch("services.asignaciones_service._disponible_producto", return_value=10)
@@ -641,12 +644,39 @@ def test_asignar_pasa_el_odoo_order_id_ya_guardado_como_order_id_conocido(mocker
     odoo_mock.assert_called_once_with("LC657", "2026-10", [{"sku": "SKU-1", "cantidad": 2}], order_id_conocido=3001)
 
 
+def test_asignar_busca_orden_previa_acotada_al_mismo_embarque(mocker):
+    # La reutilizacion de orden es por (embarque, cliente, mes): un cliente
+    # que ya tiene orden en otro embarque para el mismo mes NO debe
+    # reutilizarla -- cada embarque mantiene sus propias ordenes (lotes
+    # separados), aunque comparta cliente y mes con otro.
+    cursor = MagicMock()
+    cursor.fetchone.side_effect = [
+        {"id": 10, "importacion_id": 71, "periodo": "2026-2027", "sku": "SKU-1", "sku_norm": "SKU1"},
+        {"clave": "LC657"},
+        None,  # sin fila previa de este producto
+        None,  # ningun producto de ESTE embarque (71) tiene orden aun para LC657/2026-10
+    ]
+    _mock_conn(mocker, cursor)
+    mocker.patch("services.asignaciones_service._disponible_producto", return_value=10)
+    odoo_mock = mocker.patch(
+        "services.asignaciones_service.reservar_en_odoo",
+        return_value={"order_id": 9999, "order_name": "S09999"},
+    )
+
+    asignar(10, [{"clave_cliente": "LC657", "mes_objetivo": "2026-10", "cantidad": 2}])
+
+    odoo_mock.assert_called_once_with("LC657", "2026-10", [{"sku": "SKU-1", "cantidad": 2}], order_id_conocido=None)
+    busqueda = [c for c in cursor.execute.call_args_list if "JOIN importacion_productos p2" in c.args[0]][0]
+    assert busqueda.args[1] == (71, "LC657", _dt.date(2026, 10, 1))
+
+
 def test_asignar_llama_a_odoo_una_vez_por_cada_cliente_y_mes_distinto(mocker):
     cursor = MagicMock()
     cursor.fetchone.side_effect = [
         {"id": 10, "importacion_id": 1, "periodo": "2026-2027", "sku": "SKU-1", "sku_norm": "SKU1"},
         {"clave": "LC657"}, {"clave": "MC677"},  # cliente existe, item 1 y 2
-        None, None,                              # sin asignación previa, item 1 y 2
+        None, None,                              # item1: sin fila previa, sin orden Odoo previa del embarque
+        None, None,                              # item2: idem
     ]
     _mock_conn(mocker, cursor)
     mocker.patch("services.asignaciones_service._disponible_producto", return_value=10)
@@ -670,7 +700,7 @@ def test_asignar_revierte_todo_si_falla_la_reserva_en_odoo(mocker):
     cursor = MagicMock()
     cursor.fetchone.side_effect = [
         {"id": 10, "importacion_id": 1, "periodo": "2026-2027", "sku": "SKU-1", "sku_norm": "SKU1"},
-        {"clave": "LC657"}, None,
+        {"clave": "LC657"}, None, None,
     ]
     conn = _mock_conn(mocker, cursor)
     mocker.patch("services.asignaciones_service._disponible_producto", return_value=10)
