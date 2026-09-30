@@ -38,7 +38,6 @@ def crear_concepto():
 # ==============================================================================
 # 2. GUARDAR VALOR (La magia: Insertar o Actualizar Monto)
 # ==============================================================================
-@gastos_bp.route('/guardar-valor', methods=['POST'])
 def guardar_valor():
     data = request.get_json()
     # LOG 1: Ver qué manda Angular

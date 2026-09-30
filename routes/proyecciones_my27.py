@@ -11,13 +11,15 @@ import time
 from datetime import datetime
 from utils.tiempo import ahora_mx, ahora_str
 
-from flask import Blueprint, jsonify, request, send_file
+from flask import Blueprint, jsonify, request, send_file, g
 
 from db_conexion import obtener_conexion
 from routes.forecast import (SKU_CATALOG, FORECAST_SKU_WHITELIST,
                              _SCOTT_CORRECT_NAMES, _SCOTT_COLORS, _SCOTT_TALLAS,
                              _ensure_scott_names, _redis_get, _redis_set)
 from utils.odoo_utils import get_odoo_models, ODOO_DB, ODOO_PASSWORD, ODOO_COMPANY_ID
+from utils.auth_decorators import requiere_autenticacion
+from services.politica_montos_service import PoliticaMontosService
 
 try:
     import openpyxl
@@ -71,6 +73,15 @@ _MEGAMO_PRECIOS_TTL  = 300
 
 _STOCK_ODOO_CACHE: dict = {'data': {}, 'ts': 0.0}
 _STOCK_ODOO_TTL = 300  # 5 minutos
+
+
+def _debe_ocultar_montos_my27() -> bool:
+    """Aplica ver_montos sólo al usuario interno autenticado de MY27."""
+    usuario = getattr(g, 'usuario_actual', {})
+    usuario_id = usuario.get('id') if isinstance(usuario, dict) else None
+    return bool(usuario_id and PoliticaMontosService.debe_ocultar_montos(
+        usuario_id, 'proyecciones_my27'
+    ))
 
 
 def _get_stock_disponible_odoo() -> dict:
@@ -613,6 +624,7 @@ def debug_ordenes():
 # ─────────────────────────────────────────────────────────────────────────────
 
 @proyecciones_my27_bp.route('/exportar', methods=['GET'])
+@requiere_autenticacion
 def exportar_excel():
     """
     Exporta el resumen de proyecciones MY27 a Excel con formato profesional.
@@ -650,7 +662,7 @@ def exportar_excel():
                                           if data['total_general'] > 0 else 0.0,
             })
 
-        excel  = _generar_excel(data)
+        excel  = _generar_excel(data, ocultar_montos=_debe_ocultar_montos_my27())
         sufijo = f"_{marca}" if marca else ""
         nombre = f"ProyeccionesMY27{sufijo}_{periodo}_{ahora_str('%Y%m%d')}.xlsx"
         buf    = io.BytesIO(excel)
@@ -671,7 +683,7 @@ def exportar_excel():
 # Helper: generar Excel
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _generar_excel(data: dict) -> bytes:
+def _generar_excel(data: dict, ocultar_montos: bool = False) -> bytes:
     wb = openpyxl.Workbook()
 
     # ── Hoja 1: Resumen consolidado ──────────────────────────────────────────
@@ -758,9 +770,13 @@ def _generar_excel(data: dict) -> bytes:
     c_tot.border = thin_bdr
     # Totales de costo en fila 3
     ws.cell(row=3, column=20, value='')  # costo unitario no aplica en totales
-    c_ctot = ws.cell(row=3, column=21, value=data.get('total_costo_general', 0))
+    c_ctot = ws.cell(
+        row=3, column=21,
+        value='-' if ocultar_montos else data.get('total_costo_general', 0),
+    )
     cell_style(c_ctot, bold=True, bg='FF6B4C11', fg=BLANCO, size=10, center=True)
-    c_ctot.number_format = '"$"#,##0.00'
+    if not ocultar_montos:
+        c_ctot.number_format = '"$"#,##0.00'
     c_ctot.border = thin_bdr
     ws.row_dimensions[3].height = 20
 
@@ -804,16 +820,22 @@ def _generar_excel(data: dict) -> bytes:
 
         # Costo unitario
         costo_u = art.get('costo_unitario', 0)
-        c_cu = ws.cell(row=ri, column=20, value=costo_u if costo_u > 0 else '')
+        c_cu = ws.cell(
+            row=ri, column=20,
+            value='-' if ocultar_montos else (costo_u if costo_u > 0 else ''),
+        )
         cell_style(c_cu, bg=bg_fila, center=True, size=9)
-        if costo_u > 0:
+        if not ocultar_montos and costo_u > 0:
             c_cu.number_format = '"$"#,##0.00'
         c_cu.border = thin_bdr
 
         # Costo total
         costo_t = art.get('costo_total', 0)
-        c_ct = ws.cell(row=ri, column=21, value=costo_t if costo_t > 0 else '')
-        if costo_t > 0:
+        c_ct = ws.cell(
+            row=ri, column=21,
+            value='-' if ocultar_montos else (costo_t if costo_t > 0 else ''),
+        )
+        if not ocultar_montos and costo_t > 0:
             cell_style(c_ct, bold=True, bg='FFFEF3E2', center=True, size=9)
             c_ct.number_format = '"$"#,##0.00'
         else:
@@ -1414,6 +1436,7 @@ def get_cobertura_megamo():
 # ─────────────────────────────────────────────────────────────────────────────
 
 @proyecciones_my27_bp.route('/exportar-cobertura', methods=['GET'])
+@requiere_autenticacion
 def exportar_cobertura():
     """
     Exporta el análisis de cobertura FIFO (Inventario Entrante) a Excel.

@@ -9,7 +9,9 @@ from db_conexion import obtener_conexion
 from utils.auth_decorators import (
     requiere_autenticacion,
     requiere_modulo,
+    requiere_permiso_interno_dinamico,
 )
+from utils.jwt_utils import generar_token_prewarm_interno
 from services.politica_montos_service import PoliticaMontosService
 from services.forecast_excel_service import (
     load_excel_products,
@@ -68,7 +70,6 @@ def _redactar_montos_forecast(rows):
         for campo in (
             'precio', 'nivel_precio', 'precio_distribuidor', 'precio_partner',
             'precio_partner_elite', 'precio_partner_elite_plus',
-            'ep_precio_publico',
         ):
             fila.pop(campo, None)
     return resultado
@@ -135,10 +136,16 @@ def iniciar_precalentamiento_forecast(host: str = 'http://localhost:5000') -> in
 
     def _warm(clave: str, periodo: str) -> None:
         try:
-            _req.get(f'{host}/forecast',       params={'clave': clave, 'periodo': periodo}, timeout=120)
-            _req.get(f'{host}/forecast/avance', params={'clave': clave, 'periodo': periodo}, timeout=120)
+            _req.get(f'{host}/forecast', params={'clave': clave, 'periodo': periodo}, headers=headers, timeout=120)
+            _req.get(f'{host}/forecast/avance', params={'clave': clave, 'periodo': periodo}, headers=headers, timeout=120)
         except Exception as _e:
             logging.debug('[forecast] warm error %s/%s: %s', clave, periodo, _e)
+
+    token = generar_token_prewarm_interno()
+    if not token:
+        logging.warning('[forecast] precalentamiento omitido: no hay administrador activo para autenticarlo')
+        return 0
+    headers = {'Authorization': f'Bearer {token}'}
 
     def _run():
         logging.info('[forecast] Precalentamiento iniciado para %d pares clave+periodo', len(pairs))
@@ -4431,6 +4438,8 @@ def _tokens_busqueda(q: str) -> list:
 
 
 @forecast_bp.route('/forecast/catalogo-excel', methods=['POST'])
+@requiere_autenticacion
+@requiere_permiso_interno_dinamico
 def cargar_catalogo_excel():
     """
     POST /forecast/catalogo-excel  (multipart/form-data)
@@ -4464,6 +4473,8 @@ def cargar_catalogo_excel():
 
 
 @forecast_bp.route('/forecast/importar-csv-apparel', methods=['POST'])
+@requiere_autenticacion
+@requiere_permiso_interno_dinamico
 def importar_csv_apparel():
     """
     POST /forecast/importar-csv-apparel  (multipart/form-data)
@@ -4504,6 +4515,8 @@ def importar_csv_apparel():
 
 
 @forecast_bp.route('/forecast/catalogo-excel', methods=['GET'])
+@requiere_autenticacion
+@requiere_permiso_interno_dinamico
 def estado_catalogo_excel():
     """GET /forecast/catalogo-excel — total de productos cargados desde Excel."""
     conn = obtener_conexion()
@@ -4516,6 +4529,8 @@ def estado_catalogo_excel():
 
 
 @forecast_bp.route('/forecast/catalogo-excel/lista', methods=['GET'])
+@requiere_autenticacion
+@requiere_permiso_interno_dinamico
 def listar_catalogo_excel():
     """
     GET /forecast/catalogo-excel/lista?q=<search>&limit=<int>&offset=<int>
@@ -4538,6 +4553,8 @@ def listar_catalogo_excel():
 
 
 @forecast_bp.route('/forecast/catalogo-excel', methods=['DELETE'])
+@requiere_autenticacion
+@requiere_permiso_interno_dinamico
 def limpiar_catalogo_excel():
     """DELETE /forecast/catalogo-excel — elimina todos los productos del catálogo Excel."""
     result = clear_excel_catalog()

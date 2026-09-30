@@ -1,7 +1,8 @@
 from __future__ import annotations
-from flask import Blueprint, jsonify, request
+from flask import Blueprint, jsonify, request, current_app
 from utils.odoo_utils import get_odoo_models, ODOO_DB, ODOO_PASSWORD, ODOO_COMPANY_ID
 from db_conexion import obtener_conexion
+from utils.auth_decorators import requiere_autenticacion, requiere_permiso_interno
 from datetime import date as _date, timedelta as _timedelta
 import logging
 import time
@@ -247,6 +248,41 @@ def _odoo_supplement_rows(uid, models, grupo_id: int, fi_str: str, ff_str: str) 
 
 ventas_bp = Blueprint('ventas', __name__, url_prefix='/ventas')
 
+
+@ventas_bp.route('/listar-clientes', methods=['GET'])
+@requiere_autenticacion
+@requiere_permiso_interno('ventas_monitor', 'ver')
+def listar_clientes():
+    """Sugerencias de clientes para el buscador del Monitor de Ventas."""
+    termino = (request.args.get('q') or '').strip()
+    if len(termino) < 2:
+        return jsonify({'clientes': []}), 200
+
+    try:
+        if current_app.config.get('ODOO_TRACE_VENTAS', False):
+            logging.info('ventas.listar_clientes odoo_inicio caracteres_consulta=%d', len(termino))
+        uid, models, error = get_odoo_models()
+        if not uid:
+            if current_app.config.get('ODOO_TRACE_VENTAS', False):
+                logging.warning('ventas.listar_clientes odoo_no_disponible error=%s', str(error)[:200])
+            return jsonify({'error': 'No se pudo conectar a Odoo', 'detail': error}), 500
+        clientes = models.execute_kw(
+            ODOO_DB, uid, ODOO_PASSWORD, 'res.partner', 'search_read',
+            [[['name', 'ilike', termino]]],
+            {'fields': ['id', 'name'], 'limit': 20, 'order': 'name'}
+        )
+        if current_app.config.get('ODOO_TRACE_VENTAS', False):
+            logging.info('ventas.listar_clientes odoo_resultado registros=%d', len(clientes))
+        return jsonify({
+            'clientes': [
+                {'id': cliente['id'], 'nombre': cliente.get('name') or ''}
+                for cliente in clientes
+            ]
+        }), 200
+    except Exception as error:
+        logging.exception('ventas.listar_clientes error')
+        return jsonify({'error': str(error)}), 500
+
 MESES = {
     1: 'Enero', 2: 'Febrero', 3: 'Marzo', 4: 'Abril',
     5: 'Mayo', 6: 'Junio', 7: 'Julio', 8: 'Agosto',
@@ -292,6 +328,8 @@ _ANIOS_TTL = 6 * 3600  # 6 horas — los años de facturación no cambian con fr
 
 # ── Años disponibles ──────────────────────────────────────────────────────────
 @ventas_bp.route('/anios-disponibles', methods=['GET'])
+@requiere_autenticacion
+@requiere_permiso_interno('ventas_monitor', 'ver')
 def anios_disponibles():
     """Devuelve la lista de años con facturas de venta.
 
@@ -371,6 +409,8 @@ def anios_disponibles():
 
 # ── Resumen de periodo ────────────────────────────────────────────────────────
 @ventas_bp.route('/resumen', methods=['GET'])
+@requiere_autenticacion
+@requiere_permiso_interno('ventas_monitor', 'ver')
 def resumen():
     """
     Resumen de ventas para un rango de fechas.
@@ -577,6 +617,8 @@ def resumen():
 
 # ── Productos top por estado ──────────────────────────────────────────────────
 @ventas_bp.route('/productos-por-estado', methods=['GET'])
+@requiere_autenticacion
+@requiere_permiso_interno('ventas_monitor', 'ver')
 def productos_por_estado():
     """
     Top de productos vendidos en un estado específico.
@@ -701,6 +743,8 @@ def productos_por_estado():
 
 # ── Comparar dos años mes a mes ───────────────────────────────────────────────
 @ventas_bp.route('/comparar-anual', methods=['GET'])
+@requiere_autenticacion
+@requiere_permiso_interno('ventas_monitor', 'ver')
 def comparar_anual():
     """
     Compara 12 meses de dos años en una sola llamada.
@@ -793,6 +837,8 @@ def comparar_anual():
 
 # ── Resumen por integral (fuente: Odoo, montos reales) ───────────────────────
 @ventas_bp.route('/resumen-integral', methods=['GET'])
+@requiere_autenticacion
+@requiere_permiso_interno('ventas_monitor', 'ver')
 def resumen_integral():
     """
     Resumen de ventas de un grupo integral consultado directamente en Odoo.

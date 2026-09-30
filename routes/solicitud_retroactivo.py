@@ -840,7 +840,7 @@ def validar_nota_credito(id_venta):
     codigo = body.get('codigo')
 
     if not verificar_codigo_auditoria(codigo):
-        return jsonify({"error": "Código de Auditoría inválido."}), 401
+        return jsonify({"error": "Código de Auditoría inválido."}), 403
 
     conexion = obtener_conexion()
     if not conexion:

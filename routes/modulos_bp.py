@@ -1,7 +1,7 @@
 # routes/modulos_bp.py
 
 from flask import Blueprint, request, jsonify
-from services.modulos_service import ModulosService
+from services.modulos_service import ModulosService, ModuloEliminacionBloqueada, ModuloAreaDuplicada
 
 modulos_bp = Blueprint('modulos', __name__, url_prefix='/api/modulos')
 
@@ -24,6 +24,8 @@ def crear_modulo():
 
         resultado = ModulosService.crear_modulo(data)
         return jsonify(resultado), 201
+    except ModuloAreaDuplicada as error:
+        return jsonify({"error": str(error), "codigo": "modulo_area_duplicado"}), 409
     except Exception as e:
         return jsonify({"error": str(e)}), 400
 
@@ -32,11 +34,13 @@ def actualizar_modulo(modulo_id):
     """Actualiza un módulo y sus acciones asociadas."""
     try:
         data = request.get_json() or {}
-        if not data.get('nombre') or not data.get('identificador'):
+        if not data.get('configurar_area') and (not data.get('nombre') or not data.get('identificador')):
             return jsonify({"error": "Los campos 'nombre' e 'identificador' son obligatorios."}), 400
 
         resultado = ModulosService.actualizar_modulo(modulo_id, data)
         return jsonify(resultado), 200
+    except ModuloAreaDuplicada as error:
+        return jsonify({"error": str(error), "codigo": "modulo_area_duplicado"}), 409
     except Exception as e:
         return jsonify({"error": str(e)}), 400
 
@@ -60,5 +64,23 @@ def eliminar_modulo(modulo_id):
     try:
         resultado = ModulosService.eliminar_modulo(modulo_id)
         return jsonify(resultado), 200
+    except ModuloEliminacionBloqueada as error:
+        return jsonify({"error": str(error), "codigo": error.codigo, **error.detalles}), 409
+    except Exception as e:
+        return jsonify({"error": str(e)}), 400
+
+@modulos_bp.route('/<int:modulo_id>/areas/<int:area_id>', methods=['DELETE'])
+def eliminar_modulo_de_area(modulo_id, area_id):
+    """Quita la asociación de un módulo con una sola área."""
+    try:
+        data = request.get_json(silent=True) or {}
+        resultado = ModulosService.eliminar_modulo_de_area(
+            modulo_id,
+            area_id,
+            eliminar_permisos_asignados=data.get('eliminar_permisos_asignados') is True,
+        )
+        return jsonify(resultado), 200
+    except ModuloEliminacionBloqueada as error:
+        return jsonify({"error": str(error), "codigo": error.codigo, **error.detalles}), 409
     except Exception as e:
         return jsonify({"error": str(e)}), 400
