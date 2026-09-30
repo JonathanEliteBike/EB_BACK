@@ -811,7 +811,14 @@ def sync_monitor_odoo():
                 _inv = _ctx['invoice_name']
                 invoice_neg_totals[_inv] = invoice_neg_totals.get(_inv, 0) + _pt
 
-        cursor.execute("TRUNCATE TABLE monitor")
+        # DELETE, no TRUNCATE: en MySQL/InnoDB un TRUNCATE hace commit implícito
+        # de inmediato, sin importar el autocommit del cliente. Si el INSERT loop
+        # de abajo falla a medio camino, un conexion.rollback() no puede deshacer
+        # ese TRUNCATE — la tabla queda vacía (ya pasó: incidente del 2026-09-30,
+        # una referencia_interna de 165 caracteres tronó un INSERT y dejó
+        # `monitor` en 0 filas). DELETE sí participa en la transacción y se
+        # deshace junto con los INSERTs si algo falla.
+        cursor.execute("DELETE FROM monitor")
         total_insertados = 0
         invoice_pos_totals = {}  # factura → suma de venta_total insertada
 
@@ -888,8 +895,8 @@ def sync_monitor_odoo():
                 ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             """, (
                 inv_name,
-                code or name_prod_display,
-                name_prod_display,
+                (code or name_prod_display)[:255],
+                name_prod_display[:255],
                 contacto_referencia,
                 contacto_nombre,
                 str(fecha_str),
