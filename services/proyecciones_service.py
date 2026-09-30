@@ -4,6 +4,8 @@ Centraliza la prioridad de clientes, la normalización de SKU y la deducción
 de órdenes Odoo ya confirmadas, para que routes/proyecciones_my27.py y
 routes/asignaciones_importaciones.py usen la misma fuente sin duplicar lógica.
 """
+from __future__ import annotations
+
 import logging
 import re
 import time
