@@ -975,7 +975,7 @@ git commit -m "feat(importaciones): motor de calculo de auditoria + GET /importa
 - Modify: `EB_FRONT/src/app/services/importaciones.service.spec.ts`
 
 **Interfaces:**
-- Produces: `HitosAuditoriaService.listar/crear/actualizar/eliminar`, `<ExistingImportacionesService>.obtenerAuditoria(id): Observable<HitoAuditoria[]>`.
+- Produces: `HitosAuditoriaService.listar/crear/actualizar/eliminar`, `ImportacionesService.obtenerAuditoria(id): Observable<HitoAuditoriaResultado[]>` (interface `HitoAuditoriaResultado` defined in `importaciones.service.ts`).
 
 - [ ] **Step 1: Write the failing spec for the new service**
 
