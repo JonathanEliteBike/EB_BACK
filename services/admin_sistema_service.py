@@ -24,6 +24,35 @@ class AdminSistemaService:
         return 'id'
 
     @staticmethod
+    def listar_modulos_historicos_rol2():
+        """Catálogo técnico exclusivo del flujo distribuidor → usuario hijo."""
+        conn = obtener_conexion()
+        cur = conn.cursor(dictionary=True)
+        try:
+            cur.execute("""
+                SELECT m.id, m.padre_id, m.nombre, m.identificador, m.ruta,
+                       m.activo, m.delegable_a_hijos
+                FROM modulos_roles_acceso mra
+                INNER JOIN modulos m ON m.id = mra.modulo_id
+                WHERE mra.rol_id = 2
+                  AND mra.activo = 1
+                ORDER BY m.id
+            """)
+            modulos = cur.fetchall()
+            for modulo in modulos:
+                cur.execute("""
+                    SELECT a.id, a.nombre, a.identificador, a.activo
+                    FROM modulo_acciones ma
+                    INNER JOIN acciones a ON a.id = ma.accion_id
+                    WHERE ma.modulo_id = %s AND a.activo = 1
+                    ORDER BY a.id
+                """, (modulo['id'],))
+                modulo['acciones'] = cur.fetchall()
+            return modulos
+        finally:
+            cur.close()
+            conn.close()
+    @staticmethod
     def listar_administradores():
         """Lista todos los Administradores Cliente junto con su estado y cupo asignado."""
         conn = obtener_conexion()

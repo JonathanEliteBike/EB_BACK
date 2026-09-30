@@ -17,6 +17,7 @@ from utils.auth_decorators import (
     requiere_autenticacion,
     requiere_modulo,
 )
+from utils.jwt_utils import generar_token_prewarm_interno
 from services.politica_montos_service import PoliticaMontosService
 
 caratulas_bp = Blueprint('caratulas', __name__, url_prefix='')
@@ -36,7 +37,7 @@ except Exception as _re:
 _WARM_WORKERS = 4   # peticiones paralelas a Odoo (no subir de 5 para no saturar)
 
 
-def _contexto_cliente_autenticado(cursor):
+def _contexto_cliente_autenticado(cursor, permitir_usuario_interno=False):
     """Obtiene el cliente real del portal para roles 2 y 3.
 
     El cliente y su grupo son datos de la cuenta autenticada; nunca se toman
@@ -56,7 +57,7 @@ def _contexto_cliente_autenticado(cursor):
     contexto = cursor.fetchone()
     if not contexto:
         raise PermissionError("Usuario no encontrado o inactivo.")
-    if contexto["rol_id"] == 1:
+    if contexto["rol_id"] == 1 or (permitir_usuario_interno and contexto["rol_id"] == 4):
         return None
     if contexto["rol_id"] not in (2, 3) or not contexto["id"] or not contexto["clave"]:
         raise PermissionError("El usuario no tiene un cliente válido asignado.")
@@ -1216,11 +1217,18 @@ def _precalentar_claves(claves: list[str], host: str = 'http://localhost:5000') 
     import requests as _req
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
+    token = generar_token_prewarm_interno()
+    if not token:
+        logging.warning('Precalentamiento omitido: no hay administrador activo para autenticarlo')
+        return
+    headers = {'Authorization': f'Bearer {token}'}
+
     def _cargar_uno(clave: str) -> str:
         try:
             _req.get(
                 f'{host}/detalle-compras-odoo',
                 params={'cliente': clave, 'ref_exacta': '1'},
+                headers=headers,
                 timeout=120,
             )
             return f'OK:{clave}'
@@ -1279,7 +1287,7 @@ def buscar_caratula_evac():
         nombre_cliente = request.args.get('nombre_cliente')
         conexion = obtener_conexion()
         cursor = conexion.cursor(dictionary=True)
-        contexto = _contexto_cliente_autenticado(cursor)
+        contexto = _contexto_cliente_autenticado(cursor, permitir_usuario_interno=True)
         if contexto:
             # Roles de portal: ignorar cualquier clave o nombre manipulados.
             clave = _clave_resumen_contexto(contexto)
@@ -2541,7 +2549,16 @@ def detalle_compras_odoo():
     try:
         _conexion_contexto = obtener_conexion()
         _cursor_contexto = _conexion_contexto.cursor(dictionary=True)
-        contexto = _contexto_cliente_autenticado(_cursor_contexto)
+        # Monitor de Pedidos ya eligió explícitamente el cliente o grupo a
+        # consultar. Sólo ese contexto interno omite el cliente personal
+        # reservado para los usuarios de portal.
+        contexto = _contexto_cliente_autenticado(
+            _cursor_contexto,
+            permitir_usuario_interno=(
+                request.headers.get('X-Ruta-Interna', '').rstrip('/')
+                in ('/monitor-pedidos', '/ventas-monitor')
+),
+        )
         if contexto:
             if grupo_odoo:
                 if not contexto.get('id_grupo'):

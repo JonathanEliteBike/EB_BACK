@@ -5,6 +5,7 @@ from flask import Blueprint, jsonify, request
 from datetime import datetime, date, timedelta
 from decimal import Decimal
 from db_conexion import obtener_conexion
+from utils.auth_decorators import requiere_autenticacion
 
 importaciones_bp = Blueprint("importaciones", __name__, url_prefix="/importaciones")
 
@@ -253,6 +254,7 @@ def _calcular_progreso(row: dict) -> dict:
 # ── Inicializar tablas ────────────────────────────────────────────────────────
 
 @importaciones_bp.route("/inicializar-tablas", methods=["POST"])
+@requiere_autenticacion
 def inicializar_tablas():
     conn = obtener_conexion()
     if not conn:
@@ -565,6 +567,7 @@ def inicializar_tablas():
 # ── GET /importaciones  →  lista con resumen de progreso ────────────────────
 
 @importaciones_bp.route("", methods=["GET"])
+@requiere_autenticacion
 def listar():
     conn = obtener_conexion()
     if not conn:
@@ -592,6 +595,7 @@ def listar():
 # ── GET /importaciones/<id>  →  detalle completo ─────────────────────────────
 
 @importaciones_bp.route("/<int:id_imp>", methods=["GET"])
+@requiere_autenticacion
 def obtener(id_imp):
     conn = obtener_conexion()
     if not conn:
@@ -615,6 +619,7 @@ def obtener(id_imp):
 # ── GET /importaciones/dashboard  →  datos analíticos agregados ──────────────
 
 @importaciones_bp.route("/dashboard", methods=["GET"])
+@requiere_autenticacion
 def dashboard():
     import unicodedata as _ud
     _ORIGEN_CANON = {"ESPANA": "ESPAÑA", "BELGICA": "BÉLGICA"}
@@ -1133,6 +1138,7 @@ def dashboard():
 # ── POST /importaciones  →  crear nuevo embarque ─────────────────────────────
 
 @importaciones_bp.route("", methods=["POST"])
+@requiere_autenticacion
 def crear():
     data = request.get_json() or {}
     if not data.get("referencia"):
@@ -1172,6 +1178,7 @@ def crear():
 # ── PUT /importaciones/<id>  →  actualizar campos ────────────────────────────
 
 @importaciones_bp.route("/<int:id_imp>", methods=["PUT"])
+@requiere_autenticacion
 def actualizar(id_imp):
     data = request.get_json() or {}
     data.pop("id", None)
@@ -1314,6 +1321,7 @@ def actualizar(id_imp):
 # ── DELETE /importaciones/<id>  →  soft delete ───────────────────────────────
 
 @importaciones_bp.route("/<int:id_imp>", methods=["DELETE"])
+@requiere_autenticacion
 def eliminar(id_imp):
     conn = obtener_conexion()
     if not conn:
@@ -1337,6 +1345,7 @@ def eliminar(id_imp):
 # ── GET /importaciones/resumen  →  dashboard general ─────────────────────────
 
 @importaciones_bp.route("/resumen", methods=["GET"])
+@requiere_autenticacion
 def resumen():
     return listar()
 

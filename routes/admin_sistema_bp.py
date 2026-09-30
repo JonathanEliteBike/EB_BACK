@@ -7,6 +7,16 @@ from utils.auth_decorators import requiere_autenticacion, requiere_rol
 
 admin_sistema_bp = Blueprint('admin_sistema', __name__, url_prefix='/api/admin-sistema')
 
+@admin_sistema_bp.route('/modulos-historicos-rol2', methods=['GET'])
+@requiere_autenticacion
+@requiere_rol(1)
+def listar_modulos_historicos_rol2():
+    """Catálogo aislado para el modal histórico de permisos delegables."""
+    try:
+        return jsonify({"modulos": AdminSistemaService.listar_modulos_historicos_rol2()}), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
 @admin_sistema_bp.route('/administradores', methods=['GET'])
 @requiere_autenticacion
 @requiere_rol(1)

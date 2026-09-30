@@ -1,6 +1,7 @@
 from flask import Blueprint, jsonify, request
 import logging
 from db_conexion import obtener_conexion
+from utils.auth_decorators import requiere_autenticacion, requiere_permiso_interno_dinamico
 import jwt
 from datetime import date, datetime
 
@@ -11,6 +12,8 @@ from functools import wraps
 integrales_bp = Blueprint('integrales', __name__, url_prefix='')
 
 @integrales_bp.route('/integrales/grupos', methods=['GET'])
+@requiere_autenticacion
+@requiere_permiso_interno_dinamico
 def obtener_grupos():
     """Obtener todos los grupos de clientes"""
     conexion = obtener_conexion()

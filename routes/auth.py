@@ -8,6 +8,7 @@ import os
 import re
 import random
 from utils.email import enviar_correo_activacion
+from services.permisos_internos_service import PermisosInternosService
 from datetime import datetime, timedelta
 import uuid
 
@@ -28,7 +29,9 @@ def registrar_usuario():
     nombre     = data.get('nombre')
     correo     = data.get('correo')
     rol        = data.get('rol', 'Usuario')
+    rol_id_recibido = data.get('rol_id')
     cliente_id = data.get('cliente_id')
+    area_id    = data.get('area_id')
 
     # Validaciones básicas de campos
     campos_requeridos = {'usuario': usuario, 'contrasena': contrasena, 'nombre': nombre, 'correo': correo}
@@ -48,10 +51,16 @@ def registrar_usuario():
     if len(contrasena) < 6:
         return jsonify({"error": "Contraseña mín. 6 caracteres"}), 400
 
-    roles_validos = {"Administrador": 1, "Usuario": 2}
+    roles_validos = {"Administrador": 1, "Usuario": 2, "Usuario Interno": 4}
     if rol not in roles_validos:
         return jsonify({"error": "Rol inválido"}), 400
     rol_id = roles_validos[rol]
+    if rol_id_recibido is not None:
+        try:
+            if int(rol_id_recibido) != rol_id:
+                return jsonify({"error": "El rol y rol_id no coinciden"}), 400
+        except (TypeError, ValueError):
+            return jsonify({"error": "rol_id inválido"}), 400
 
     # 2. AHORA SÍ, ABRIMOS LA BASE DE DATOS
     conexion = obtener_conexion()
@@ -72,6 +81,20 @@ def registrar_usuario():
         else:
             cliente_id = None
 
+        if rol_id == 4:
+            if area_id in [None, "", "null"]:
+                return jsonify({"error": "El área principal es obligatoria para un Usuario Interno"}), 400
+            try:
+                area_id = int(area_id)
+            except (TypeError, ValueError):
+                return jsonify({"error": "area_id inválido"}), 400
+
+            cursor.execute("SELECT id FROM areas WHERE id = %s AND activo = 1", (area_id,))
+            if not cursor.fetchone():
+                return jsonify({"error": "El área principal no existe o está inactiva"}), 400
+        else:
+            area_id = None
+
         # Validar duplicados (requiere BD)
         cursor.execute("SELECT id FROM usuarios WHERE usuario = %s", (usuario,))
         if cursor.fetchone():
@@ -85,25 +108,39 @@ def registrar_usuario():
         contrasena_hash = hash_password(contrasena)
         # Registrar usuario sin id_grupo (se obtiene desde clientes table via JOIN)
         cursor.execute(
-            """INSERT INTO usuarios (usuario, contrasena, nombre, correo, rol_id, activo, cliente_id) 
-               VALUES (%s, %s, %s, %s, %s, %s, %s)""",
-            (usuario, contrasena_hash, nombre, correo, rol_id, True, cliente_id)
+            """INSERT INTO usuarios (usuario, contrasena, nombre, correo, rol_id, activo, cliente_id, area_id)
+               VALUES (%s, %s, %s, %s, %s, %s, %s, %s)""",
+            (usuario, contrasena_hash, nombre, correo, rol_id, True, cliente_id, area_id)
         )
-        conexion.commit()
         nuevo_id = cursor.lastrowid
+        permisos_base_asignados = 0
+        if rol_id == 4:
+            permisos_base_asignados = PermisosInternosService.asignar_permisos_base_area(
+                cursor, nuevo_id, area_id
+            )
+        conexion.commit()
 
         # Obtener resultado
         cursor.execute("""
-            SELECT u.id, u.usuario, u.nombre, u.correo, r.nombre AS rol, u.activo, 
-                   c.nombre_cliente, c.id AS cliente_id, c.id_grupo
+            SELECT u.id, u.usuario, u.nombre, u.correo, r.nombre AS rol, u.activo,
+                   c.nombre_cliente, c.id AS cliente_id, c.id_grupo, u.area_id,
+                   a.nombre AS area_nombre
             FROM usuarios u
             JOIN roles r ON u.rol_id = r.id
             LEFT JOIN clientes c ON u.cliente_id = c.id
+            LEFT JOIN areas a ON u.area_id = a.id
             WHERE u.id = %s
         """, (nuevo_id,))
         usuario_creado = cursor.fetchone()
 
-        return jsonify({"mensaje": "Registrado", "usuario": usuario_creado}), 201
+        mensaje = "Registrado"
+        if rol_id == 4 and permisos_base_asignados == 0:
+            mensaje = "Registrado. El área no tiene permisos base configurados."
+        return jsonify({
+            "mensaje": mensaje,
+            "usuario": usuario_creado,
+            "permisos_base_asignados": permisos_base_asignados,
+        }), 201
 
     except Exception as e:
         if conexion.is_connected(): conexion.rollback()
