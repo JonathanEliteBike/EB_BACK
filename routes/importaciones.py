@@ -866,6 +866,138 @@ def eliminar_tiempo_estimado(id_regla):
         conn.close()
 
 
+# ── Hitos de auditoría de llenado (sección → días esperados desde un ancla) ──
+# Alimentan _calcular_auditoria(). Pantalla de administración en el frontend:
+# /importaciones/hitos-auditoria
+
+_SECCIONES_HITOS = {
+    "logistica", "importacion", "despacho", "odoo",
+    "almacen", "recepcion", "cierre", "costos",
+}
+
+
+def _validar_payload_hito(data: dict) -> str | None:
+    if str(data.get("seccion") or "").strip() not in _SECCIONES_HITOS:
+        return "Sección inválida"
+    if not str(data.get("etiqueta") or "").strip():
+        return "Falta la etiqueta"
+    if str(data.get("campo_dato") or "").strip() not in _COLS_PERMITIDAS:
+        return "'campo_dato' debe ser una columna válida del formulario"
+    campo_ancla = data.get("campo_ancla")
+    if campo_ancla and str(campo_ancla).strip() not in _COLS_PERMITIDAS:
+        return "'campo_ancla' debe ser una columna válida del formulario (o vacío = Alta de embarque)"
+    try:
+        if int(data.get("dias_esperados")) < 0:
+            return "'dias_esperados' no puede ser negativo"
+    except (TypeError, ValueError):
+        return "'dias_esperados' debe ser un número entero de días"
+    try:
+        int(data.get("orden_hito"))
+    except (TypeError, ValueError):
+        return "'orden_hito' debe ser un número entero"
+    return None
+
+
+@importaciones_bp.route("/hitos-auditoria", methods=["GET"])
+def listar_hitos_auditoria():
+    conn = obtener_conexion()
+    if not conn:
+        return jsonify({"error": "Sin conexion a BD"}), 500
+    try:
+        cursor = conn.cursor(dictionary=True)
+        cursor.execute(
+            "SELECT * FROM importaciones_hitos_auditoria ORDER BY seccion, orden_hito"
+        )
+        return jsonify([_serialize(r) for r in cursor.fetchall()]), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    finally:
+        conn.close()
+
+
+@importaciones_bp.route("/hitos-auditoria", methods=["POST"])
+def crear_hito_auditoria():
+    data = request.get_json() or {}
+    error = _validar_payload_hito(data)
+    if error:
+        return jsonify({"error": error}), 400
+
+    conn = obtener_conexion()
+    if not conn:
+        return jsonify({"error": "Sin conexion a BD"}), 500
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            "INSERT INTO importaciones_hitos_auditoria "
+            "(seccion, orden_hito, etiqueta, campo_dato, campo_ancla, dias_esperados, activo) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s)",
+            (
+                data["seccion"].strip(), int(data["orden_hito"]), data["etiqueta"].strip(),
+                data["campo_dato"].strip(),
+                (data.get("campo_ancla") or "").strip() or None,
+                int(data["dias_esperados"]), 1 if data.get("activo", True) else 0,
+            ),
+        )
+        conn.commit()
+        return jsonify({"ok": True, "id": cursor.lastrowid}), 201
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    finally:
+        conn.close()
+
+
+@importaciones_bp.route("/hitos-auditoria/<int:id_hito>", methods=["PUT"])
+def actualizar_hito_auditoria(id_hito):
+    data = request.get_json() or {}
+    error = _validar_payload_hito(data)
+    if error:
+        return jsonify({"error": error}), 400
+
+    conn = obtener_conexion()
+    if not conn:
+        return jsonify({"error": "Sin conexion a BD"}), 500
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            "UPDATE importaciones_hitos_auditoria SET "
+            "seccion = %s, orden_hito = %s, etiqueta = %s, campo_dato = %s, "
+            "campo_ancla = %s, dias_esperados = %s, activo = %s WHERE id = %s",
+            (
+                data["seccion"].strip(), int(data["orden_hito"]), data["etiqueta"].strip(),
+                data["campo_dato"].strip(),
+                (data.get("campo_ancla") or "").strip() or None,
+                int(data["dias_esperados"]), 1 if data.get("activo", True) else 0,
+                id_hito,
+            ),
+        )
+        conn.commit()
+        if cursor.rowcount == 0:
+            return jsonify({"error": "No encontrado"}), 404
+        return jsonify({"ok": True}), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    finally:
+        conn.close()
+
+
+@importaciones_bp.route("/hitos-auditoria/<int:id_hito>", methods=["DELETE"])
+def eliminar_hito_auditoria(id_hito):
+    conn = obtener_conexion()
+    if not conn:
+        return jsonify({"error": "Sin conexion a BD"}), 500
+    try:
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM importaciones_hitos_auditoria WHERE id = %s", (id_hito,))
+        conn.commit()
+        if cursor.rowcount == 0:
+            return jsonify({"error": "No encontrado"}), 404
+        return jsonify({"ok": True}), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    finally:
+        conn.close()
+
+
 # ── GET /importaciones  →  lista con resumen de progreso ────────────────────
 
 @importaciones_bp.route("", methods=["GET"])

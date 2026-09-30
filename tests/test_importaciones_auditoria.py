@@ -129,3 +129,114 @@ def test_put_importacion_registra_historial_en_bd_real():
     cursor.execute("DELETE FROM importaciones WHERE id = %s", (id_imp,))
     conn.commit()
     conn.close()
+
+
+def test_listar_hitos_auditoria_devuelve_json_del_select(mocker):
+    conn = MagicMock()
+    cursor = MagicMock()
+    cursor.fetchall.return_value = [
+        {"id": 1, "seccion": "logistica", "orden_hito": 1, "etiqueta": "1. Importador",
+         "campo_dato": "odoo_importador", "campo_ancla": None, "dias_esperados": 0, "activo": 1},
+    ]
+    conn.cursor.return_value = cursor
+    mocker.patch("routes.importaciones.obtener_conexion", return_value=conn)
+
+    resp = _cliente_test().get("/importaciones/hitos-auditoria")
+
+    assert resp.status_code == 200
+    assert resp.get_json()[0]["campo_dato"] == "odoo_importador"
+
+
+def test_crear_hito_auditoria_rechaza_campo_dato_vacio(mocker):
+    conn = MagicMock()
+    mocker.patch("routes.importaciones.obtener_conexion", return_value=conn)
+
+    resp = _cliente_test().post("/importaciones/hitos-auditoria", json={
+        "seccion": "logistica", "orden_hito": 1, "etiqueta": "x",
+        "campo_dato": "", "dias_esperados": 5,
+    })
+
+    assert resp.status_code == 400
+
+
+def test_crear_hito_auditoria_ok(mocker):
+    conn = MagicMock()
+    cursor = MagicMock()
+    cursor.lastrowid = 7
+    conn.cursor.return_value = cursor
+    mocker.patch("routes.importaciones.obtener_conexion", return_value=conn)
+
+    resp = _cliente_test().post("/importaciones/hitos-auditoria", json={
+        "seccion": "logistica", "orden_hito": 3, "etiqueta": "18. Contenedores",
+        "campo_dato": "log_contenedor", "campo_ancla": "log_fecha_entrega", "dias_esperados": 1,
+    })
+
+    assert resp.status_code == 201
+    assert resp.get_json()["id"] == 7
+
+
+def test_actualizar_hito_auditoria_404_si_no_existe(mocker):
+    conn = MagicMock()
+    cursor = MagicMock()
+    cursor.rowcount = 0
+    conn.cursor.return_value = cursor
+    mocker.patch("routes.importaciones.obtener_conexion", return_value=conn)
+
+    resp = _cliente_test().put("/importaciones/hitos-auditoria/999", json={
+        "seccion": "logistica", "orden_hito": 1, "etiqueta": "x",
+        "campo_dato": "log_contenedor", "dias_esperados": 1,
+    })
+
+    assert resp.status_code == 404
+
+
+def test_eliminar_hito_auditoria_ok(mocker):
+    conn = MagicMock()
+    cursor = MagicMock()
+    cursor.rowcount = 1
+    conn.cursor.return_value = cursor
+    mocker.patch("routes.importaciones.obtener_conexion", return_value=conn)
+
+    resp = _cliente_test().delete("/importaciones/hitos-auditoria/7")
+
+    assert resp.status_code == 200
+
+
+import pytest as _pytest
+
+_HITOS_INICIALES = [
+    ("logistica",    1, "1. Importador",                                   "odoo_importador",              None,                              0),
+    ("costos",       1, "Flete proyectado (USD)",                          "cos_flete_proyectado_usd",     None,                              0),
+    ("logistica",    2, "9. Confirmación de cotización y forwarder",       "log_confirmacion_cotizacion",  None,                              7),
+    ("logistica",    3, "18. Contenedores",                                "log_contenedor",               "log_fecha_entrega",              1),
+    ("importacion",  1, "1. Fecha de entrega de traducción al RBF",        "imp_fecha_traduccion",         "log_fecha_entrega",              10),
+    ("odoo",         1, "1. Recepción de documentos",                      "log_recepcion_documentos",     "log_fecha_entrega",              2),
+    ("odoo",         2, "6. Folios de orden de compra",                    "odoo_folio_orden",             "log_recepcion_documentos",       10),
+    ("importacion",  2, "18. Recepción de draft de pedimento",             "imp_recepcion_draft_pedimento","imp_llegada_contenedor_puerto",  5),
+    ("importacion",  3, "34. Fecha de pago de pedimento",                  "imp_fecha_pago_pedimento",     "imp_pedimento_revisado",         4),
+    ("despacho",     1, "1. Solicitud de cita para cruce",                 "des_solicitud_cita_cruce",     "imp_fecha_pago_pedimento",       1),
+    ("almacen",      1, "1. Base de datos para etiquetas",                 "alm_base_datos_etiquetas",     "imp_fecha_pago_pedimento",       2),
+    ("despacho",     2, "9. Llegada de contenedor a almacén",              "des_llegada_almacen",          "des_fecha_cruce_real",           2),
+    ("despacho",     3, "15. Recepción de documento EIR",                  "des_recepcion_eir",            "des_fecha_cruce_real",           3),
+    ("almacen",      2, "6. Envío de información a la UVA (Real)",         "alm_envio_info_uva",           "des_llegada_almacen",            2),
+    ("almacen",      3, "10. Fecha de terminación de etiquetado (Real)",   "alm_terminacion_etiquetado",   "alm_inicio_etiquetado",          3),
+    ("recepcion",    1, "Cédula de costeo de IGI",                         "rec_cedula_costeo",            "des_llegada_almacen",            2),
+    ("recepcion",    2, "Liberación final del producto",                   "rec_liberacion_final",         "rec_liberacion_verificacion",    1),
+    ("costos",       3, "Costos reales",                                   "cos_tipo_cambio_pedimento",    "des_fecha_cruce_real",           10),
+    ("cierre",       1, "1. Recepción de cuentas de gastos",                "cie_recepcion_cuenta_gastos",  "cos_tipo_cambio_pedimento",       2),
+    ("cierre",       2, "Fecha de pago a agente aduanal",                  "cie_fecha_pago_aa",            "cie_recepcion_cuenta_gastos",    4),
+]
+
+
+@_pytest.mark.skip(reason="Seed manual -- correr una vez contra local quitando el skip, luego restaurarlo")
+def test_seed_hitos_iniciales():
+    conn = obtener_conexion()
+    cursor = conn.cursor()
+    cursor.executemany(
+        "INSERT INTO importaciones_hitos_auditoria "
+        "(seccion, orden_hito, etiqueta, campo_dato, campo_ancla, dias_esperados) "
+        "VALUES (%s, %s, %s, %s, %s, %s)",
+        _HITOS_INICIALES,
+    )
+    conn.commit()
+    conn.close()
