@@ -612,11 +612,33 @@ def test_asignar_agrupa_items_del_mismo_cliente_y_mes_en_una_sola_llamada_a_odoo
         {"clave_cliente": "LC657", "mes_objetivo": "2026-10", "cantidad": 2},
     ])
 
-    odoo_mock.assert_called_once_with("LC657", "2026-10", [{"sku": "SKU-1", "cantidad": 5}])
+    odoo_mock.assert_called_once_with("LC657", "2026-10", [{"sku": "SKU-1", "cantidad": 5}], order_id_conocido=None)
     updates = [c for c in cursor.execute.call_args_list
                if "UPDATE importacion_asignaciones SET odoo_order_id" in c.args[0]]
     assert len(updates) == 1
     assert updates[0].args[1] == (1, "S00001", 10, "LC657", _dt.date(2026, 10, 1))
+
+
+def test_asignar_pasa_el_odoo_order_id_ya_guardado_como_order_id_conocido(mocker):
+    # Si esta reserva (mismo producto+cliente+mes) ya tenía una orden de Odoo
+    # asignada de un intento anterior, reservar_en_odoo debe recibir ese id
+    # para reutilizarla -- nunca debe crear una orden nueva de la nada.
+    cursor = MagicMock()
+    cursor.fetchone.side_effect = [
+        {"id": 10, "importacion_id": 1, "periodo": "2026-2027", "sku": "SKU-1", "sku_norm": "SKU1"},
+        {"clave": "LC657"},
+        {"id": 55, "odoo_order_id": 3001},  # ya existía una asignación con orden Odoo
+    ]
+    _mock_conn(mocker, cursor)
+    mocker.patch("services.asignaciones_service._disponible_producto", return_value=10)
+    odoo_mock = mocker.patch(
+        "services.asignaciones_service.reservar_en_odoo",
+        return_value={"order_id": 3001, "order_name": "S00042"},
+    )
+
+    asignar(10, [{"clave_cliente": "LC657", "mes_objetivo": "2026-10", "cantidad": 2}])
+
+    odoo_mock.assert_called_once_with("LC657", "2026-10", [{"sku": "SKU-1", "cantidad": 2}], order_id_conocido=3001)
 
 
 def test_asignar_llama_a_odoo_una_vez_por_cada_cliente_y_mes_distinto(mocker):

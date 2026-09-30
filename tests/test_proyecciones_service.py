@@ -111,7 +111,6 @@ def test_reservar_en_odoo_crea_orden_nueva_con_vendedor_y_actividad(mocker):
         [{"id": 900, "default_code": "SKU-1"}],             # product.product search_read
         [],                                                  # crm.tag search_read (no existe)
         77,                                                  # crm.tag create -> tag_id
-        [],                                                  # sale.order search_read (no hay orden abierta)
         3001,                                                # sale.order create -> order_id
         [{"name": "S00042", "state": "draft"}],             # sale.order read -> name + state
         [733],                                               # ir.model search -> id de sale.order
@@ -141,35 +140,66 @@ def test_reservar_en_odoo_crea_orden_nueva_con_vendedor_y_actividad(mocker):
     # La orden nueva queda confirmada (sale), no como cotización en borrador.
     confirm_call = [c for c in models.execute_kw.call_args_list if c.args[3] == "sale.order" and c.args[4] == "action_confirm"][0]
     assert confirm_call.args[5] == [[3001]]
+    # Sin order_id_conocido nunca se busca en Odoo por partner+tag -- cada
+    # reserva nueva crea su propia orden, nunca se reutiliza una ajena.
+    assert ("sale.order", "search_read") not in metodos_llamados_completos(models)
 
 
-def test_reservar_en_odoo_agrega_lineas_a_orden_en_borrador_existente_sin_crear_otra(mocker):
+def metodos_llamados_completos(models):
+    return [(c.args[3], c.args[4]) for c in models.execute_kw.call_args_list]
+
+
+def test_reservar_en_odoo_reintento_agrega_lineas_a_la_orden_ya_conocida_sin_crear_otra(mocker):
+    # Reintento de una reserva que ya había creado una orden en un intento
+    # anterior (order_id_conocido = lo que el caller tiene guardado en
+    # importacion_asignaciones.odoo_order_id) -- debe reutilizarla, no crear
+    # una nueva ni buscar por partner+tag.
     models = MagicMock()
     models.execute_kw.side_effect = [
         [{"id": 501, "name": "Víctor Hugo"}],                        # partner
         [{"id": 900, "default_code": "SKU-1"}],                       # producto
         [{"id": 77}],                                                 # tag ya existe
-        [{"id": 3001, "name": "S00042", "order_line": [11], "state": "draft", "locked": False}],  # orden en borrador ya existe
+        [{"id": 3001, "name": "S00042", "order_line": [11], "state": "draft", "locked": False}],  # lookup por id=3001
         [{"id": 11, "product_id": [900, "SKU-1"], "product_uom_qty": 3}],  # línea ya existente para ese producto
         True,                                                          # sale.order write (order_line)
         True,                                                          # sale.order action_confirm
     ]
     mocker.patch("services.proyecciones_service.get_odoo_models", return_value=(1, models, None))
 
-    resultado = reservar_en_odoo("LC657", "2026-10", [{"sku": "SKU-1", "cantidad": 2}])
+    resultado = reservar_en_odoo("LC657", "2026-10", [{"sku": "SKU-1", "cantidad": 2}], order_id_conocido=3001)
 
     assert resultado == {"order_id": 3001, "order_name": "S00042"}
-    # No debe haber llamado a crear una orden ni una actividad nueva.
-    metodos_llamados = [(c.args[3], c.args[4]) for c in models.execute_kw.call_args_list]
+    metodos_llamados = metodos_llamados_completos(models)
     assert ("sale.order", "create") not in metodos_llamados
     assert ("mail.activity", "create") not in metodos_llamados
+    search_call = [c for c in models.execute_kw.call_args_list if c.args[3] == "sale.order" and c.args[4] == "search_read"][0]
+    assert search_call.args[5][0] == [["id", "=", 3001], ["state", "in", ["draft", "sale"]]]
     write_calls = [c for c in models.execute_kw.call_args_list if c.args[3] == "sale.order" and c.args[4] == "write"]
     order_line_cmds = write_calls[0].args[5][1]["order_line"]
     assert order_line_cmds == [(1, 11, {"product_uom_qty": 5})]  # 3 existentes + 2 nuevas
-    # La orden en borrador aún no estaba bloqueada -- no hace falta desbloquearla,
-    # solo confirmarla al final (queda en 'sale').
     assert len(write_calls) == 1
     assert ("sale.order", "action_confirm") in metodos_llamados
+
+
+def test_reservar_en_odoo_reintento_con_orden_borrada_crea_una_nueva(mocker):
+    # El order_id_conocido ya no existe en Odoo (se borró) -- debe crear una
+    # orden nueva en vez de fallar.
+    models = MagicMock()
+    models.execute_kw.side_effect = [
+        [{"id": 501, "name": "Víctor Hugo"}],                        # partner
+        [{"id": 900, "default_code": "SKU-1"}],                       # producto
+        [{"id": 77}],                                                 # tag ya existe
+        [],                                                            # lookup por id=3001 -> ya no existe
+        3002,                                                          # sale.order create -> order_id
+        [{"name": "S00099", "state": "draft"}],                       # sale.order read -> name + state
+        True,                                                          # sale.order action_confirm
+    ]
+    mocker.patch("services.proyecciones_service.get_odoo_models", return_value=(1, models, None))
+    mocker.patch("services.proyecciones_service._crear_actividad_revisar_reserva")
+
+    resultado = reservar_en_odoo("LC657", "2026-10", [{"sku": "SKU-1", "cantidad": 2}], order_id_conocido=3001)
+
+    assert resultado == {"order_id": 3002, "order_name": "S00099"}
 
 
 def test_reservar_en_odoo_desbloquea_agrega_y_vuelve_a_bloquear_una_orden_ya_confirmada(mocker):
@@ -186,7 +216,7 @@ def test_reservar_en_odoo_desbloquea_agrega_y_vuelve_a_bloquear_una_orden_ya_con
     ]
     mocker.patch("services.proyecciones_service.get_odoo_models", return_value=(1, models, None))
 
-    resultado = reservar_en_odoo("LC657", "2026-10", [{"sku": "SKU-1", "cantidad": 2}])
+    resultado = reservar_en_odoo("LC657", "2026-10", [{"sku": "SKU-1", "cantidad": 2}], order_id_conocido=3001)
 
     assert resultado == {"order_id": 3001, "order_name": "S00042"}
     write_calls = [c for c in models.execute_kw.call_args_list if c.args[3] == "sale.order" and c.args[4] == "write"]
