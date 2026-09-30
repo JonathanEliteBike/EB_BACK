@@ -688,6 +688,31 @@ def sync_monitor_odoo():
                 if pid not in product_categ_map and r.get('categ_id'):
                     product_categ_map[pid] = r['categ_id'][0]
 
+        # ── 4b. Respaldo directo a product.product ──────────────────────────
+        # sale.report solo tiene una fila por producto que en algún momento se
+        # vendió a través de un sale.order. Un producto agregado directamente a
+        # una factura (sin línea de venta detrás, p. ej. facturas manuales de
+        # Contabilidad) no aparece ahí y su categoría queda sin resolver, lo que
+        # tira TODAS las líneas de esa factura de `monitor` en silencio. Para
+        # esos productos huérfanos se completa leyendo product.product directo.
+        _faltantes = [pid for pid in product_ids if pid not in product_categ_map]
+        if _faltantes:
+            try:
+                _prods_directo = models.execute_kw(
+                    ODOO_DB, uid, ODOO_PASSWORD,
+                    'product.product', 'read',
+                    [_faltantes],
+                    {'fields': ['id', 'categ_id']}
+                )
+                for p in _prods_directo:
+                    if p.get('categ_id'):
+                        product_categ_map[p['id']] = p['categ_id'][0]
+            except Exception:
+                logging.exception(
+                    'sync_monitor_odoo: no se pudo resolver categoría de respaldo '
+                    'via product.product para %d producto(s)', len(_faltantes)
+                )
+
         # ── 5. Categorías en batch ────────────────────────────────────────────
         categ_ids = list(set(product_categ_map.values()))
         categs_raw = models.execute_kw(
