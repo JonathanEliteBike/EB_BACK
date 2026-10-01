@@ -227,6 +227,13 @@ def _calcular_auditoria_resumen(conn) -> list[dict]:
 
     resumen = []
     for emb in embarques:
+        if emb.get("created_at") is None:
+            # Dato faltante/corrupto -- se omite esta fila en vez de tumbar
+            # el resumen completo con un 500 por un solo embarque malo.
+            logging.warning(
+                "Embarque %s sin created_at -- omitido del resumen de auditoria", emb.get("id")
+            )
+            continue
         hitos = _calcular_auditoria(emb["id"], conn)
         conteo = {"atrasados": 0, "adelantados": 0, "a_tiempo": 0, "pendientes": 0, "en_espera": 0, "sin_historial": 0}
         clave_por_estado = {
@@ -892,6 +899,19 @@ def inicializar_tablas():
         """)
         conn.commit()
 
+        # Semilla inicial de los 20 hitos -- solo si la tabla todavia esta
+        # vacia, para que correr este endpoint varias veces (ej. en cada
+        # despliegue) nunca duplique filas.
+        cursor.execute("SELECT COUNT(*) FROM importaciones_hitos_auditoria")
+        if cursor.fetchone()[0] == 0:
+            cursor.executemany(
+                "INSERT INTO importaciones_hitos_auditoria "
+                "(seccion, orden_hito, etiqueta, campo_dato, campo_ancla, dias_esperados) "
+                "VALUES (%s, %s, %s, %s, %s, %s)",
+                _HITOS_SEED,
+            )
+            conn.commit()
+
         return jsonify({"ok": True, "mensaje": "Tabla importaciones creada/verificada"}), 201
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -1044,6 +1064,34 @@ _SECCIONES_HITOS = {
     "logistica", "importacion", "despacho", "odoo",
     "almacen", "recepcion", "cierre", "costos",
 }
+
+# Semilla inicial de los 20 hitos (seccion, orden_hito, etiqueta, campo_dato,
+# campo_ancla, dias_esperados), en el mismo orden en que el usuario los dio
+# -- _calcular_auditoria() lista por id ascendente, así que este orden de
+# inserción ES el orden en que se muestran en el pipeline de auditoría.
+# Sembrada de forma idempotente desde inicializar_tablas() (ver ahí).
+_HITOS_SEED = [
+    ("logistica",    1, "1. Importador",                                   "odoo_importador",              None,                              0),
+    ("costos",       1, "Flete proyectado (USD)",                          "cos_flete_proyectado_usd",     None,                              0),
+    ("logistica",    2, "9. Confirmación de cotización y forwarder",       "log_confirmacion_cotizacion",  None,                              7),
+    ("logistica",    3, "18. Contenedores",                                "log_contenedor",               "log_fecha_entrega",              1),
+    ("importacion",  1, "1. Fecha de entrega de traducción al RBF",        "imp_fecha_traduccion",         "log_fecha_entrega",              10),
+    ("odoo",         1, "1. Recepción de documentos",                      "log_recepcion_documentos",     "log_fecha_entrega",              2),
+    ("odoo",         2, "6. Folios de orden de compra",                    "odoo_folio_orden",             "log_recepcion_documentos",       10),
+    ("importacion",  2, "18. Recepción de draft de pedimento",             "imp_recepcion_draft_pedimento","imp_llegada_contenedor_puerto",  5),
+    ("importacion",  3, "34. Fecha de pago de pedimento",                  "imp_fecha_pago_pedimento",     "imp_pedimento_revisado",         4),
+    ("despacho",     1, "1. Solicitud de cita para cruce",                 "des_solicitud_cita_cruce",     "imp_fecha_pago_pedimento",       1),
+    ("almacen",      1, "1. Base de datos para etiquetas",                 "alm_base_datos_etiquetas",     "imp_fecha_pago_pedimento",       2),
+    ("despacho",     2, "9. Llegada de contenedor a almacén",              "des_llegada_almacen",          "des_fecha_cruce_real",           2),
+    ("despacho",     3, "15. Recepción de documento EIR",                  "des_recepcion_eir",            "des_fecha_cruce_real",           3),
+    ("almacen",      2, "6. Envío de información a la UVA (Real)",         "alm_envio_info_uva",           "des_llegada_almacen",            2),
+    ("almacen",      3, "10. Fecha de terminación de etiquetado (Real)",   "alm_terminacion_etiquetado",   "alm_inicio_etiquetado",          3),
+    ("recepcion",    1, "Cédula de costeo de IGI",                         "rec_cedula_costeo",            "des_llegada_almacen",            2),
+    ("recepcion",    2, "Liberación final del producto",                   "rec_liberacion_final",         "rec_liberacion_verificacion",    1),
+    ("costos",       3, "Costos reales",                                   "cos_tipo_cambio_pedimento",    "des_fecha_cruce_real",           10),
+    ("cierre",       1, "1. Recepción de cuentas de gastos",                "cie_recepcion_cuenta_gastos",  "cos_tipo_cambio_pedimento",       2),
+    ("cierre",       2, "Fecha de pago a agente aduanal",                  "cie_fecha_pago_aa",            "cie_recepcion_cuenta_gastos",    4),
+]
 
 
 def _validar_payload_hito(data: dict) -> str | None:
@@ -1993,8 +2041,19 @@ def actualizar(id_imp):
         cursor.execute(f"UPDATE importaciones SET {set_clause} WHERE id = %s", vals)
         conn.commit()
 
-        _registrar_primera_captura(cursor, id_imp, existing, merged, campos_a_actualizar)
-        conn.commit()
+        # El historial de auditoria es secundario al guardado principal (que
+        # ya tiene commit arriba) -- si esto truena (ej. la tabla todavia no
+        # existe en un servidor donde no se corrio /inicializar-tablas antes
+        # del despliegue), no debe verse como un 500 para quien esta
+        # guardando el formulario, cuyo dato real ya quedo persistido.
+        try:
+            _registrar_primera_captura(cursor, id_imp, existing, merged, campos_a_actualizar)
+            conn.commit()
+        except Exception:
+            logging.exception(
+                "No se pudo registrar el historial de auditoria para importacion %s", id_imp
+            )
+            conn.rollback()
 
         # ── Auto-transición de estado según progreso global ───────────────────
         cursor.execute("SELECT * FROM importaciones WHERE id = %s", (id_imp,))

@@ -2,7 +2,7 @@
 de captura por campo, y el motor de calculo _calcular_auditoria()."""
 from __future__ import annotations
 
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 from flask import Flask
@@ -30,6 +30,43 @@ def test_inicializar_tablas_crea_historial_y_hitos(mocker):
     )
     assert "CREATE TABLE IF NOT EXISTS importaciones_historial_campos" in sql_ejecutados
     assert "CREATE TABLE IF NOT EXISTS importaciones_hitos_auditoria" in sql_ejecutados
+
+
+def _llamadas_executemany_hitos(cursor):
+    return [
+        c for c in cursor.executemany.call_args_list
+        if c.args and "importaciones_hitos_auditoria" in c.args[0]
+    ]
+
+
+def test_inicializar_tablas_siembra_los_hitos_si_la_tabla_esta_vacia(mocker):
+    from routes.importaciones import _HITOS_SEED
+
+    conn = MagicMock()
+    cursor = MagicMock()
+    conn.cursor.return_value = cursor
+    cursor.fetchone.return_value = (0,)
+    mocker.patch("routes.importaciones.obtener_conexion", return_value=conn)
+
+    resp = _cliente_test().post("/importaciones/inicializar-tablas")
+
+    assert resp.status_code == 201
+    llamadas = _llamadas_executemany_hitos(cursor)
+    assert len(llamadas) == 1
+    assert llamadas[0].args[1] == _HITOS_SEED
+
+
+def test_inicializar_tablas_no_duplica_hitos_si_ya_hay_datos(mocker):
+    conn = MagicMock()
+    cursor = MagicMock()
+    conn.cursor.return_value = cursor
+    cursor.fetchone.return_value = (20,)
+    mocker.patch("routes.importaciones.obtener_conexion", return_value=conn)
+
+    resp = _cliente_test().post("/importaciones/inicializar-tablas")
+
+    assert resp.status_code == 201
+    assert _llamadas_executemany_hitos(cursor) == []
 
 
 from datetime import date, datetime
@@ -101,34 +138,70 @@ def _crear_embarque_de_prueba():
 
 def test_put_importacion_registra_historial_en_bd_real():
     id_imp = _crear_embarque_de_prueba()
-    client = _cliente_test()
+    try:
+        client = _cliente_test()
 
-    # Primera captura de log_contenedor -> debe quedar en el historial.
-    resp = client.put(f"/importaciones/{id_imp}", json={"log_contenedor": "MSKU9999999"})
-    assert resp.status_code == 200
+        # Primera captura de log_contenedor -> debe quedar en el historial.
+        resp = client.put(f"/importaciones/{id_imp}", json={"log_contenedor": "MSKU9999999"})
+        assert resp.status_code == 200
 
-    conn = obtener_conexion()
-    cursor = conn.cursor(dictionary=True)
-    cursor.execute(
-        "SELECT * FROM importaciones_historial_campos WHERE importacion_id = %s AND campo = %s",
-        (id_imp, "log_contenedor"),
-    )
-    filas = cursor.fetchall()
-    assert len(filas) == 1
-    assert filas[0]["valor_nuevo"] == "MSKU9999999"
+        conn = obtener_conexion()
+        cursor = conn.cursor(dictionary=True)
+        cursor.execute(
+            "SELECT * FROM importaciones_historial_campos WHERE importacion_id = %s AND campo = %s",
+            (id_imp, "log_contenedor"),
+        )
+        filas = cursor.fetchall()
+        assert len(filas) == 1
+        assert filas[0]["valor_nuevo"] == "MSKU9999999"
 
-    # Segunda escritura del MISMO campo (correccion) -> NO debe duplicar la fila.
-    resp2 = client.put(f"/importaciones/{id_imp}", json={"log_contenedor": "MSKU8888888"})
-    assert resp2.status_code == 200
-    cursor.execute(
-        "SELECT COUNT(*) AS c FROM importaciones_historial_campos WHERE importacion_id = %s AND campo = %s",
-        (id_imp, "log_contenedor"),
-    )
-    assert cursor.fetchone()["c"] == 1  # sigue siendo 1, no 2
+        # Segunda escritura del MISMO campo (correccion) -> NO debe duplicar la fila.
+        resp2 = client.put(f"/importaciones/{id_imp}", json={"log_contenedor": "MSKU8888888"})
+        assert resp2.status_code == 200
+        cursor.execute(
+            "SELECT COUNT(*) AS c FROM importaciones_historial_campos WHERE importacion_id = %s AND campo = %s",
+            (id_imp, "log_contenedor"),
+        )
+        assert cursor.fetchone()["c"] == 1  # sigue siendo 1, no 2
+        conn.close()
+    finally:
+        # try/finally: si algun assert de arriba falla, igual se limpia el
+        # embarque de prueba en vez de dejarlo huerfano en la BD real.
+        conn = obtener_conexion()
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM importaciones WHERE id = %s", (id_imp,))
+        conn.commit()
+        conn.close()
 
-    cursor.execute("DELETE FROM importaciones WHERE id = %s", (id_imp,))
-    conn.commit()
-    conn.close()
+
+def test_put_importacion_no_truena_si_falla_el_registro_de_historial():
+    """Si _registrar_primera_captura() truena (ej. la tabla
+    importaciones_historial_campos no existe todavia en un servidor donde
+    no se corrio /inicializar-tablas antes del despliegue), el guardado
+    principal del embarque YA se hizo commit -- no debe convertirse en un
+    500 para el usuario, que vería un error aunque su dato si se guardo."""
+    id_imp = _crear_embarque_de_prueba()
+    try:
+        with patch(
+            "routes.importaciones._registrar_primera_captura",
+            side_effect=Exception("tabla no existe"),
+        ):
+            resp = _cliente_test().put(f"/importaciones/{id_imp}", json={"log_contenedor": "MSKU7777777"})
+
+        assert resp.status_code == 200
+
+        conn = obtener_conexion()
+        cursor = conn.cursor(dictionary=True)
+        cursor.execute("SELECT log_contenedor FROM importaciones WHERE id = %s", (id_imp,))
+        fila = cursor.fetchone()
+        conn.close()
+        assert fila["log_contenedor"] == "MSKU7777777"
+    finally:
+        conn = obtener_conexion()
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM importaciones WHERE id = %s", (id_imp,))
+        conn.commit()
+        conn.close()
 
 
 def test_listar_hitos_auditoria_devuelve_json_del_select(mocker):
@@ -454,44 +527,12 @@ def test_get_auditoria_devuelve_200_con_lista(mocker):
     assert resp.get_json()[0]["estado"] == "a_tiempo"
 
 
-import pytest as _pytest
-
-_HITOS_INICIALES = [
-    ("logistica",    1, "1. Importador",                                   "odoo_importador",              None,                              0),
-    ("costos",       1, "Flete proyectado (USD)",                          "cos_flete_proyectado_usd",     None,                              0),
-    ("logistica",    2, "9. Confirmación de cotización y forwarder",       "log_confirmacion_cotizacion",  None,                              7),
-    ("logistica",    3, "18. Contenedores",                                "log_contenedor",               "log_fecha_entrega",              1),
-    ("importacion",  1, "1. Fecha de entrega de traducción al RBF",        "imp_fecha_traduccion",         "log_fecha_entrega",              10),
-    ("odoo",         1, "1. Recepción de documentos",                      "log_recepcion_documentos",     "log_fecha_entrega",              2),
-    ("odoo",         2, "6. Folios de orden de compra",                    "odoo_folio_orden",             "log_recepcion_documentos",       10),
-    ("importacion",  2, "18. Recepción de draft de pedimento",             "imp_recepcion_draft_pedimento","imp_llegada_contenedor_puerto",  5),
-    ("importacion",  3, "34. Fecha de pago de pedimento",                  "imp_fecha_pago_pedimento",     "imp_pedimento_revisado",         4),
-    ("despacho",     1, "1. Solicitud de cita para cruce",                 "des_solicitud_cita_cruce",     "imp_fecha_pago_pedimento",       1),
-    ("almacen",      1, "1. Base de datos para etiquetas",                 "alm_base_datos_etiquetas",     "imp_fecha_pago_pedimento",       2),
-    ("despacho",     2, "9. Llegada de contenedor a almacén",              "des_llegada_almacen",          "des_fecha_cruce_real",           2),
-    ("despacho",     3, "15. Recepción de documento EIR",                  "des_recepcion_eir",            "des_fecha_cruce_real",           3),
-    ("almacen",      2, "6. Envío de información a la UVA (Real)",         "alm_envio_info_uva",           "des_llegada_almacen",            2),
-    ("almacen",      3, "10. Fecha de terminación de etiquetado (Real)",   "alm_terminacion_etiquetado",   "alm_inicio_etiquetado",          3),
-    ("recepcion",    1, "Cédula de costeo de IGI",                         "rec_cedula_costeo",            "des_llegada_almacen",            2),
-    ("recepcion",    2, "Liberación final del producto",                   "rec_liberacion_final",         "rec_liberacion_verificacion",    1),
-    ("costos",       3, "Costos reales",                                   "cos_tipo_cambio_pedimento",    "des_fecha_cruce_real",           10),
-    ("cierre",       1, "1. Recepción de cuentas de gastos",                "cie_recepcion_cuenta_gastos",  "cos_tipo_cambio_pedimento",       2),
-    ("cierre",       2, "Fecha de pago a agente aduanal",                  "cie_fecha_pago_aa",            "cie_recepcion_cuenta_gastos",    4),
-]
-
-
-@_pytest.mark.skip(reason="Seed manual -- correr una vez contra local quitando el skip, luego restaurarlo")
-def test_seed_hitos_iniciales():
-    conn = obtener_conexion()
-    cursor = conn.cursor()
-    cursor.executemany(
-        "INSERT INTO importaciones_hitos_auditoria "
-        "(seccion, orden_hito, etiqueta, campo_dato, campo_ancla, dias_esperados) "
-        "VALUES (%s, %s, %s, %s, %s, %s)",
-        _HITOS_INICIALES,
-    )
-    conn.commit()
-    conn.close()
+# El seed manual de hitos (_HITOS_INICIALES + test con skip) se reemplazó
+# por el seed automático e idempotente dentro de inicializar_tablas() (ver
+# _HITOS_SEED en routes/importaciones.py y los tests
+# test_inicializar_tablas_siembra_los_hitos_si_la_tabla_esta_vacia /
+# test_inicializar_tablas_no_duplica_hitos_si_ya_hay_datos más arriba) --
+# ya no hace falta un paso manual de despliegue para sembrar los 20 hitos.
 
 
 # ── Resumen de auditoria (todos los embarques, contador por estado) ──────────
@@ -549,6 +590,24 @@ def test_resumen_auditoria_sin_embarques_devuelve_lista_vacia(mocker):
     cursor.fetchall.return_value = []
 
     assert _calcular_auditoria_resumen(conn) == []
+
+
+def test_resumen_auditoria_omite_embarque_con_created_at_null(mocker):
+    """Un embarque con created_at NULL (dato faltante/corrupto) no debe
+    tumbar el resumen completo con un 500 -- se omite esa fila y el resto
+    del resumen se calcula normal."""
+    conn = MagicMock()
+    cursor = MagicMock()
+    conn.cursor.return_value = cursor
+    cursor.fetchall.return_value = [
+        {"id": 1, "referencia": "R26-0001", "nombre": "Sin fecha", "created_at": None},
+        {"id": 2, "referencia": "R26-0002", "nombre": "Con fecha", "created_at": date(2026, 1, 2)},
+    ]
+    mocker.patch("routes.importaciones._calcular_auditoria", return_value=[])
+
+    resultado = _calcular_auditoria_resumen(conn)
+
+    assert [e["id"] for e in resultado] == [2]
 
 
 def test_get_auditoria_resumen_devuelve_200(mocker):
