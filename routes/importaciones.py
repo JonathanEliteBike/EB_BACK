@@ -219,7 +219,7 @@ def _calcular_auditoria_resumen(conn) -> list[dict]:
     queda para badges/orden rapido."""
     cursor = conn.cursor(dictionary=True)
     cursor.execute("""
-        SELECT id, referencia, nombre FROM importaciones
+        SELECT id, referencia, nombre, created_at FROM importaciones
         WHERE estado != 'eliminado'
         ORDER BY created_at DESC
     """)
@@ -239,6 +239,7 @@ def _calcular_auditoria_resumen(conn) -> list[dict]:
                 conteo[clave] += 1
         resumen.append({
             "id": emb["id"], "referencia": emb["referencia"], "nombre": emb["nombre"],
+            "creado_en": _a_date(emb["created_at"]).isoformat(),
             **conteo,
             "hitos": hitos,
         })

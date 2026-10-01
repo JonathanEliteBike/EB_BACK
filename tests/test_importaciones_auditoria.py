@@ -517,15 +517,29 @@ def test_resumen_auditoria_cuenta_por_estado(mocker):
     resultado = _calcular_auditoria_resumen(conn)
 
     assert resultado[0] == {
-        "id": 1, "referencia": "R26-0001", "nombre": "Embarque 1",
+        "id": 1, "referencia": "R26-0001", "nombre": "Embarque 1", "creado_en": "2026-01-01",
         "atrasados": 2, "adelantados": 0, "a_tiempo": 1, "pendientes": 0, "en_espera": 0, "sin_historial": 0,
         "hitos": hitos_emb1,
     }
     assert resultado[1] == {
-        "id": 2, "referencia": "R26-0002", "nombre": "Embarque 2",
+        "id": 2, "referencia": "R26-0002", "nombre": "Embarque 2", "creado_en": "2026-01-02",
         "atrasados": 0, "adelantados": 1, "a_tiempo": 0, "pendientes": 1, "en_espera": 1, "sin_historial": 1,
         "hitos": hitos_emb2,
     }
+
+
+def test_resumen_auditoria_creado_en_normaliza_datetime_a_date(mocker):
+    conn = MagicMock()
+    cursor = MagicMock()
+    conn.cursor.return_value = cursor
+    cursor.fetchall.return_value = [
+        {"id": 1, "referencia": "R26-0001", "nombre": "Embarque 1", "created_at": datetime(2026, 1, 1, 15, 30)},
+    ]
+    mocker.patch("routes.importaciones._calcular_auditoria", return_value=[])
+
+    resultado = _calcular_auditoria_resumen(conn)
+
+    assert resultado[0]["creado_en"] == "2026-01-01"
 
 
 def test_resumen_auditoria_sin_embarques_devuelve_lista_vacia(mocker):
