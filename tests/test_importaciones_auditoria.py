@@ -531,6 +531,18 @@ def test_auditoria_disparador_capturado_en_datetime_resuelve_bien():
     assert resultado[0]["estado"] == "en_espera"
 
 
+def test_a_date_convierte_datetime_utc_a_fecha_mexico_sin_cruzar_dia():
+    """MySQL en produccion devuelve TIMESTAMP en UTC (confirmado contra la
+    BD real: @@system_time_zone = UTC) -- una captura de las 20:00 hora de
+    Mexico (02:00 UTC del dia siguiente) debe seguir contando para el dia
+    de Mexico en que realmente se capturo, no para el dia UTC."""
+    from routes.importaciones import _a_date
+    # 2026-01-02 02:00 UTC = 2026-01-01 20:00 hora de Mexico (UTC-6 fijo)
+    assert _a_date(datetime(2026, 1, 2, 2, 0, 0)) == date(2026, 1, 1)
+    # Un caso que NO cruza el dia debe seguir dando el mismo dia
+    assert _a_date(datetime(2026, 1, 2, 15, 0, 0)) == date(2026, 1, 2)
+
+
 def test_get_auditoria_devuelve_200_con_lista(mocker):
     conn = MagicMock()
     mocker.patch("routes.importaciones.obtener_conexion", return_value=conn)

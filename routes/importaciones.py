@@ -4,7 +4,7 @@ import json as _json
 import logging
 import re
 from flask import Blueprint, jsonify, request, make_response
-from datetime import datetime, date, timedelta
+from datetime import datetime, date, timedelta, timezone
 from decimal import Decimal
 from db_conexion import obtener_conexion
 from utils.auth_decorators import requiere_autenticacion
@@ -38,13 +38,22 @@ def _es_valor_vacio(v) -> bool:
     return v in (None, "", "__NA__")
 
 
+_TZ_MX = timezone(timedelta(hours=-6))  # offset fijo: Mexico elimino el horario de verano en 2022
+
+
 def _a_date(v) -> date:
     """Normaliza date/datetime/str ISO a un date plano. datetime.datetime es
     subclase de datetime.date, asi que un isinstance(v, date) por si solo no
     basta para distinguir un TIMESTAMP de MySQL (que llega como datetime) de
-    un date real -- hay que revisar datetime primero."""
+    un date real -- hay que revisar datetime primero.
+
+    Los TIMESTAMP que regresa mysql-connector vienen naive (sin tzinfo) en
+    la zona horaria de la sesion de MySQL -- en produccion es UTC
+    (confirmado contra la BD real: @@system_time_zone = UTC), asi que una
+    captura nocturna en hora de Mexico (UTC-6) cae en el dia UTC
+    siguiente si no se convierte antes de quedarse solo con la fecha."""
     if isinstance(v, datetime):
-        return v.date()
+        return v.replace(tzinfo=timezone.utc).astimezone(_TZ_MX).date()
     if isinstance(v, date):
         return v
     return date.fromisoformat(str(v)[:10])
