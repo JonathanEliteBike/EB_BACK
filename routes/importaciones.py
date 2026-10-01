@@ -33,6 +33,50 @@ def _serialize(row: dict) -> dict:
     return row
 
 
+def _es_valor_vacio(v) -> bool:
+    return v in (None, "", "__NA__")
+
+
+def _a_date(v) -> date:
+    """Normaliza date/datetime/str ISO a un date plano. datetime.datetime es
+    subclase de datetime.date, asi que un isinstance(v, date) por si solo no
+    basta para distinguir un TIMESTAMP de MySQL (que llega como datetime) de
+    un date real -- hay que revisar datetime primero."""
+    if isinstance(v, datetime):
+        return v.date()
+    if isinstance(v, date):
+        return v
+    return date.fromisoformat(str(v)[:10])
+
+
+def _registrar_primera_captura(cursor, importacion_id: int, existing: dict, merged: dict,
+                                campos_a_actualizar: list) -> None:
+    """Inserta en importaciones_historial_campos la PRIMERA vez que cada
+    campo rastreado pasa de vacio a tener valor. No se llama dentro de una
+    transaccion propia -- corre en la misma conexion/commit que el UPDATE
+    principal de actualizar().
+
+    Solo registra columnas en _COLS_PERMITIDAS (los campos capturables del
+    formulario); un valor vacio se define como None, cadena vacia o
+    '__NA__'. Si el campo YA tenia un valor real antes de este guardado, es
+    una correccion, no una primera captura -- no se toca el historial."""
+    for campo in campos_a_actualizar:
+        if campo not in _COLS_PERMITIDAS:
+            continue
+        valor_antes = existing.get(campo)
+        if not _es_valor_vacio(valor_antes):
+            continue
+        valor_despues = merged.get(campo)
+        if _es_valor_vacio(valor_despues):
+            continue
+        cursor.execute(
+            "INSERT INTO importaciones_historial_campos "
+            "(importacion_id, campo, valor_anterior, valor_nuevo) VALUES (%s, %s, %s, %s)",
+            (importacion_id, campo, str(valor_antes) if valor_antes is not None else None,
+             str(valor_despues)),
+        )
+
+
 def _calc_dias(fecha_desde, fecha_hasta):
     if fecha_desde and fecha_hasta:
         try:
@@ -44,6 +88,169 @@ def _calc_dias(fecha_desde, fecha_hasta):
         except Exception:
             return None
     return None
+
+
+def _calcular_auditoria(importacion_id: int, conn) -> list[dict]:
+    """Resuelve cada hito activo de importaciones_hitos_auditoria contra su
+    ancla y devuelve el resultado de la auditoria de llenado. Ver
+    docs/superpowers/specs/2026-09-30-auditoria-llenado-embarque-design.md
+    §4 para las 3 reglas de resolucion de fecha esperada."""
+    cursor = conn.cursor(dictionary=True)
+    cursor.execute("SELECT * FROM importaciones WHERE id = %s", (importacion_id,))
+    embarque = cursor.fetchone()
+    if not embarque:
+        return []
+
+    # ORDER BY id, no por seccion/orden_hito: el usuario llena los hitos en
+    # el orden en que se los dieron (mezclando secciones), y la vista debe
+    # respetar ese orden de captura -- los hitos se sembraron en ese mismo
+    # orden, asi que su id ascendente ES ese orden original.
+    cursor.execute(
+        "SELECT * FROM importaciones_hitos_auditoria WHERE activo = 1 ORDER BY id"
+    )
+    hitos = cursor.fetchall()
+    if not hitos:
+        return []
+
+    cursor.execute(
+        "SELECT campo, capturado_en FROM importaciones_historial_campos WHERE importacion_id = %s",
+        (importacion_id,),
+    )
+    capturado_en = {}
+    for fila in cursor.fetchall():
+        # Si un campo se capturo mas de una vez por error de datos viejos,
+        # se queda con la mas antigua (la primera captura real).
+        actual = capturado_en.get(fila["campo"])
+        if actual is None or fila["capturado_en"] < actual:
+            capturado_en[fila["campo"]] = fila["capturado_en"]
+
+    # Un campo_dato puede repetirse entre hitos activos por error de
+    # configuracion -- se usa el de menor id como el "dueño" de la fecha
+    # esperada para que otros hitos que anclen en el mismo campo_dato
+    # resuelvan de forma deterministica.
+    hito_por_campo_dato: dict = {}
+    for h in sorted(hitos, key=lambda x: x["id"]):
+        hito_por_campo_dato.setdefault(h["campo_dato"], h)
+
+    # OJO: memoizado por ID de hito, NO por campo_dato. Si dos hitos activos
+    # comparten el mismo campo_dato (config invalida), cada uno igual debe
+    # mostrar SU PROPIA fecha esperada (su propio ancla/dias) en la salida;
+    # solo la resolucion de "quien es el ancla de un dependiente" usa el
+    # hito canonico (hito_por_campo_dato, el de menor id). Memoizar por
+    # campo_dato colapsaria ambos usos y el primero en resolverse "ganaria"
+    # para todos los demas que compartan ese campo_dato.
+    fecha_esperada_resuelta: dict = {}
+
+    def resolver_esperada(hito, visitados=None):
+        hito_id = hito["id"]
+        if hito_id in fecha_esperada_resuelta:
+            return fecha_esperada_resuelta[hito_id]
+        visitados = visitados or set()
+        if hito_id in visitados:
+            fecha_esperada_resuelta[hito_id] = None  # referencia circular -- no resoluble
+            return None
+        visitados = visitados | {hito_id}
+
+        ancla = hito["campo_ancla"]
+        if not ancla:
+            base = _a_date(embarque["created_at"])
+        elif ancla in hito_por_campo_dato:
+            base = resolver_esperada(hito_por_campo_dato[ancla], visitados)
+            if base is None:
+                fecha_esperada_resuelta[hito_id] = None
+                return None
+        else:
+            # Ancla "disparador": no es un hito con fecha esperada propia --
+            # se usa su fecha REAL capturada, si existe.
+            real_ancla = capturado_en.get(ancla)
+            if real_ancla is None:
+                fecha_esperada_resuelta[hito_id] = None
+                return None
+            base = _a_date(real_ancla)
+
+        resultado = base + timedelta(days=int(hito["dias_esperados"]))
+        fecha_esperada_resuelta[hito_id] = resultado
+        return resultado
+
+    salida = []
+    for hito in hitos:
+        esperada = resolver_esperada(hito)
+        real = capturado_en.get(hito["campo_dato"])
+        real_date = _a_date(real) if real is not None else None
+
+        if esperada is None:
+            estado, dias_diferencia = "pendiente", None
+        elif real_date is None:
+            # No hay registro de CUANDO se llenó, pero puede que el campo ya
+            # tenga un valor de antes de que existiera esta auditoría (dato
+            # capturado antes de que el rastreo de historial arrancara) --
+            # no reportarlo como "en_espera" (daría a entender que sigue
+            # vacío) cuando en realidad ya está lleno, solo que no se sabe
+            # la fecha exacta de captura.
+            if not _es_valor_vacio(embarque.get(hito["campo_dato"])):
+                estado, dias_diferencia = "sin_historial", None
+            else:
+                estado, dias_diferencia = "en_espera", None
+        else:
+            dias_diferencia = (esperada - real_date).days
+            if dias_diferencia > 0:
+                estado = "adelantado"
+            elif dias_diferencia < 0:
+                estado = "atrasado"
+            else:
+                estado = "a_tiempo"
+
+        salida.append({
+            "id": hito["id"], "seccion": hito["seccion"], "orden_hito": hito["orden_hito"],
+            "etiqueta": hito["etiqueta"], "campo_dato": hito["campo_dato"],
+            "fecha_esperada": esperada.isoformat() if esperada else None,
+            "fecha_real": real_date.isoformat() if real_date else None,
+            "estado": estado, "dias_diferencia": dias_diferencia,
+        })
+    return salida
+
+
+def _calcular_auditoria_resumen(conn) -> list[dict]:
+    """Auditoria de TODOS los embarques (menos los eliminados) de un
+    vistazo: para cada uno agrega el conteo por estado y el desglose
+    completo de hitos (mismo shape que _calcular_auditoria), reutilizando
+    _calcular_auditoria() por embarque. El desglose completo es lo que usa
+    el frontend para pintar la tarjeta de pipeline por embarque; el conteo
+    queda para badges/orden rapido."""
+    cursor = conn.cursor(dictionary=True)
+    cursor.execute("""
+        SELECT id, referencia, nombre, created_at FROM importaciones
+        WHERE estado != 'eliminado'
+        ORDER BY created_at DESC
+    """)
+    embarques = cursor.fetchall()
+
+    resumen = []
+    for emb in embarques:
+        if emb.get("created_at") is None:
+            # Dato faltante/corrupto -- se omite esta fila en vez de tumbar
+            # el resumen completo con un 500 por un solo embarque malo.
+            logging.warning(
+                "Embarque %s sin created_at -- omitido del resumen de auditoria", emb.get("id")
+            )
+            continue
+        hitos = _calcular_auditoria(emb["id"], conn)
+        conteo = {"atrasados": 0, "adelantados": 0, "a_tiempo": 0, "pendientes": 0, "en_espera": 0, "sin_historial": 0}
+        clave_por_estado = {
+            "atrasado": "atrasados", "adelantado": "adelantados", "a_tiempo": "a_tiempo",
+            "pendiente": "pendientes", "en_espera": "en_espera", "sin_historial": "sin_historial",
+        }
+        for h in hitos:
+            clave = clave_por_estado.get(h["estado"])
+            if clave:
+                conteo[clave] += 1
+        resumen.append({
+            "id": emb["id"], "referencia": emb["referencia"], "nombre": emb["nombre"],
+            "creado_en": _a_date(emb["created_at"]).isoformat(),
+            **conteo,
+            "hitos": hitos,
+        })
+    return resumen
 
 
 
@@ -654,6 +861,57 @@ def inicializar_tablas():
         )
         conn.commit()
 
+        # Historial de primera captura por campo -- alimenta la auditoria de
+        # llenado del embarque. Tabla de proposito general: sirve para estos
+        # hitos y para cualquier auditoria futura ("quien capturo que y
+        # cuando"), no se acopla a los hitos configurados.
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS importaciones_historial_campos (
+                id               INT AUTO_INCREMENT PRIMARY KEY,
+                importacion_id   INT NOT NULL,
+                campo            VARCHAR(100) NOT NULL,
+                valor_anterior   TEXT,
+                valor_nuevo      TEXT,
+                capturado_en     TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                usuario_id       INT,
+                INDEX idx_importacion_campo (importacion_id, campo),
+                FOREIGN KEY (importacion_id) REFERENCES importaciones(id) ON DELETE CASCADE
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+        """)
+        conn.commit()
+
+        # Hitos configurables de la auditoria (seccion -> campo esperado en N
+        # dias desde un ancla). Editable desde /importaciones/hitos-auditoria,
+        # mismo patron que importaciones_tiempos_estimados.
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS importaciones_hitos_auditoria (
+                id               INT AUTO_INCREMENT PRIMARY KEY,
+                seccion          VARCHAR(30) NOT NULL,
+                orden_hito       INT NOT NULL,
+                etiqueta         VARCHAR(150) NOT NULL,
+                campo_dato       VARCHAR(100) NOT NULL,
+                campo_ancla      VARCHAR(100),
+                dias_esperados   INT NOT NULL DEFAULT 0,
+                activo           TINYINT(1) NOT NULL DEFAULT 1,
+                created_at       TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at       TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+        """)
+        conn.commit()
+
+        # Semilla inicial de los 20 hitos -- solo si la tabla todavia esta
+        # vacia, para que correr este endpoint varias veces (ej. en cada
+        # despliegue) nunca duplique filas.
+        cursor.execute("SELECT COUNT(*) FROM importaciones_hitos_auditoria")
+        if cursor.fetchone()[0] == 0:
+            cursor.executemany(
+                "INSERT INTO importaciones_hitos_auditoria "
+                "(seccion, orden_hito, etiqueta, campo_dato, campo_ancla, dias_esperados) "
+                "VALUES (%s, %s, %s, %s, %s, %s)",
+                _HITOS_SEED,
+            )
+            conn.commit()
+
         return jsonify({"ok": True, "mensaje": "Tabla importaciones creada/verificada"}), 201
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -794,6 +1052,194 @@ def eliminar_tiempo_estimado(id_regla):
         return jsonify({"ok": True}), 200
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+    finally:
+        conn.close()
+
+
+# ── Hitos de auditoría de llenado (sección → días esperados desde un ancla) ──
+# Alimentan _calcular_auditoria(). Pantalla de administración en el frontend:
+# /importaciones/hitos-auditoria
+
+_SECCIONES_HITOS = {
+    "logistica", "importacion", "despacho", "odoo",
+    "almacen", "recepcion", "cierre", "costos",
+}
+
+# Semilla inicial de los 20 hitos (seccion, orden_hito, etiqueta, campo_dato,
+# campo_ancla, dias_esperados), en el mismo orden en que el usuario los dio
+# -- _calcular_auditoria() lista por id ascendente, así que este orden de
+# inserción ES el orden en que se muestran en el pipeline de auditoría.
+# Sembrada de forma idempotente desde inicializar_tablas() (ver ahí).
+_HITOS_SEED = [
+    ("logistica",    1, "1. Importador",                                   "odoo_importador",              None,                              0),
+    ("costos",       1, "Flete proyectado (USD)",                          "cos_flete_proyectado_usd",     None,                              0),
+    ("logistica",    2, "9. Confirmación de cotización y forwarder",       "log_confirmacion_cotizacion",  None,                              7),
+    ("logistica",    3, "18. Contenedores",                                "log_contenedor",               "log_fecha_entrega",              1),
+    ("importacion",  1, "1. Fecha de entrega de traducción al RBF",        "imp_fecha_traduccion",         "log_fecha_entrega",              10),
+    ("odoo",         1, "1. Recepción de documentos",                      "log_recepcion_documentos",     "log_fecha_entrega",              2),
+    ("odoo",         2, "6. Folios de orden de compra",                    "odoo_folio_orden",             "log_recepcion_documentos",       10),
+    ("importacion",  2, "18. Recepción de draft de pedimento",             "imp_recepcion_draft_pedimento","imp_llegada_contenedor_puerto",  5),
+    ("importacion",  3, "34. Fecha de pago de pedimento",                  "imp_fecha_pago_pedimento",     "imp_pedimento_revisado",         4),
+    ("despacho",     1, "1. Solicitud de cita para cruce",                 "des_solicitud_cita_cruce",     "imp_fecha_pago_pedimento",       1),
+    ("almacen",      1, "1. Base de datos para etiquetas",                 "alm_base_datos_etiquetas",     "imp_fecha_pago_pedimento",       2),
+    ("despacho",     2, "9. Llegada de contenedor a almacén",              "des_llegada_almacen",          "des_fecha_cruce_real",           2),
+    ("despacho",     3, "15. Recepción de documento EIR",                  "des_recepcion_eir",            "des_fecha_cruce_real",           3),
+    ("almacen",      2, "6. Envío de información a la UVA (Real)",         "alm_envio_info_uva",           "des_llegada_almacen",            2),
+    ("almacen",      3, "10. Fecha de terminación de etiquetado (Real)",   "alm_terminacion_etiquetado",   "alm_inicio_etiquetado",          3),
+    ("recepcion",    1, "Cédula de costeo de IGI",                         "rec_cedula_costeo",            "des_llegada_almacen",            2),
+    ("recepcion",    2, "Liberación final del producto",                   "rec_liberacion_final",         "rec_liberacion_verificacion",    1),
+    ("costos",       3, "Costos reales",                                   "cos_tipo_cambio_pedimento",    "des_fecha_cruce_real",           10),
+    ("cierre",       1, "1. Recepción de cuentas de gastos",                "cie_recepcion_cuenta_gastos",  "cos_tipo_cambio_pedimento",       2),
+    ("cierre",       2, "Fecha de pago a agente aduanal",                  "cie_fecha_pago_aa",            "cie_recepcion_cuenta_gastos",    4),
+]
+
+
+def _validar_payload_hito(data: dict) -> str | None:
+    if str(data.get("seccion") or "").strip() not in _SECCIONES_HITOS:
+        return "Sección inválida"
+    if not str(data.get("etiqueta") or "").strip():
+        return "Falta la etiqueta"
+    if str(data.get("campo_dato") or "").strip() not in _COLS_PERMITIDAS:
+        return "'campo_dato' debe ser una columna válida del formulario"
+    campo_ancla = data.get("campo_ancla")
+    if campo_ancla and str(campo_ancla).strip() not in _COLS_PERMITIDAS:
+        return "'campo_ancla' debe ser una columna válida del formulario (o vacío = Alta de embarque)"
+    try:
+        if int(data.get("dias_esperados")) < 0:
+            return "'dias_esperados' no puede ser negativo"
+    except (TypeError, ValueError):
+        return "'dias_esperados' debe ser un número entero de días"
+    try:
+        int(data.get("orden_hito"))
+    except (TypeError, ValueError):
+        return "'orden_hito' debe ser un número entero"
+    return None
+
+
+@importaciones_bp.route("/hitos-auditoria", methods=["GET"])
+def listar_hitos_auditoria():
+    conn = obtener_conexion()
+    if not conn:
+        return jsonify({"error": "Sin conexion a BD"}), 500
+    try:
+        cursor = conn.cursor(dictionary=True)
+        cursor.execute(
+            "SELECT * FROM importaciones_hitos_auditoria ORDER BY seccion, orden_hito"
+        )
+        return jsonify([_serialize(r) for r in cursor.fetchall()]), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    finally:
+        conn.close()
+
+
+@importaciones_bp.route("/hitos-auditoria", methods=["POST"])
+def crear_hito_auditoria():
+    data = request.get_json() or {}
+    error = _validar_payload_hito(data)
+    if error:
+        return jsonify({"error": error}), 400
+
+    conn = obtener_conexion()
+    if not conn:
+        return jsonify({"error": "Sin conexion a BD"}), 500
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            "INSERT INTO importaciones_hitos_auditoria "
+            "(seccion, orden_hito, etiqueta, campo_dato, campo_ancla, dias_esperados, activo) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s)",
+            (
+                data["seccion"].strip(), int(data["orden_hito"]), data["etiqueta"].strip(),
+                data["campo_dato"].strip(),
+                (data.get("campo_ancla") or "").strip() or None,
+                int(data["dias_esperados"]), 1 if data.get("activo", True) else 0,
+            ),
+        )
+        conn.commit()
+        return jsonify({"ok": True, "id": cursor.lastrowid}), 201
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    finally:
+        conn.close()
+
+
+@importaciones_bp.route("/hitos-auditoria/<int:id_hito>", methods=["PUT"])
+def actualizar_hito_auditoria(id_hito):
+    data = request.get_json() or {}
+    error = _validar_payload_hito(data)
+    if error:
+        return jsonify({"error": error}), 400
+
+    conn = obtener_conexion()
+    if not conn:
+        return jsonify({"error": "Sin conexion a BD"}), 500
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            "UPDATE importaciones_hitos_auditoria SET "
+            "seccion = %s, orden_hito = %s, etiqueta = %s, campo_dato = %s, "
+            "campo_ancla = %s, dias_esperados = %s, activo = %s WHERE id = %s",
+            (
+                data["seccion"].strip(), int(data["orden_hito"]), data["etiqueta"].strip(),
+                data["campo_dato"].strip(),
+                (data.get("campo_ancla") or "").strip() or None,
+                int(data["dias_esperados"]), 1 if data.get("activo", True) else 0,
+                id_hito,
+            ),
+        )
+        conn.commit()
+        if cursor.rowcount == 0:
+            return jsonify({"error": "No encontrado"}), 404
+        return jsonify({"ok": True}), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    finally:
+        conn.close()
+
+
+@importaciones_bp.route("/hitos-auditoria/<int:id_hito>", methods=["DELETE"])
+def eliminar_hito_auditoria(id_hito):
+    conn = obtener_conexion()
+    if not conn:
+        return jsonify({"error": "Sin conexion a BD"}), 500
+    try:
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM importaciones_hitos_auditoria WHERE id = %s", (id_hito,))
+        conn.commit()
+        if cursor.rowcount == 0:
+            return jsonify({"error": "No encontrado"}), 404
+        return jsonify({"ok": True}), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    finally:
+        conn.close()
+
+
+@importaciones_bp.route("/<int:id_imp>/auditoria", methods=["GET"])
+def obtener_auditoria(id_imp):
+    conn = obtener_conexion()
+    if not conn:
+        return jsonify({"error": "Sin conexion a BD"}), 500
+    try:
+        return jsonify(_calcular_auditoria(id_imp, conn)), 200
+    except Exception as e:
+        logging.exception("Error calculando auditoria del embarque %s: %s", id_imp, e)
+        return jsonify({"error": "No se pudo calcular la auditoría"}), 500
+    finally:
+        conn.close()
+
+
+@importaciones_bp.route("/auditoria-resumen", methods=["GET"])
+def obtener_auditoria_resumen():
+    conn = obtener_conexion()
+    if not conn:
+        return jsonify({"error": "Sin conexion a BD"}), 500
+    try:
+        return jsonify(_calcular_auditoria_resumen(conn)), 200
+    except Exception as e:
+        logging.exception("Error calculando el resumen de auditoria: %s", e)
+        return jsonify({"error": "No se pudo calcular el resumen de auditoría"}), 500
     finally:
         conn.close()
 
@@ -1594,6 +2040,20 @@ def actualizar(id_imp):
         vals.append(id_imp)
         cursor.execute(f"UPDATE importaciones SET {set_clause} WHERE id = %s", vals)
         conn.commit()
+
+        # El historial de auditoria es secundario al guardado principal (que
+        # ya tiene commit arriba) -- si esto truena (ej. la tabla todavia no
+        # existe en un servidor donde no se corrio /inicializar-tablas antes
+        # del despliegue), no debe verse como un 500 para quien esta
+        # guardando el formulario, cuyo dato real ya quedo persistido.
+        try:
+            _registrar_primera_captura(cursor, id_imp, existing, merged, campos_a_actualizar)
+            conn.commit()
+        except Exception:
+            logging.exception(
+                "No se pudo registrar el historial de auditoria para importacion %s", id_imp
+            )
+            conn.rollback()
 
         # ── Auto-transición de estado según progreso global ───────────────────
         cursor.execute("SELECT * FROM importaciones WHERE id = %s", (id_imp,))
