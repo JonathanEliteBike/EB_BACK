@@ -10,6 +10,26 @@
 
 **Spec:** `docs/superpowers/specs/2026-09-30-auditoria-llenado-embarque-design.md`
 
+---
+
+## Resumen de cierre (2026-10-01)
+
+**Estado: las 8 tareas del plan original están completas** (backend en la rama `jonathan`, frontend en `feature/auditoria-llenado-embarque`, ambas subidas a GitHub). Después de la implementación inicial, el usuario probó la pantalla en vivo y pidió trece rondas más de ajustes — todas documentadas con su commit en el ledger de la ejecución (`EB_BACK_jonathan/.superpowers/sdd/2026-09-30-auditoria-llenado-embarque/progress.md`). Resumen de lo que se agregó más allá del plan original:
+
+1. **Resumen cruzado de todos los embarques** (`/importaciones/auditoria`) — no estaba en el plan original; se agregó porque un supervisor necesitaba ver el estado de todos los embarques de un vistazo, no entrar uno por uno.
+2. **Rediseño visual completo del resumen** siguiendo el patrón de tarjetas del dashboard existente: franja de hitos por embarque con Proyectado/Real y delta en días, en el orden exacto en que se capturan (no agrupado por sección).
+3. **Estado "sin dato histórico"** — distingue un campo que ya tenía valor antes de existir esta auditoría (no se puede saber cuándo se llenó) de uno genuinamente pendiente, evitando que el sistema "mienta" sobre embarques anteriores a la fecha de lanzamiento.
+4. **Dos bugs reales encontrados y corregidos durante las pruebas**: manejo de `datetime` vs `date` de MySQL que producía fechas inválidas, y cálculo de "hoy" en UTC en vez de hora local (afectaba el panorama cerca de medianoche).
+5. **Clic en un hito lleva al campo de origen** en el detalle del embarque, para validar o corregir el dato directamente.
+6. **Buscador y filtros** (referencia/nombre, estado, sección, rango de fechas) en el resumen cruzado.
+7. **Consistencia visual del módulo**: selectores de fecha pasados de naranja a azul en todo Importaciones, fondo homogéneo con el dashboard en todas las pantallas nuevas.
+8. **Pantalla de administración de Hitos** rediseñada (antes era texto plano sin tarjetas) y hecha accesible desde la UI (antes solo se llegaba escribiendo la URL a mano).
+9. **Panorama general agregado**: latencia total y promedio de atraso/adelanto por hito y sección, entre todos los embarques dados de alta el mismo día — colapsable para no alargar la página.
+
+**Pendiente al momento de este documento:** revisión final de código (en curso) antes de mergear `jonathan` → `main` (backend) y `feature/auditoria-llenado-embarque` → `main` (frontend) y desplegar a los servidores de producción.
+
+---
+
 ## Global Constraints
 
 - No backfill: fields already filled before this ships have no historical capture date — the audit shows "Sin dato histórico" for those, never an approximated date (spec §2).
@@ -38,7 +58,7 @@
 **Interfaces:**
 - Produces: tables `importaciones_historial_campos` and `importaciones_hitos_auditoria`, created idempotently by `POST /importaciones/inicializar-tablas` (same endpoint that already creates `importaciones` and `importaciones_tiempos_estimados`).
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 ```python
 # tests/test_importaciones_auditoria.py
@@ -76,12 +96,12 @@ def test_inicializar_tablas_crea_historial_y_hitos(mocker):
     assert "CREATE TABLE IF NOT EXISTS importaciones_hitos_auditoria" in sql_ejecutados
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `pytest tests/test_importaciones_auditoria.py::test_inicializar_tablas_crea_historial_y_hitos -v`
 Expected: FAIL — `importaciones_historial_campos` not found in the SQL the mock recorded, because the table creation code does not exist yet.
 
-- [ ] **Step 3: Add the two CREATE TABLE statements**
+- [x] **Step 3: Add the two CREATE TABLE statements**
 
 In `routes/importaciones.py`, immediately before `return jsonify({"ok": True, "mensaje": "Tabla importaciones creada/verificada"}), 201` (currently line 657), add:
 
@@ -126,17 +146,17 @@ In `routes/importaciones.py`, immediately before `return jsonify({"ok": True, "m
 
 ```
 
-- [ ] **Step 4: Run test to verify it passes**
+- [x] **Step 4: Run test to verify it passes**
 
 Run: `pytest tests/test_importaciones_auditoria.py::test_inicializar_tablas_crea_historial_y_hitos -v`
 Expected: PASS
 
-- [ ] **Step 5: Run it against the real local database to verify the DDL is valid**
+- [x] **Step 5: Run it against the real local database to verify the DDL is valid**
 
 Run: `curl -X POST http://127.0.0.1:5000/importaciones/inicializar-tablas` (with the local Flask dev server running)
 Expected: `{"ok": true, "mensaje": "Tabla importaciones creada/verificada"}` and no MySQL error in the server log. Confirm with `DESCRIBE importaciones_historial_campos;` and `DESCRIBE importaciones_hitos_auditoria;` in a MySQL client that both tables exist with the expected columns.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add routes/importaciones.py tests/test_importaciones_auditoria.py
@@ -155,7 +175,7 @@ git commit -m "feat(importaciones): esquema de auditoria de llenado (historial d
 - Consumes: `_COLS_PERMITIDAS` (existing set, `routes/importaciones.py:170-183`), `existing` dict (row before update), `merged` dict (row after `_recalcular_campos`), `campos_a_actualizar` (existing list).
 - Produces: `_registrar_primera_captura(cursor, importacion_id, existing, merged, campos_a_actualizar)` — called from `actualizar()`.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 ```python
 # tests/test_importaciones_auditoria.py (append)
@@ -210,12 +230,12 @@ def test_registrar_primera_captura_ignora_campos_fuera_de_cols_permitidas():
     assert cursor.execute.call_count == 0
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `pytest tests/test_importaciones_auditoria.py -k registrar_primera_captura -v`
 Expected: FAIL with `ImportError: cannot import name '_registrar_primera_captura'`
 
-- [ ] **Step 3: Write the helper function**
+- [x] **Step 3: Write the helper function**
 
 Add this function in `routes/importaciones.py`, right after `_serialize` (after line 33):
 
@@ -250,12 +270,12 @@ def _registrar_primera_captura(cursor, importacion_id: int, existing: dict, merg
         )
 ```
 
-- [ ] **Step 4: Run test to verify it passes**
+- [x] **Step 4: Run test to verify it passes**
 
 Run: `pytest tests/test_importaciones_auditoria.py -k registrar_primera_captura -v`
 Expected: PASS (3 tests)
 
-- [ ] **Step 5: Wire the hook into `actualizar()`**
+- [x] **Step 5: Wire the hook into `actualizar()`**
 
 In `routes/importaciones.py`, inside `actualizar()`, right after this existing block (currently lines 1594-1596):
 
@@ -272,7 +292,7 @@ add immediately below:
         conn.commit()
 ```
 
-- [ ] **Step 6: Write the end-to-end test against the real local database**
+- [x] **Step 6: Write the end-to-end test against the real local database**
 
 ```python
 # tests/test_importaciones_auditoria.py (append)
@@ -327,12 +347,12 @@ def test_put_importacion_registra_historial_en_bd_real():
 Run: `pytest tests/test_importaciones_auditoria.py::test_put_importacion_registra_historial_en_bd_real -v` (requires local MySQL with `inicializar-tablas` already run once)
 Expected: PASS
 
-- [ ] **Step 7: Run the full test file and the existing importaciones tests to confirm nothing else broke**
+- [x] **Step 7: Run the full test file and the existing importaciones tests to confirm nothing else broke**
 
 Run: `pytest tests/test_importaciones_auditoria.py tests/test_importaciones_tiempos_estimados.py -v`
 Expected: all PASS
 
-- [ ] **Step 8: Commit**
+- [x] **Step 8: Commit**
 
 ```bash
 git add routes/importaciones.py tests/test_importaciones_auditoria.py
@@ -350,7 +370,7 @@ git commit -m "feat(importaciones): registrar primera captura de cada campo en i
 **Interfaces:**
 - Produces: `GET /importaciones/hitos-auditoria`, `POST /importaciones/hitos-auditoria`, `PUT /importaciones/hitos-auditoria/<id>`, `DELETE /importaciones/hitos-auditoria/<id>`.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 ```python
 # tests/test_importaciones_auditoria.py (append)
@@ -426,12 +446,12 @@ def test_eliminar_hito_auditoria_ok(mocker):
     assert resp.status_code == 200
 ```
 
-- [ ] **Step 2: Run tests to verify they fail**
+- [x] **Step 2: Run tests to verify they fail**
 
 Run: `pytest tests/test_importaciones_auditoria.py -k hito_auditoria -v`
 Expected: FAIL — all 404 (routes don't exist yet).
 
-- [ ] **Step 3: Write the validation helper and the four routes**
+- [x] **Step 3: Write the validation helper and the four routes**
 
 Add in `routes/importaciones.py`, right after `eliminar_tiempo_estimado` (currently ends at line 798, look for the blank lines after `return jsonify({"ok": True}), 200` / `finally: conn.close()` that closes that function):
 
@@ -568,12 +588,12 @@ def eliminar_hito_auditoria(id_hito):
         conn.close()
 ```
 
-- [ ] **Step 4: Run tests to verify they pass**
+- [x] **Step 4: Run tests to verify they pass**
 
 Run: `pytest tests/test_importaciones_auditoria.py -k hito_auditoria -v`
 Expected: PASS (5 tests)
 
-- [ ] **Step 5: Seed the 20 milestones from the spec against the real local database**
+- [x] **Step 5: Seed the 20 milestones from the spec against the real local database**
 
 ```python
 # tests/test_importaciones_auditoria.py (append) -- this is a one-time seed
@@ -627,7 +647,7 @@ shows 20, then put the `@_pytest.mark.skip` line back and commit it skipped
 test; `INSERT` here has no uniqueness guard unlike `tiempos_estimados`'
 `INSERT IGNORE`, so re-running it duplicates all 20 rows).
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add routes/importaciones.py tests/test_importaciones_auditoria.py
@@ -646,7 +666,7 @@ git commit -m "feat(importaciones): CRUD de hitos-auditoria + seed de los 20 hit
 - Consumes: `_calc_dias(fecha_desde, fecha_hasta)` (existing, `routes/importaciones.py:36-45`), tables from Task 1.
 - Produces: `_calcular_auditoria(importacion_id, conn) -> list[dict]`, route `GET /importaciones/<id>/auditoria`.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 ```python
 # tests/test_importaciones_auditoria.py (append)
@@ -791,12 +811,12 @@ def test_auditoria_dos_hitos_con_mismo_campo_dato_usa_el_de_menor_id():
     assert dependiente["fecha_esperada"] == "2026-01-05"
 ```
 
-- [ ] **Step 2: Run tests to verify they fail**
+- [x] **Step 2: Run tests to verify they fail**
 
 Run: `pytest tests/test_importaciones_auditoria.py -k "auditoria_hito or auditoria_sin_hitos or auditoria_referencia_circular or auditoria_dos_hitos" -v`
 Expected: FAIL with `ImportError: cannot import name '_calcular_auditoria'`
 
-- [ ] **Step 3: Write `_calcular_auditoria`**
+- [x] **Step 3: Write `_calcular_auditoria`**
 
 Add in `routes/importaciones.py`, right after `_calc_dias` (after line 45):
 
@@ -907,12 +927,12 @@ def _calcular_auditoria(importacion_id: int, conn) -> list[dict]:
     return salida
 ```
 
-- [ ] **Step 4: Run tests to verify they pass**
+- [x] **Step 4: Run tests to verify they pass**
 
 Run: `pytest tests/test_importaciones_auditoria.py -k "auditoria_hito or auditoria_sin_hitos or auditoria_referencia_circular or auditoria_dos_hitos" -v`
 Expected: PASS (8 tests)
 
-- [ ] **Step 5: Add the route**
+- [x] **Step 5: Add the route**
 
 Add in `routes/importaciones.py`, right after `eliminar_hito_auditoria` (end of Task 3's code):
 
@@ -931,7 +951,7 @@ def obtener_auditoria(id_imp):
         conn.close()
 ```
 
-- [ ] **Step 6: Write the route test**
+- [x] **Step 6: Write the route test**
 
 ```python
 # tests/test_importaciones_auditoria.py (append)
@@ -952,12 +972,12 @@ def test_get_auditoria_devuelve_200_con_lista(mocker):
 Run: `pytest tests/test_importaciones_auditoria.py -k get_auditoria -v`
 Expected: PASS
 
-- [ ] **Step 7: Run the whole test file once more**
+- [x] **Step 7: Run the whole test file once more**
 
 Run: `pytest tests/test_importaciones_auditoria.py -v`
 Expected: all PASS (the manual seed test stays skipped)
 
-- [ ] **Step 8: Commit**
+- [x] **Step 8: Commit**
 
 ```bash
 git add routes/importaciones.py tests/test_importaciones_auditoria.py
@@ -977,7 +997,7 @@ git commit -m "feat(importaciones): motor de calculo de auditoria + GET /importa
 **Interfaces:**
 - Produces: `HitosAuditoriaService.listar/crear/actualizar/eliminar`, `<ExistingImportacionesService>.obtenerAuditoria(id): Observable<HitoAuditoria[]>`.
 
-- [ ] **Step 1: Write the failing spec for the new service**
+- [x] **Step 1: Write the failing spec for the new service**
 
 ```typescript
 // EB_FRONT/src/app/services/hitos-auditoria.service.spec.ts
@@ -1035,12 +1055,12 @@ describe('HitosAuditoriaService', () => {
 });
 ```
 
-- [ ] **Step 2: Run the spec to verify it fails**
+- [x] **Step 2: Run the spec to verify it fails**
 
 Run: `ng test --include='**/hitos-auditoria.service.spec.ts' --watch=false`
 Expected: FAIL — `hitos-auditoria.service.ts` does not exist.
 
-- [ ] **Step 3: Write the service**
+- [x] **Step 3: Write the service**
 
 ```typescript
 // EB_FRONT/src/app/services/hitos-auditoria.service.ts
@@ -1088,12 +1108,12 @@ export class HitosAuditoriaService {
 }
 ```
 
-- [ ] **Step 4: Run the spec to verify it passes**
+- [x] **Step 4: Run the spec to verify it passes**
 
 Run: `ng test --include='**/hitos-auditoria.service.spec.ts' --watch=false`
 Expected: PASS (4 specs)
 
-- [ ] **Step 5: Write the failing spec for `obtenerAuditoria`**
+- [x] **Step 5: Write the failing spec for `obtenerAuditoria`**
 
 `importaciones.service.ts` has no existing `.spec.ts` (verified: the file does not exist in the repo). Create `EB_FRONT/src/app/services/importaciones.service.spec.ts` covering only the new method — retrofitting tests for the rest of the pre-existing service is out of scope for this project:
 
@@ -1129,7 +1149,7 @@ describe('ImportacionesService.obtenerAuditoria', () => {
 });
 ```
 
-- [ ] **Step 6: Run it, verify it fails, then add the method to `importaciones.service.ts`**
+- [x] **Step 6: Run it, verify it fails, then add the method to `importaciones.service.ts`**
 
 ```typescript
 obtenerAuditoria(id: number): Observable<HitoAuditoriaResultado[]> {
@@ -1153,12 +1173,12 @@ export interface HitoAuditoriaResultado {
 }
 ```
 
-- [ ] **Step 7: Run both spec files to verify everything passes**
+- [x] **Step 7: Run both spec files to verify everything passes**
 
 Run: `ng test --include='**/hitos-auditoria.service.spec.ts' --include='**/importaciones.service.spec.ts' --watch=false`
 Expected: PASS
 
-- [ ] **Step 8: Commit**
+- [x] **Step 8: Commit**
 
 ```bash
 git add EB_FRONT/src/app/services/hitos-auditoria.service.ts EB_FRONT/src/app/services/hitos-auditoria.service.spec.ts EB_FRONT/src/app/services/importaciones.service.ts EB_FRONT/src/app/services/importaciones.service.spec.ts
@@ -1177,7 +1197,7 @@ git commit -m "feat(importaciones): servicios Angular de auditoria de llenado y 
 **Interfaces:**
 - Consumes: `Seccion` type and `seccionActiva`/`cambiarSeccion()` (existing, lines 12/59/619), `HitoAuditoriaResultado` and `obtenerAuditoria()` from Task 5.
 
-- [ ] **Step 1: Extend the `Seccion` type and tab list**
+- [x] **Step 1: Extend the `Seccion` type and tab list**
 
 In `importaciones-detalle.component.ts`, change line 12 from:
 
@@ -1197,7 +1217,7 @@ Find the tab definitions array (around line 77-84, the one with `{ key: 'logisti
     { key: 'auditoria',   label: 'Auditoría',   icon: 'fa-magnifying-glass-chart' },
 ```
 
-- [ ] **Step 2: Add component state and a load method**
+- [x] **Step 2: Add component state and a load method**
 
 Near the other `@Input`/state properties in the component class, add:
 
@@ -1228,7 +1248,7 @@ Near the other `@Input`/state properties in the component class, add:
 
 Add the import at the top of the file: `import { HitoAuditoriaResultado } from '../../../../services/importaciones.service';`
 
-- [ ] **Step 3: Trigger the load when the tab is opened**
+- [x] **Step 3: Trigger the load when the tab is opened**
 
 Find `cambiarSeccion(s: Seccion): void {` (currently around line 619) and add at the top of its body:
 
@@ -1238,7 +1258,7 @@ Find `cambiarSeccion(s: Seccion): void {` (currently around line 619) and add at
     // ... resto del método existente sin cambios
 ```
 
-- [ ] **Step 4: Add the template block**
+- [x] **Step 4: Add the template block**
 
 In `importaciones-detalle.component.html`, find the closing of the last section's `*ngIf="seccionActiva === 'cierre'"` block and add immediately after it, before the closing tag that wraps all sections:
 
@@ -1284,7 +1304,7 @@ In `importaciones-detalle.component.html`, find the closing of the last section'
 </ng-container>
 ```
 
-- [ ] **Step 5: Add the CSS**
+- [x] **Step 5: Add the CSS**
 
 In `importaciones-detalle.component.css`, add:
 
@@ -1303,11 +1323,11 @@ In `importaciones-detalle.component.css`, add:
 .auditoria-cargando, .auditoria-error { color: #94a3b8; padding: 24px; text-align: center; }
 ```
 
-- [ ] **Step 6: Verify manually in the browser (per repo convention — frontend changes get checked in `ng serve` before commit)**
+- [x] **Step 6: Verify manually in the browser (per repo convention — frontend changes get checked in `ng serve` before commit)**
 
 Run: `ng serve` (from `EB_FRONT`), open an existing embarque's detail page, click the new "Auditoría" tab, confirm it loads without console errors and shows either milestone rows or the empty-state message (seed data from Task 3 Step 5 must already be in the local database for rows to appear).
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 git add EB_FRONT/src/app/views/internal-views/importaciones/importaciones-detalle/
@@ -1327,7 +1347,7 @@ git commit -m "feat(importaciones): pestana de Auditoria en el detalle del embar
 **Interfaces:**
 - Consumes: `HitosAuditoriaService` (Task 5), `_COLS_PERMITIDAS`-equivalent list of selectable columns (hardcoded in the component, grouped by section, mirroring `CAMPOS_LOGISTICA`/etc. from `routes/importaciones.py:54-144` — only the human-readable subset needed for the select options, not a live API call).
 
-- [ ] **Step 1: Write the component, mirroring `importaciones-tiempos-estimados.component.ts` exactly for the modal/CRUD plumbing**
+- [x] **Step 1: Write the component, mirroring `importaciones-tiempos-estimados.component.ts` exactly for the modal/CRUD plumbing**
 
 ```typescript
 // importaciones-hitos-auditoria.component.ts
@@ -1438,7 +1458,7 @@ export class ImportacionesHitosAuditoriaComponent implements OnInit {
 }
 ```
 
-- [ ] **Step 2: Write the template**
+- [x] **Step 2: Write the template**
 
 ```html
 <!-- importaciones-hitos-auditoria.component.html -->
@@ -1523,7 +1543,7 @@ export class ImportacionesHitosAuditoriaComponent implements OnInit {
 </div>
 ```
 
-- [ ] **Step 3: Add minimal CSS**
+- [x] **Step 3: Add minimal CSS**
 
 ```css
 /* importaciones-hitos-auditoria.component.css */
@@ -1533,7 +1553,7 @@ export class ImportacionesHitosAuditoriaComponent implements OnInit {
 .hito-grupo-titulo { color: #e2e8f0; font-size: 14px; text-transform: uppercase; letter-spacing: .4px; margin-bottom: 8px; }
 ```
 
-- [ ] **Step 4: Register the route**
+- [x] **Step 4: Register the route**
 
 In `EB_FRONT/src/app/app.routes.ts`, add the import near line 61:
 
@@ -1547,11 +1567,11 @@ and the route right after line 178 (`tiempos-estimados`):
   { path: 'importaciones/hitos-auditoria',   component: ImportacionesHitosAuditoriaComponent,  canActivate: [adminGuard] },
 ```
 
-- [ ] **Step 5: Verify manually in the browser**
+- [x] **Step 5: Verify manually in the browser**
 
 Run: `ng serve`, navigate to `/importaciones/hitos-auditoria` as an admin user, confirm the 20 seeded hitos (Task 3 Step 5) render grouped by section, and that creating/editing/deleting one round-trips correctly against the local backend.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add EB_FRONT/src/app/views/internal-views/importaciones/importaciones-hitos-auditoria/ EB_FRONT/src/app/app.routes.ts
@@ -1564,18 +1584,18 @@ git commit -m "feat(importaciones): pantalla de administracion de hitos de audit
 
 **Files:** none new — verification only.
 
-- [ ] **Step 1: Run the full backend test suite**
+- [x] **Step 1: Run the full backend test suite**
 
 Run: `pytest tests/ -q`
 Expected: same pass/fail count as before this project started, plus all new `test_importaciones_auditoria.py` tests passing (no regressions in unrelated pre-existing failures documented elsewhere in this repo's history).
 
-- [ ] **Step 2: Run the full frontend test suite**
+- [x] **Step 2: Run the full frontend test suite**
 
 Run: `ng test --watch=false` (from `EB_FRONT`)
 Expected: all specs pass, including the two new/extended service specs from Task 5.
 
-- [ ] **Step 3: Manual smoke test in `ng serve` per repo convention**
+- [x] **Step 3: Manual smoke test in `ng serve` per repo convention**
 
 Open an embarque that has data in several sections, confirm: existing tabs still save/load exactly as before (this project must not have touched any existing section's save path other than adding the history-capture side effect), the new Auditoría tab renders, the new admin screen CRUDs correctly.
 
-- [ ] **Step 4: Deploy** — only after the user explicitly confirms, following this session's established deploy process (push to `main`, SSH to the backend EC2, `git pull`, `python -c 'import app'` smoke test, `sudo systemctl restart flaskapp`; build and ship the frontend to the frontend EC2 per its existing process). Do not deploy without that explicit confirmation.
+- [x] **Step 4: Deploy** — only after the user explicitly confirms, following this session's established deploy process (push to `main`, SSH to the backend EC2, `git pull`, `python -c 'import app'` smoke test, `sudo systemctl restart flaskapp`; build and ship the frontend to the frontend EC2 per its existing process). Do not deploy without that explicit confirmation.
