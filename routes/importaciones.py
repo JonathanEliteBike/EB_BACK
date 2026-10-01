@@ -40,6 +40,13 @@ def _es_valor_vacio(v) -> bool:
 
 _TZ_MX = timezone(timedelta(hours=-6))  # offset fijo: Mexico elimino el horario de verano en 2022
 
+# Un embarque dado de alta ANTES de esta fecha arranco su proceso bajo
+# reglas/plazos que no existian todavia -- marcarlo "atrasado" contra un
+# plazo calculado retroactivamente con los hitos de esta auditoria seria
+# injusto. Fecha de corte = el dia real en que esto se desplego a
+# produccion (mismo valor que FECHA_INICIO_PANORAMA en el frontend).
+FECHA_CORTE_AUDITORIA = date(2026, 10, 1)
+
 
 def _a_date(v) -> date:
     """Normaliza date/datetime/str ISO a un date plano. datetime.datetime es
@@ -110,6 +117,15 @@ def _calcular_auditoria(importacion_id: int, conn) -> list[dict]:
     embarque = cursor.fetchone()
     if not embarque:
         return []
+
+    # Embarque anterior a la implementacion: ninguno de sus hitos recibe
+    # veredicto de atraso/adelanto (ver FECHA_CORTE_AUDITORIA arriba). Si
+    # created_at falta (dato corrupto, no deberia pasar en produccion) se
+    # trata como posterior al corte -- no hay base para excluirlo.
+    embarque_anterior_al_corte = (
+        embarque.get("created_at") is not None
+        and _a_date(embarque["created_at"]) < FECHA_CORTE_AUDITORIA
+    )
 
     # ORDER BY id, no por seccion/orden_hito: el usuario llena los hitos en
     # el orden en que se los dieron (mezclando secciones), y la vista debe
@@ -188,7 +204,13 @@ def _calcular_auditoria(importacion_id: int, conn) -> list[dict]:
         real = capturado_en.get(hito["campo_dato"])
         real_date = _a_date(real) if real is not None else None
 
-        if esperada is None:
+        if embarque_anterior_al_corte:
+            # Se conserva fecha_real si el campo se llego a capturar (la
+            # captura en si es un dato real, pase cuando pase) -- pero sin
+            # fecha_esperada ni veredicto, porque ese plazo se calculo con
+            # reglas que no existian cuando este embarque arranco.
+            estado, dias_diferencia, esperada = "no_aplica", None, None
+        elif esperada is None:
             estado, dias_diferencia = "pendiente", None
         elif real_date is None:
             # No hay registro de CUANDO se llenó, pero puede que el campo ya
@@ -245,10 +267,14 @@ def _calcular_auditoria_resumen(conn) -> list[dict]:
             )
             continue
         hitos = _calcular_auditoria(emb["id"], conn)
-        conteo = {"atrasados": 0, "adelantados": 0, "a_tiempo": 0, "pendientes": 0, "en_espera": 0, "sin_historial": 0}
+        conteo = {
+            "atrasados": 0, "adelantados": 0, "a_tiempo": 0, "pendientes": 0,
+            "en_espera": 0, "sin_historial": 0, "no_aplica": 0,
+        }
         clave_por_estado = {
             "atrasado": "atrasados", "adelantado": "adelantados", "a_tiempo": "a_tiempo",
             "pendiente": "pendientes", "en_espera": "en_espera", "sin_historial": "sin_historial",
+            "no_aplica": "no_aplica",
         }
         for h in hitos:
             clave = clave_por_estado.get(h["estado"])

@@ -295,6 +295,17 @@ def test_eliminar_hito_auditoria_ok(mocker):
 from routes.importaciones import _calcular_auditoria
 
 
+@pytest.fixture(autouse=True)
+def _cutoff_auditoria_en_el_pasado(mocker):
+    """Las pruebas de este archivo usan created_at: date(2026, 1, 1) como
+    marca generica, sin relacion con la fecha real de corte de produccion
+    (FECHA_CORTE_AUDITORIA) -- se parchea el corte bien atras para que
+    ninguna caiga sin querer en la regla de "embarque anterior a la
+    implementacion". Las pruebas que SI prueban esa regla sobreescriben
+    este parche con su propio mocker.patch."""
+    mocker.patch("routes.importaciones.FECHA_CORTE_AUDITORIA", date(2000, 1, 1))
+
+
 def _conn_mock_auditoria(embarque_row, hitos_rows, historial_rows):
     conn = MagicMock()
     cursor = MagicMock()
@@ -531,6 +542,76 @@ def test_auditoria_disparador_capturado_en_datetime_resuelve_bien():
     assert resultado[0]["estado"] == "en_espera"
 
 
+# ── Embarques anteriores a la implementacion: no reciben veredicto ──────────
+# El usuario senalo que un embarque creado ANTES de que esta auditoria
+# existiera arranco su proceso bajo reglas/plazos que no existian todavia --
+# marcarlo "atrasado" contra un plazo calculado retroactivamente es injusto.
+# Regla acordada: created_at < FECHA_CORTE_AUDITORIA => "no_aplica" siempre,
+# sin importar si el campo ya se lleno, sigue vacio, o se llena despues del
+# despliegue (en ese ultimo caso SI se muestra la fecha real, solo que sin
+# veredicto de adelanto/atraso, porque esa fecha de captura si es real).
+
+def test_auditoria_embarque_anterior_al_corte_campo_vacio_queda_no_aplica(mocker):
+    mocker.patch("routes.importaciones.FECHA_CORTE_AUDITORIA", date(2026, 10, 1))
+    embarque = {"id": 1, "created_at": date(2026, 1, 1), "odoo_importador": None}
+    hitos = [{"id": 1, "seccion": "logistica", "orden_hito": 1, "etiqueta": "1. Importador",
+              "campo_dato": "odoo_importador", "campo_ancla": None, "dias_esperados": 0}]
+    conn, _ = _conn_mock_auditoria(embarque, hitos, [])
+
+    resultado = _calcular_auditoria(1, conn)
+
+    assert resultado[0]["estado"] == "no_aplica"
+    assert resultado[0]["fecha_esperada"] is None
+    assert resultado[0]["fecha_real"] is None
+    assert resultado[0]["dias_diferencia"] is None
+
+
+def test_auditoria_embarque_anterior_al_corte_campo_ya_lleno_antes_queda_no_aplica(mocker):
+    # Sin la regla de corte, esto hubiera sido "sin_historial" -- con la
+    # regla, se colapsa a "no_aplica" igual que cualquier otro hito de un
+    # embarque viejo, para no mezclar dos etiquetas distintas sin veredicto.
+    mocker.patch("routes.importaciones.FECHA_CORTE_AUDITORIA", date(2026, 10, 1))
+    embarque = {"id": 1, "created_at": date(2026, 1, 1), "odoo_importador": "ACME SA"}
+    hitos = [{"id": 1, "seccion": "logistica", "orden_hito": 1, "etiqueta": "1. Importador",
+              "campo_dato": "odoo_importador", "campo_ancla": None, "dias_esperados": 0}]
+    conn, _ = _conn_mock_auditoria(embarque, hitos, [])
+
+    resultado = _calcular_auditoria(1, conn)
+
+    assert resultado[0]["estado"] == "no_aplica"
+
+
+def test_auditoria_embarque_anterior_al_corte_campo_capturado_despues_muestra_fecha_real_sin_veredicto(mocker):
+    mocker.patch("routes.importaciones.FECHA_CORTE_AUDITORIA", date(2026, 10, 1))
+    embarque = {"id": 1, "created_at": date(2026, 1, 1)}
+    hitos = [{"id": 1, "seccion": "logistica", "orden_hito": 2, "etiqueta": "9. Confirmacion",
+              "campo_dato": "log_confirmacion_cotizacion", "campo_ancla": None, "dias_esperados": 7}]
+    historial = [{"campo": "log_confirmacion_cotizacion", "capturado_en": date(2026, 10, 15)}]
+    conn, _ = _conn_mock_auditoria(embarque, hitos, historial)
+
+    resultado = _calcular_auditoria(1, conn)
+
+    assert resultado[0]["estado"] == "no_aplica"
+    assert resultado[0]["fecha_real"] == "2026-10-15"
+    assert resultado[0]["fecha_esperada"] is None
+    assert resultado[0]["dias_diferencia"] is None
+
+
+def test_auditoria_embarque_posterior_al_corte_se_audita_normal(mocker):
+    mocker.patch("routes.importaciones.FECHA_CORTE_AUDITORIA", date(2026, 10, 1))
+    embarque = {"id": 1, "created_at": date(2026, 10, 2)}
+    hitos = [{"id": 1, "seccion": "logistica", "orden_hito": 2, "etiqueta": "9. Confirmacion",
+              "campo_dato": "log_confirmacion_cotizacion", "campo_ancla": None, "dias_esperados": 7}]
+    # esperada = 2026-10-09; real 3 dias tarde = 2026-10-12
+    historial = [{"campo": "log_confirmacion_cotizacion", "capturado_en": date(2026, 10, 12)}]
+    conn, _ = _conn_mock_auditoria(embarque, hitos, historial)
+
+    resultado = _calcular_auditoria(1, conn)
+
+    assert resultado[0]["estado"] == "atrasado"
+    assert resultado[0]["dias_diferencia"] == -3
+
+
 def test_a_date_convierte_datetime_utc_a_fecha_mexico_sin_cruzar_dia():
     """MySQL en produccion devuelve TIMESTAMP en UTC (confirmado contra la
     BD real: @@system_time_zone = UTC) -- una captura de las 20:00 hora de
@@ -588,14 +669,31 @@ def test_resumen_auditoria_cuenta_por_estado(mocker):
 
     assert resultado[0] == {
         "id": 1, "referencia": "R26-0001", "nombre": "Embarque 1", "creado_en": "2026-01-01",
-        "atrasados": 2, "adelantados": 0, "a_tiempo": 1, "pendientes": 0, "en_espera": 0, "sin_historial": 0,
+        "atrasados": 2, "adelantados": 0, "a_tiempo": 1, "pendientes": 0, "en_espera": 0,
+        "sin_historial": 0, "no_aplica": 0,
         "hitos": hitos_emb1,
     }
     assert resultado[1] == {
         "id": 2, "referencia": "R26-0002", "nombre": "Embarque 2", "creado_en": "2026-01-02",
-        "atrasados": 0, "adelantados": 1, "a_tiempo": 0, "pendientes": 1, "en_espera": 1, "sin_historial": 1,
+        "atrasados": 0, "adelantados": 1, "a_tiempo": 0, "pendientes": 1, "en_espera": 1,
+        "sin_historial": 1, "no_aplica": 0,
         "hitos": hitos_emb2,
     }
+
+
+def test_resumen_auditoria_cuenta_no_aplica(mocker):
+    conn = MagicMock()
+    cursor = MagicMock()
+    conn.cursor.return_value = cursor
+    cursor.fetchall.return_value = [
+        {"id": 1, "referencia": "R26-0001", "nombre": "Embarque viejo", "created_at": date(2026, 1, 1)},
+    ]
+    hitos_emb1 = [{"estado": "no_aplica"}, {"estado": "no_aplica"}]
+    mocker.patch("routes.importaciones._calcular_auditoria", side_effect=[hitos_emb1])
+
+    resultado = _calcular_auditoria_resumen(conn)
+
+    assert resultado[0]["no_aplica"] == 2
 
 
 def test_resumen_auditoria_creado_en_normaliza_datetime_a_date(mocker):
