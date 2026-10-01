@@ -26,7 +26,11 @@
 8. **Pantalla de administración de Hitos** rediseñada (antes era texto plano sin tarjetas) y hecha accesible desde la UI (antes solo se llegaba escribiendo la URL a mano).
 9. **Panorama general agregado**: latencia total y promedio de atraso/adelanto por hito y sección, entre todos los embarques dados de alta el mismo día — colapsable para no alargar la página.
 
-**Pendiente al momento de este documento:** revisión final de código (en curso) antes de mergear `jonathan` → `main` (backend) y `feature/auditoria-llenado-embarque` → `main` (frontend) y desplegar a los servidores de producción.
+**Revisión final y despliegue (2026-10-01):** se lanzaron dos revisores frescos (modelo más capaz) sobre el diff completo de cada rama antes de mergear. Hallazgos Críticos e Importantes corregidos en un solo pase: fallo silencioso al registrar historial ahora no tumba el guardado principal; el resumen ya no truena si un embarque tiene `created_at` nulo; la siembra de los 20 hitos quedó automática e idempotente; el Panorama general pasó de una fecha de corte móvil ("hoy") a una fecha fija de despliegue; un hito "en espera" vencido ahora sí cuenta como atraso; la pestaña de Auditoría del detalle distingue mejor sus estados y se recarga correctamente; el admin de hitos ya no reactiva en silencio un hito desactivado al editarlo. Los hallazgos Menores quedaron diferidos (ver ledger).
+
+Durante el despliegue se descubrió y resolvió una divergencia real de producción en ambos servidores: un sistema de "permisos internos" (autorización por rol/módulo/acción) y trabajo del módulo de contabilidad, construidos directamente en producción y nunca subidos a GitHub. Se mergeó con cuidado preservando ambas historias (0 conflictos reales en backend, 2 conflictos de contenido resueltos a mano en frontend), confirmado con el usuario antes de tocar nada. También se confirmó contra la base de datos real que MySQL de producción corre en UTC (no en hora de México) y se corrigió el motor de auditoría para convertir correctamente.
+
+**Backend desplegado** en 3.128.54.77 (`flaskapp.service` reiniciado, commit `cbcce9d`). **Frontend desplegado** en 3.146.204.64 (build de producción servido por nginx, commit `fc66ccd`). Ambos verificados en vivo tras el despliegue. Pendiente, fuera del alcance de este plan: los hallazgos Menores diferidos, y una revisión dedicada de la zona horaria de MySQL a nivel de conexión (el fix actual está acotado al motor de auditoría, no es un cambio global).
 
 ---
 
