@@ -8,6 +8,7 @@ import pytest
 from flask import Flask
 
 from routes.importaciones import importaciones_bp
+from utils.jwt_utils import generar_token
 
 
 def _cliente_test():
@@ -16,13 +17,29 @@ def _cliente_test():
     return app.test_client()
 
 
+def _token_valido(rol=1):
+    # @requiere_autenticacion se agregó a /inicializar-tablas y al PUT de
+    # /importaciones/<id> fuera de esta feature (sistema de permisos
+    # internos, mergeado a main después) -- las rutas de auditoria
+    # (hitos-auditoria, auditoria-resumen, etc.) siguen sin requerirlo,
+    # igual que tiempos-estimados.
+    return generar_token(
+        id_usuario=1, rol=rol, usuario="test", nombre="Test",
+        cliente_id=None, clave_cliente=None, nombre_cliente=None, id_grupo=None, flujo=None,
+    )
+
+
+def _headers_auth():
+    return {"Authorization": f"Bearer {_token_valido()}"}
+
+
 def test_inicializar_tablas_crea_historial_y_hitos(mocker):
     conn = MagicMock()
     cursor = MagicMock()
     conn.cursor.return_value = cursor
     mocker.patch("routes.importaciones.obtener_conexion", return_value=conn)
 
-    resp = _cliente_test().post("/importaciones/inicializar-tablas")
+    resp = _cliente_test().post("/importaciones/inicializar-tablas", headers=_headers_auth())
 
     assert resp.status_code == 201
     sql_ejecutados = " ".join(
@@ -48,7 +65,7 @@ def test_inicializar_tablas_siembra_los_hitos_si_la_tabla_esta_vacia(mocker):
     cursor.fetchone.return_value = (0,)
     mocker.patch("routes.importaciones.obtener_conexion", return_value=conn)
 
-    resp = _cliente_test().post("/importaciones/inicializar-tablas")
+    resp = _cliente_test().post("/importaciones/inicializar-tablas", headers=_headers_auth())
 
     assert resp.status_code == 201
     llamadas = _llamadas_executemany_hitos(cursor)
@@ -63,7 +80,7 @@ def test_inicializar_tablas_no_duplica_hitos_si_ya_hay_datos(mocker):
     cursor.fetchone.return_value = (20,)
     mocker.patch("routes.importaciones.obtener_conexion", return_value=conn)
 
-    resp = _cliente_test().post("/importaciones/inicializar-tablas")
+    resp = _cliente_test().post("/importaciones/inicializar-tablas", headers=_headers_auth())
 
     assert resp.status_code == 201
     assert _llamadas_executemany_hitos(cursor) == []
@@ -142,7 +159,7 @@ def test_put_importacion_registra_historial_en_bd_real():
         client = _cliente_test()
 
         # Primera captura de log_contenedor -> debe quedar en el historial.
-        resp = client.put(f"/importaciones/{id_imp}", json={"log_contenedor": "MSKU9999999"})
+        resp = client.put(f"/importaciones/{id_imp}", json={"log_contenedor": "MSKU9999999"}, headers=_headers_auth())
         assert resp.status_code == 200
 
         conn = obtener_conexion()
@@ -156,7 +173,7 @@ def test_put_importacion_registra_historial_en_bd_real():
         assert filas[0]["valor_nuevo"] == "MSKU9999999"
 
         # Segunda escritura del MISMO campo (correccion) -> NO debe duplicar la fila.
-        resp2 = client.put(f"/importaciones/{id_imp}", json={"log_contenedor": "MSKU8888888"})
+        resp2 = client.put(f"/importaciones/{id_imp}", json={"log_contenedor": "MSKU8888888"}, headers=_headers_auth())
         assert resp2.status_code == 200
         cursor.execute(
             "SELECT COUNT(*) AS c FROM importaciones_historial_campos WHERE importacion_id = %s AND campo = %s",
@@ -186,7 +203,7 @@ def test_put_importacion_no_truena_si_falla_el_registro_de_historial():
             "routes.importaciones._registrar_primera_captura",
             side_effect=Exception("tabla no existe"),
         ):
-            resp = _cliente_test().put(f"/importaciones/{id_imp}", json={"log_contenedor": "MSKU7777777"})
+            resp = _cliente_test().put(f"/importaciones/{id_imp}", json={"log_contenedor": "MSKU7777777"}, headers=_headers_auth())
 
         assert resp.status_code == 200
 
