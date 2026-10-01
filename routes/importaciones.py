@@ -37,6 +37,18 @@ def _es_valor_vacio(v) -> bool:
     return v in (None, "", "__NA__")
 
 
+def _a_date(v) -> date:
+    """Normaliza date/datetime/str ISO a un date plano. datetime.datetime es
+    subclase de datetime.date, asi que un isinstance(v, date) por si solo no
+    basta para distinguir un TIMESTAMP de MySQL (que llega como datetime) de
+    un date real -- hay que revisar datetime primero."""
+    if isinstance(v, datetime):
+        return v.date()
+    if isinstance(v, date):
+        return v
+    return date.fromisoformat(str(v)[:10])
+
+
 def _registrar_primera_captura(cursor, importacion_id: int, existing: dict, merged: dict,
                                 campos_a_actualizar: list) -> None:
     """Inserta en importaciones_historial_campos la PRIMERA vez que cada
@@ -141,11 +153,7 @@ def _calcular_auditoria(importacion_id: int, conn) -> list[dict]:
 
         ancla = hito["campo_ancla"]
         if not ancla:
-            base = embarque["created_at"]
-            if isinstance(base, str):
-                base = date.fromisoformat(base[:10])
-            elif hasattr(base, "date") and not isinstance(base, date):
-                base = base.date()
+            base = _a_date(embarque["created_at"])
         elif ancla in hito_por_campo_dato:
             base = resolver_esperada(hito_por_campo_dato[ancla], visitados)
             if base is None:
@@ -158,7 +166,7 @@ def _calcular_auditoria(importacion_id: int, conn) -> list[dict]:
             if real_ancla is None:
                 fecha_esperada_resuelta[hito_id] = None
                 return None
-            base = real_ancla if isinstance(real_ancla, date) else date.fromisoformat(str(real_ancla)[:10])
+            base = _a_date(real_ancla)
 
         resultado = base + timedelta(days=int(hito["dias_esperados"]))
         fecha_esperada_resuelta[hito_id] = resultado
@@ -168,9 +176,7 @@ def _calcular_auditoria(importacion_id: int, conn) -> list[dict]:
     for hito in hitos:
         esperada = resolver_esperada(hito)
         real = capturado_en.get(hito["campo_dato"])
-        real_date = None
-        if real is not None:
-            real_date = real if isinstance(real, date) else date.fromisoformat(str(real)[:10])
+        real_date = _a_date(real) if real is not None else None
 
         if esperada is None:
             estado, dias_diferencia = "pendiente", None

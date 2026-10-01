@@ -32,7 +32,7 @@ def test_inicializar_tablas_crea_historial_y_hitos(mocker):
     assert "CREATE TABLE IF NOT EXISTS importaciones_hitos_auditoria" in sql_ejecutados
 
 
-from datetime import date
+from datetime import date, datetime
 from routes.importaciones import _registrar_primera_captura
 
 
@@ -395,6 +395,50 @@ def test_auditoria_consulta_hitos_ordenados_por_id_no_por_seccion():
     sql_hitos = cursor.execute.call_args_list[1].args[0]
     assert "ORDER BY id" in sql_hitos
     assert "ORDER BY seccion" not in sql_hitos
+
+
+def test_auditoria_created_at_datetime_no_genera_fecha_invalida():
+    # MySQL devuelve TIMESTAMP/DATETIME como datetime.datetime, no como
+    # date -- y datetime.datetime ES subclase de date, asi que un simple
+    # isinstance(base, date) no lo detecta para convertirlo. Si no se
+    # normaliza, fecha_esperada queda como "2026-01-01T10:30:00" en vez de
+    # "2026-01-01", y el frontend lo interpreta como "Invalid Date".
+    embarque = {"id": 1, "created_at": datetime(2026, 1, 1, 10, 30, 0)}
+    hitos = [{"id": 1, "seccion": "logistica", "orden_hito": 1, "etiqueta": "1. Importador",
+              "campo_dato": "odoo_importador", "campo_ancla": None, "dias_esperados": 0}]
+    conn, _ = _conn_mock_auditoria(embarque, hitos, [])
+
+    resultado = _calcular_auditoria(1, conn)
+
+    assert resultado[0]["fecha_esperada"] == "2026-01-01"
+
+
+def test_auditoria_capturado_en_datetime_calcula_dias_diferencia_correctamente():
+    embarque = {"id": 1, "created_at": date(2026, 1, 1)}
+    hitos = [{"id": 1, "seccion": "logistica", "orden_hito": 2, "etiqueta": "9. Confirmacion",
+              "campo_dato": "log_confirmacion_cotizacion", "campo_ancla": None, "dias_esperados": 7}]
+    # esperada = 2026-01-08; capturado_en llega como datetime (TIMESTAMP real), no date
+    historial = [{"campo": "log_confirmacion_cotizacion", "capturado_en": datetime(2026, 1, 6, 14, 0, 0)}]
+    conn, _ = _conn_mock_auditoria(embarque, hitos, historial)
+
+    resultado = _calcular_auditoria(1, conn)
+
+    assert resultado[0]["estado"] == "adelantado"
+    assert resultado[0]["dias_diferencia"] == 2
+    assert resultado[0]["fecha_real"] == "2026-01-06"
+
+
+def test_auditoria_disparador_capturado_en_datetime_resuelve_bien():
+    embarque = {"id": 1, "created_at": date(2026, 1, 1)}
+    hitos = [{"id": 1, "seccion": "logistica", "orden_hito": 3, "etiqueta": "18. Contenedores",
+              "campo_dato": "log_contenedor", "campo_ancla": "log_fecha_entrega", "dias_esperados": 1}]
+    historial = [{"campo": "log_fecha_entrega", "capturado_en": datetime(2026, 1, 10, 9, 15, 0)}]
+    conn, _ = _conn_mock_auditoria(embarque, hitos, historial)
+
+    resultado = _calcular_auditoria(1, conn)
+
+    assert resultado[0]["fecha_esperada"] == "2026-01-11"
+    assert resultado[0]["estado"] == "en_espera"
 
 
 def test_get_auditoria_devuelve_200_con_lista(mocker):
