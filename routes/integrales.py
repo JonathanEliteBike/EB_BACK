@@ -185,8 +185,8 @@ def obtener_clientes_por_grupo(id_grupo):
 
 @integrales_bp.route('/integrales/clientes/asignar-grupo', methods=['POST'])
 def asignar_grupo_cliente():
-    """Asignar un grupo a un cliente"""
-    data = request.get_json()
+    """Asignar/remover grupo y mantener metas/avances de Integrales alineados."""
+    data = request.get_json() or {}
     id_cliente = data.get('id_cliente')
     id_grupo = data.get('id_grupo')
 
@@ -194,35 +194,82 @@ def asignar_grupo_cliente():
         return jsonify({"error": "ID del cliente y ID del grupo son obligatorios"}), 400
 
     conexion = obtener_conexion()
-    cursor = conexion.cursor()
+    cursor = conexion.cursor(dictionary=True)
 
     try:
-        # Verificar que el cliente exista
-        cursor.execute("SELECT id FROM clientes WHERE id = %s", (id_cliente,))
-        if cursor.fetchone() is None:
+        cursor.execute(
+            """
+            SELECT id, clave, nombre_cliente, nivel, id_grupo
+            FROM clientes
+            WHERE id = %s
+            """,
+            (id_cliente,),
+        )
+        cliente = cursor.fetchone()
+        if cliente is None:
             return jsonify({"error": "Cliente no encontrado"}), 404
 
-        # Si id_grupo es 0, significa quitar el grupo (NULL)
-        if id_grupo == 0:
-            query = "UPDATE clientes SET id_grupo = NULL WHERE id = %s"
-            cursor.execute(query, (id_cliente,))
-            conexion.commit()
-            return jsonify({"mensaje": "Grupo removido del cliente exitosamente"}), 200
+        grupo_anterior = cliente.get('id_grupo')
+        grupo_nuevo = None if int(id_grupo) == 0 else int(id_grupo)
 
-        # Verificar que el grupo exista
-        cursor.execute("SELECT id FROM grupo_clientes WHERE id = %s", (id_grupo,))
-        if cursor.fetchone() is None:
-            return jsonify({"error": "Grupo no encontrado"}), 404
+        if grupo_nuevo is not None:
+            cursor.execute(
+                "SELECT id FROM grupo_clientes WHERE id = %s",
+                (grupo_nuevo,),
+            )
+            if cursor.fetchone() is None:
+                return jsonify({"error": "Grupo no encontrado"}), 404
 
-        # Asignar el grupo al cliente
-        query = "UPDATE clientes SET id_grupo = %s WHERE id = %s"
-        cursor.execute(query, (id_grupo, id_cliente))
-        conexion.commit()
+        cursor.execute(
+            "UPDATE clientes SET id_grupo = %s WHERE id = %s",
+            (grupo_nuevo, id_cliente),
+        )
 
-        return jsonify({"mensaje": "Grupo asignado al cliente exitosamente"}), 200
+        from services.metas_previo_my27_service import (
+            sincronizar_grupos_afectados_my27,
+            sincronizar_metas_cliente_my27,
+        )
+
+        # El miembro conserva la meta de su propio nivel como 1 sucursal.
+        sync_cliente = sincronizar_metas_cliente_my27(
+            conexion,
+            id_cliente,
+            aplicar=True,
+        )
+
+        # Recalcular tanto el grupo del que salió como aquel al que entró.
+        sync_grupos = sincronizar_grupos_afectados_my27(
+            conexion,
+            [grupo_anterior, grupo_nuevo],
+            aplicar=True,
+        )
+
+        # La composición del grupo también cambia sus avances consolidados.
+        from routes.monitor_odoo import _recalcular_acumulados_previo
+
+        filas_avances = _recalcular_acumulados_previo(conexion, cursor)
+
+        mensaje = (
+            "Grupo removido del cliente exitosamente"
+            if grupo_nuevo is None
+            else "Grupo asignado al cliente exitosamente"
+        )
+        return jsonify({
+            "mensaje": mensaje,
+            "sincronizacion_cliente_my27": sync_cliente,
+            "integrales_afectadas": sync_grupos,
+            "filas_avances_actualizadas": filas_avances,
+        }), 200
+
     except Exception as e:
+        if conexion:
+            conexion.rollback()
         logging.exception("Error al asignar grupo al cliente")
-        return jsonify({"error": "Error al asignar grupo al cliente"}), 500
+        return jsonify({
+            "error": "Error al asignar grupo al cliente",
+            "detalle": str(e),
+        }), 500
+
     finally:
         if cursor:
             cursor.close()
