@@ -202,12 +202,29 @@ def inicializar_tablas():
             "ALTER TABLE garantia_formularios ADD COLUMN pieza_reemplazo VARCHAR(100) DEFAULT NULL",
             "ALTER TABLE garantia_formularios ADD COLUMN fecha_estatus DATE DEFAULT NULL",
             "ALTER TABLE garantia_formularios ADD COLUMN fecha_pieza DATE DEFAULT NULL",
+            "ALTER TABLE garantia_formularios ADD COLUMN clave_distribuidor VARCHAR(10) DEFAULT NULL",
         ]:
             try:
                 cursor.execute(col_sql)
                 conn.commit()
             except Exception:
                 conn.rollback()  # columna ya existe, ignorar
+
+        # Backfill: tickets antiguos sin clave_distribuidor -- se resuelve por el
+        # correo con el que se registró el ticket, buscando el cliente_id de esa
+        # cuenta. Idempotente: solo toca filas donde aun falta.
+        try:
+            cursor.execute("""
+                UPDATE garantia_formularios f
+                JOIN usuarios u ON u.correo COLLATE utf8mb4_unicode_ci = f.email
+                JOIN clientes c ON c.id = u.cliente_id
+                SET f.clave_distribuidor = c.clave
+                WHERE f.clave_distribuidor IS NULL
+            """)
+            conn.commit()
+        except Exception:
+            conn.rollback()
+
         return jsonify({"ok": True, "mensaje": "Tablas creadas correctamente"})
     except Exception as e:
         logging.exception("Error al inicializar tablas de garantias: %s", e)
@@ -232,13 +249,27 @@ def enviar_formulario():
         # Determinar el email del ticket (a quién pertenece)
         email = datos.get('email', '')
         cursor_u = conn.cursor(dictionary=True)
-        cursor_u.execute("SELECT correo, rol_id FROM usuarios WHERE id = %s", (g.usuario_actual['id'],))
+        cursor_u.execute("SELECT correo, rol_id, cliente_id FROM usuarios WHERE id = %s", (g.usuario_actual['id'],))
         user = cursor_u.fetchone()
+        cliente_id_dueno = user.get('cliente_id') if user else None
         if user and user.get('correo'):
             email = user['correo']
-            # Si el administrador asigna explícitamente a otro usuario, usar ese email.
+            # Si el administrador asigna explícitamente a otro usuario, usar ese email
+            # y resolver la clave de distribuidor con el cliente de esa cuenta.
             if user.get('rol_id') == 1 and datos.get('email_asignado'):
                 email = datos['email_asignado']
+                cursor_u.execute("SELECT cliente_id FROM usuarios WHERE correo = %s", (email,))
+                asignado = cursor_u.fetchone()
+                cliente_id_dueno = asignado['cliente_id'] if asignado else None
+
+        # Clave del distribuidor (identifica la sucursal exacta, ej. NARUCO tiene
+        # varias con la misma razón social pero clave distinta) -- se resuelve del
+        # cliente ligado a la cuenta que llena el ticket, no del texto del <select>.
+        clave_distribuidor = None
+        if cliente_id_dueno:
+            cursor_u.execute("SELECT clave FROM clientes WHERE id = %s", (cliente_id_dueno,))
+            cli = cursor_u.fetchone()
+            clave_distribuidor = cli['clave'] if cli else None
 
         cursor = conn.cursor()
         fecha_ingreso = datos.get('fecha_ingreso') or None
@@ -247,11 +278,12 @@ def enviar_formulario():
         if fecha_ingreso:
             cursor.execute("""
                 INSERT INTO garantia_formularios
-                    (email, distribuidor, contacto, puesto, marca, datos, fecha_creacion)
-                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                    (email, distribuidor, clave_distribuidor, contacto, puesto, marca, datos, fecha_creacion)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
             """, (
                 email,
                 datos.get('distribuidor', ''),
+                clave_distribuidor,
                 datos.get('contacto', ''),
                 datos.get('puesto', ''),
                 datos.get('marca', ''),
@@ -261,11 +293,12 @@ def enviar_formulario():
         else:
             cursor.execute("""
                 INSERT INTO garantia_formularios
-                    (email, distribuidor, contacto, puesto, marca, datos)
-                VALUES (%s, %s, %s, %s, %s, %s)
+                    (email, distribuidor, clave_distribuidor, contacto, puesto, marca, datos)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
             """, (
                 email,
                 datos.get('distribuidor', ''),
+                clave_distribuidor,
                 datos.get('contacto', ''),
                 datos.get('puesto', ''),
                 datos.get('marca', ''),
@@ -294,7 +327,7 @@ def lista_formularios():
     try:
         cursor = conn.cursor(dictionary=True)
         cursor.execute("""
-            SELECT id, folio, email, distribuidor, contacto, puesto, marca,
+            SELECT id, folio, email, distribuidor, clave_distribuidor, contacto, puesto, marca,
                    estatus, estatus_pieza, pieza_reemplazo,
                    docs_validados, serie_validada,
                    validacion_docs_json, fecha_creacion,
@@ -419,7 +452,7 @@ def mis_tickets():
 
         if nombre_cliente:
             cursor.execute("""
-                SELECT id, folio, email, distribuidor, contacto, puesto, marca,
+                SELECT id, folio, email, distribuidor, clave_distribuidor, contacto, puesto, marca,
                        estatus, estatus_pieza, fecha_creacion
                 FROM garantia_formularios
                 WHERE distribuidor = %s OR email = %s
@@ -427,7 +460,7 @@ def mis_tickets():
             """, (nombre_cliente, email))
         else:
             cursor.execute("""
-                SELECT id, folio, email, distribuidor, contacto, puesto, marca,
+                SELECT id, folio, email, distribuidor, clave_distribuidor, contacto, puesto, marca,
                        estatus, estatus_pieza, fecha_creacion
                 FROM garantia_formularios
                 WHERE email = %s
