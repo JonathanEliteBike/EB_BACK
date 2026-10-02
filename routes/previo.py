@@ -114,6 +114,15 @@ def actualizar_previo():
         conexion = obtener_conexion()
         conexion.autocommit = False 
         cursor = conexion.cursor()
+
+        # Antes de reconstruir `previo`, preservar las metas comerciales que no
+        # siguen la regla estándar MY27 (Integrales 1-4 y Christian Boccaletti).
+        from services.metas_previo_my27_service import (
+            capturar_metas_protegidas,
+            restaurar_metas_protegidas,
+            sincronizar_metas_previo_my27,
+        )
+        metas_protegidas = capturar_metas_protegidas(conexion)
         
         def seguro_float(valor):
             try:
@@ -300,8 +309,32 @@ def actualizar_previo():
                 logging.exception("Error procesando registro %s", i)
                 raise Exception(f"Falla en registro {registro.get('clave')}: {str(e)}")
         
-        conexion.commit() 
-        return jsonify({'mensaje': f'Actualización completa. {registros_insertados} registros procesados.'}), 200
+        # El backend es la fuente de verdad para MY27. Aunque Angular envíe
+        # metas antiguas/hardcodeadas, las normalizamos antes del commit.
+        metas_especiales_restauradas = restaurar_metas_protegidas(
+            conexion, metas_protegidas
+        )
+        resultado_metas = sincronizar_metas_previo_my27(
+            conexion, aplicar=True
+        )
+
+        # Recalcular compras reales y porcentajes con las metas ya corregidas.
+        # Esta función hace commit al finalizar correctamente, por lo que todo
+        # el DELETE + INSERT + normalización queda en la misma transacción.
+        from routes.monitor_odoo import _recalcular_acumulados_previo
+
+        cursor.close()
+        cursor = conexion.cursor(dictionary=True)
+        filas_avances = _recalcular_acumulados_previo(conexion, cursor)
+
+        return jsonify({
+            'mensaje': f'Actualización completa. {registros_insertados} registros procesados.',
+            'metas_my27_actualizadas': resultado_metas.get('actualizadas', 0),
+            'metas_especiales_restauradas': metas_especiales_restauradas,
+            'filas_avances_actualizadas': filas_avances,
+            'protegidas': resultado_metas.get('protegidas', 0),
+            'omitidas': resultado_metas.get('omitidas', 0),
+        }), 200
         
     except Exception as e:
         if conexion: conexion.rollback()
@@ -400,18 +433,24 @@ def obtener_previo_fecha():
 
 @previo_bp.route('/recalcular_previo', methods=['POST'])
 def disparar_recalculo_previo():
+    """Recalcula metas MY27 + avances antes de responder al frontend.
+
+    Se ejecuta de forma síncrona para que Angular no solicite /obtener_previo
+    antes de que termine el recálculo.
+    """
     try:
-        from celery_worker import celery_app
+        from tasks_previo import recalcular_previo
 
-        task = celery_app.send_task('tasks.recalcular_previo_async')
+        resultado = recalcular_previo(aplicar=True)
 
-        return jsonify({
-            'mensaje': 'Recalculo de previo iniciado',
-            'task_id': task.id
-        }), 202
+        if resultado.get('status') != 'success':
+            return jsonify(resultado), 500
+
+        return jsonify(resultado), 200
 
     except Exception as e:
-        logging.exception("Error iniciando recalculo de previo")
+        logging.exception("Error recalculando previo")
         return jsonify({
+            'status': 'error',
             'error': str(e)
         }), 500
