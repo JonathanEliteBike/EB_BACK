@@ -2861,10 +2861,13 @@ def detalle_compras_odoo():
                         [child_ids_list],
                         {'fields': ['id', 'ref']}
                     )
+                    _cliente_upper = (cliente or '').strip().upper()
                     for child in children_data:
                         child_ref = (child.get('ref') or '').strip().upper()
-                        # Solo incluir hijos que NO son clientes independientes registrados
-                        if not child_ref or child_ref not in _clientes_registrados:
+                        # Incluir el hijo si: no tiene ref, su ref no está en nuestra DB,
+                        # o su ref coincide con el cliente padre que ya estamos consultando
+                        # (evita excluir cuentas B2B/hijo con el mismo ref que el padre).
+                        if not child_ref or child_ref not in _clientes_registrados or child_ref == _cliente_upper:
                             all_partner_ids.add(child['id'])
                 except Exception:
                     # Fallback: incluir todos los hijos del partner
