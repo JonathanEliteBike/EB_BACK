@@ -340,7 +340,7 @@ CAMPOS_DESPACHO = [
 CAMPOS_ODOO = [
     "log_recepcion_documentos",
     "odoo_codificacion", "odoo_alta_catalogo", "odoo_alta_precios",
-    "odoo_alta_orden_compra", "odoo_folio_orden",
+    "odoo_folio_orden",
 ]
 
 CAMPOS_ALMACEN = [
