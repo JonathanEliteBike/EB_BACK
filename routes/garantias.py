@@ -3,7 +3,7 @@ import json
 import logging
 import os
 import uuid
-from datetime import date, datetime
+from datetime import datetime, timedelta, timezone
 
 from flask import Blueprint, jsonify, request, send_file, g
 from services.s3_service import subir_archivo_s3, generar_url_firmada_s3, existe_archivo_s3, descargar_archivo_s3
@@ -26,6 +26,24 @@ UPLOAD_FOLDER = os.path.join(os.path.dirname(__file__), '..', 'uploads', 'garant
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
 ALLOWED_EXTENSIONS = {'pdf', 'jpg', 'jpeg', 'png', 'gif', 'mp4', 'mov', 'avi', 'webp'}
+
+# CDMX no usa horario de verano desde 2022: UTC-6 fijo.
+ZONA_CDMX = timezone(timedelta(hours=-6))
+
+
+def _conexion_garantias():
+    """Conexión con la zona horaria de sesión en CDMX, para que NOW() y los DEFAULT
+    DATETIME de estas tablas guarden la hora local y no la del servidor (UTC)."""
+    conn = obtener_conexion()
+    if conn:
+        cur = conn.cursor()
+        cur.execute("SET time_zone = '-06:00'")
+        cur.close()
+    return conn
+
+
+def _hoy_cdmx():
+    return datetime.now(ZONA_CDMX).date()
 
 
 def allowed_file(filename):
@@ -132,7 +150,7 @@ def refrescar():
 @requiere_autenticacion
 @requiere_rol(1)
 def inicializar_tablas():
-    conn = obtener_conexion()
+    conn = _conexion_garantias()
     if not conn:
         return jsonify({"error": "Sin conexion a BD"}), 500
     try:
@@ -240,7 +258,7 @@ def inicializar_tablas():
 @requiere_modulo("usuarios_garantias")
 @requiere_permiso_interno("garantias", "crear")
 def enviar_formulario():
-    conn = obtener_conexion()
+    conn = _conexion_garantias()
     if not conn:
         return jsonify({"error": "Sin conexion a BD"}), 500
     try:
@@ -321,7 +339,7 @@ def enviar_formulario():
 @requiere_rol(1)
 @requiere_permiso_interno("garantias", "ver")
 def lista_formularios():
-    conn = obtener_conexion()
+    conn = _conexion_garantias()
     if not conn:
         return jsonify({"error": "Sin conexion a BD"}), 500
     try:
@@ -356,7 +374,7 @@ def lista_formularios():
 @requiere_modulo("usuarios_garantias")
 def actualizar_dato_usuario(form_id):
     """El usuario dueño del ticket actualiza un campo rechazado y resetea su validación."""
-    conn = obtener_conexion()
+    conn = _conexion_garantias()
     if not conn:
         return jsonify({"error": "Sin conexion a BD"}), 500
     try:
@@ -433,7 +451,7 @@ def mis_tickets():
     """
     user_id = g.usuario_actual['id']
 
-    conn = obtener_conexion()
+    conn = _conexion_garantias()
     if not conn:
         return jsonify({"error": "Sin conexion a BD"}), 500
     try:
@@ -484,7 +502,7 @@ def mis_tickets():
 @requiere_permiso_interno("garantias", "eliminar")
 def eliminar_formulario(form_id):
     """Elimina un ticket y renumera los folios consecutivamente. Solo admins."""
-    conn = obtener_conexion()
+    conn = _conexion_garantias()
     if not conn:
         return jsonify({"error": "Sin conexion a BD"}), 500
     try:
@@ -519,7 +537,7 @@ def eliminar_formulario(form_id):
 @requiere_modulo("usuarios_garantias")
 @requiere_permiso_interno("garantias", "ver")
 def obtener_formulario(form_id):
-    conn = obtener_conexion()
+    conn = _conexion_garantias()
     if not conn:
         return jsonify({"error": "Sin conexion a BD"}), 500
     try:
@@ -555,13 +573,13 @@ def obtener_formulario(form_id):
 @requiere_rol(1)
 @requiere_permiso_interno("garantias", "editar")
 def actualizar_estatus(form_id):
-    conn = obtener_conexion()
+    conn = _conexion_garantias()
     if not conn:
         return jsonify({"error": "Sin conexion a BD"}), 500
     try:
         datos = request.get_json(force=True) or {}
         nuevo_estatus = datos.get('estatus', 'Enviado')
-        fecha = datos.get('fecha') or date.today().isoformat()
+        fecha = datos.get('fecha') or _hoy_cdmx().isoformat()
         cursor = conn.cursor()
         cursor.execute(
             "UPDATE garantia_formularios SET estatus = %s, fecha_estatus = %s WHERE id = %s",
@@ -586,12 +604,12 @@ def actualizar_estatus(form_id):
 @requiere_permiso_interno("garantias", "editar")
 def actualizar_fecha_estatus(form_id):
     """Edita solo la fecha del estatus actual sin cambiar el estatus."""
-    conn = obtener_conexion()
+    conn = _conexion_garantias()
     if not conn:
         return jsonify({"error": "Sin conexion a BD"}), 500
     try:
         datos = request.get_json(force=True) or {}
-        fecha = datos.get('fecha') or date.today().isoformat()
+        fecha = datos.get('fecha') or _hoy_cdmx().isoformat()
         cursor = conn.cursor()
         cursor.execute(
             "UPDATE garantia_formularios SET fecha_estatus = %s WHERE id = %s",
@@ -616,12 +634,12 @@ def actualizar_fecha_estatus(form_id):
 @requiere_permiso_interno("garantias", "editar")
 def actualizar_fecha_creacion(form_id):
     """Corrige la fecha de alta (creación) del ticket cuando se registró mal, sin borrar y recrear."""
-    conn = obtener_conexion()
+    conn = _conexion_garantias()
     if not conn:
         return jsonify({"error": "Sin conexion a BD"}), 500
     try:
         datos = request.get_json(force=True) or {}
-        fecha = datos.get('fecha') or date.today().isoformat()
+        fecha = datos.get('fecha') or _hoy_cdmx().isoformat()
         cursor = conn.cursor()
         cursor.execute(
             "UPDATE garantia_formularios SET fecha_creacion = %s WHERE id = %s",
@@ -645,7 +663,7 @@ def actualizar_fecha_creacion(form_id):
 @requiere_rol(1)
 @requiere_permiso_interno("garantias", "editar")
 def actualizar_pieza_reemplazo(form_id):
-    conn = obtener_conexion()
+    conn = _conexion_garantias()
     if not conn:
         return jsonify({"error": "Sin conexion a BD"}), 500
     try:
@@ -674,13 +692,13 @@ def actualizar_pieza_reemplazo(form_id):
 @requiere_rol(1)
 @requiere_permiso_interno("garantias", "editar")
 def actualizar_pieza(form_id):
-    conn = obtener_conexion()
+    conn = _conexion_garantias()
     if not conn:
         return jsonify({"error": "Sin conexion a BD"}), 500
     try:
         datos = request.get_json(force=True) or {}
         nuevo_estatus = datos.get('estatus_pieza', 'Sin pieza')
-        fecha = datos.get('fecha') or date.today().isoformat()
+        fecha = datos.get('fecha') or _hoy_cdmx().isoformat()
         cursor = conn.cursor()
         cursor.execute(
             "UPDATE garantia_formularios SET estatus_pieza = %s, fecha_pieza = %s WHERE id = %s",
@@ -705,12 +723,12 @@ def actualizar_pieza(form_id):
 @requiere_permiso_interno("garantias", "editar")
 def actualizar_fecha_pieza(form_id):
     """Edita solo la fecha del estatus de pieza sin cambiar el estatus."""
-    conn = obtener_conexion()
+    conn = _conexion_garantias()
     if not conn:
         return jsonify({"error": "Sin conexion a BD"}), 500
     try:
         datos = request.get_json(force=True) or {}
-        fecha = datos.get('fecha') or date.today().isoformat()
+        fecha = datos.get('fecha') or _hoy_cdmx().isoformat()
         cursor = conn.cursor()
         cursor.execute(
             "UPDATE garantia_formularios SET fecha_pieza = %s WHERE id = %s",
@@ -735,7 +753,7 @@ def actualizar_fecha_pieza(form_id):
 @requiere_permiso_interno("garantias", "editar")
 def actualizar_validacion_doc(form_id):
     """Valida o rechaza un documento individual. body: {campo, estado, nombre_legible}"""
-    conn = obtener_conexion()
+    conn = _conexion_garantias()
     if not conn:
         return jsonify({"error": "Sin conexion a BD"}), 500
     try:
@@ -800,7 +818,7 @@ def actualizar_validacion_doc(form_id):
 @requiere_rol(1)
 @requiere_permiso_interno("garantias", "editar")
 def actualizar_validacion(form_id):
-    conn = obtener_conexion()
+    conn = _conexion_garantias()
     if not conn:
         return jsonify({"error": "Sin conexion a BD"}), 500
     try:
@@ -850,7 +868,7 @@ def actualizar_validacion(form_id):
 @requiere_modulo("usuarios_garantias")
 @requiere_permiso_interno("garantias", "ver")
 def obtener_estructura():
-    conn = obtener_conexion()
+    conn = _conexion_garantias()
     if not conn:
         return jsonify({"error": "Sin conexion a BD"}), 500
     try:
@@ -876,7 +894,7 @@ def obtener_estructura():
 @requiere_rol(1)
 @requiere_permiso_interno("garantias", "editar")
 def guardar_estructura():
-    conn = obtener_conexion()
+    conn = _conexion_garantias()
     if not conn:
         return jsonify({"error": "Sin conexion a BD"}), 500
     try:
@@ -906,7 +924,7 @@ def guardar_estructura():
 @requiere_rol(1)
 @requiere_permiso_interno("garantias", "ver")
 def get_stats():
-    conn = obtener_conexion()
+    conn = _conexion_garantias()
     if not conn:
         return jsonify({"error": "Sin conexion a BD"}), 500
     try:
@@ -944,7 +962,7 @@ def get_stats():
 @requiere_modulo("usuarios_garantias")
 @requiere_permiso_interno("garantias", "ver")
 def get_comentarios(formulario_id):
-    conn = obtener_conexion()
+    conn = _conexion_garantias()
     if not conn:
         return jsonify({"error": "Sin conexion a BD"}), 500
     try:
@@ -981,7 +999,7 @@ def get_comentarios(formulario_id):
 @requiere_modulo("usuarios_garantias")
 @requiere_permiso_interno("garantias", "crear")
 def add_comentario(formulario_id):
-    conn = obtener_conexion()
+    conn = _conexion_garantias()
     if not conn:
         return jsonify({"error": "Sin conexion a BD"}), 500
     try:
@@ -1028,7 +1046,7 @@ def add_comentario(formulario_id):
 @requiere_permiso_interno("garantias", "ver")
 def get_latencias():
     """Devuelve latencia de atención y de cierre por ticket individual."""
-    conn = obtener_conexion()
+    conn = _conexion_garantias()
     if not conn:
         return jsonify({"error": "Sin conexion a BD"}), 500
     try:
@@ -1068,7 +1086,7 @@ def get_latencias():
 @requiere_rol(1)
 @requiere_permiso_interno("garantias", "ver")
 def listar_piezas():
-    conn = obtener_conexion()
+    conn = _conexion_garantias()
     if not conn:
         return jsonify({"error": "Sin conexion a BD"}), 500
     try:
@@ -1110,7 +1128,7 @@ def listar_piezas():
 @requiere_rol(1)
 @requiere_permiso_interno("garantias", "crear")
 def agregar_pieza():
-    conn = obtener_conexion()
+    conn = _conexion_garantias()
     if not conn:
         return jsonify({"error": "Sin conexion a BD"}), 500
     try:
@@ -1141,7 +1159,7 @@ def contar_uso_pieza():
     nombre = (request.args.get('nombre') or '').strip().upper()
     if not nombre:
         return jsonify({"error": "El nombre de la pieza es requerido"}), 400
-    conn = obtener_conexion()
+    conn = _conexion_garantias()
     if not conn:
         return jsonify({"error": "Sin conexion a BD"}), 500
     try:
@@ -1168,7 +1186,7 @@ def eliminar_pieza():
     duplicados o nombres capturados por error (ej. 'MAUBRIO'). No afecta los
     tickets que ya tengan esa pieza asignada, solo deja de ofrecerse en el
     selector de nuevas asignaciones."""
-    conn = obtener_conexion()
+    conn = _conexion_garantias()
     if not conn:
         return jsonify({"error": "Sin conexion a BD"}), 500
     try:
@@ -1222,7 +1240,7 @@ def _requiere_admin(request):
     payload = verificar_token(raw_token)
     if not payload or not payload.get('id'):
         return None, (jsonify({"error": "Token inválido"}), 401)
-    conn = obtener_conexion()
+    conn = _conexion_garantias()
     if not conn:
         return None, (jsonify({"error": "Sin conexión a BD"}), 500)
     try:
@@ -1327,7 +1345,7 @@ def descargar_plantilla_importacion():
     ws2.column_dimensions["A"].width = 35
     ws2.column_dimensions["B"].width = 35
 
-    conn = obtener_conexion()
+    conn = _conexion_garantias()
     if conn:
         try:
             cur = conn.cursor(dictionary=True)
@@ -1391,7 +1409,7 @@ def importar_garantias():
     ws = wb["Importar"] if "Importar" in wb.sheetnames else wb.active
 
     # Cargar usuarios del sistema para mapeo nombre → correo
-    conn = obtener_conexion()
+    conn = _conexion_garantias()
     if not conn:
         return jsonify({"error": "Sin conexión a BD"}), 500
 
@@ -1420,7 +1438,7 @@ def importar_garantias():
     errores    = []
     filas_datos = list(ws.iter_rows(min_row=4, values_only=True))  # fila 1=instrucción, 2=header, 3=ejemplo
 
-    conn = obtener_conexion()
+    conn = _conexion_garantias()
     if not conn:
         return jsonify({"error": "Sin conexión a BD"}), 500
 
@@ -1606,7 +1624,7 @@ def subir_archivo():
 @requiere_modulo("usuarios_garantias")
 @requiere_permiso_interno("garantias", "ver")
 def descargar_archivo(nombre):
-    conn = obtener_conexion()
+    conn = _conexion_garantias()
     if not conn:
         return jsonify({"error": "Sin conexion a BD"}), 500
     try:
