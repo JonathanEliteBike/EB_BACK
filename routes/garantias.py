@@ -1600,7 +1600,9 @@ def subir_archivo():
         return jsonify({"error": "Nombre de archivo vacio"}), 400
 
     if not allowed_file(file.filename):
-        return jsonify({"error": "Tipo de archivo no permitido"}), 400
+        if file.filename.lower().endswith(('.heic', '.heif')):
+            return jsonify({"error": "Formato HEIC no compatible. Convierte la foto a JPG antes de subirla."}), 400
+        return jsonify({"error": "Tipo de archivo no permitido. Formatos: JPG, PNG, WEBP, GIF, PDF, MP4, MOV, AVI."}), 400
 
     try:
         resultado = subir_archivo_s3(file)
