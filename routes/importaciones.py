@@ -454,9 +454,9 @@ def _estado_actual(r: dict) -> str:
     "Rec. Odoo" no se toma en cuenta para esto (pedido explícito), aunque sí
     se sigue mostrando en la fila de fechas del pipeline.
 
-    Una etapa con fecha real capturada (en verde) ya quedó atrás: el badge
-    debe avanzar a la siguiente etapa de la secuencia, no quedarse mostrando
-    la que ya se completó."""
+    El badge se queda en la última etapa con fecha real ya registrada (en
+    verde): solo avanza a la siguiente cuando esa siguiente etapa registra
+    su propia fecha real, no antes."""
     ultimo_completado = -1
     for i, (_, campo) in enumerate(_ETAPAS_ORDEN):
         if r.get(campo):
@@ -464,9 +464,7 @@ def _estado_actual(r: dict) -> str:
 
     if ultimo_completado == -1:
         return "Pendiente"
-    if ultimo_completado == len(_ETAPAS_ORDEN) - 1:
-        return "Liberado"
-    return _ETAPAS_ORDEN[ultimo_completado + 1][0]
+    return _ETAPAS_ORDEN[ultimo_completado][0]
 
 
 # Campos derivados que _recalcular_campos() inyecta en data — deben persistirse

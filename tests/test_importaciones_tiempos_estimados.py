@@ -1,6 +1,6 @@
 """Tests del cálculo automático de fechas proyectadas Booking→Almacén
 (regla por origen+tipo_producto+vía en importaciones_tiempos_estimados) y de
-_estado_actual() (avance de etapa una vez que la anterior ya tiene fecha real).
+_estado_actual() (se queda en la última etapa con fecha real capturada).
 
 No golpean MySQL real: el `conn`/cursor que necesita _recalcular_campos() para
 consultar la tabla de reglas se mockea con unittest.mock.
@@ -26,16 +26,17 @@ def _mock_conn_con_regla(regla: dict | None):
     return conn
 
 
-# ── _estado_actual(): avanza a la siguiente etapa, no se queda en la última completada ──
+# ── _estado_actual(): se queda en la última etapa con fecha real, no se adelanta ──
 
 def test_estado_actual_pendiente_sin_nada_capturado():
     assert _estado_actual({}) == "Pendiente"
 
 
-def test_estado_actual_avanza_a_la_siguiente_etapa_tras_completar_booking():
-    # Booking ya tiene fecha real -> debe mostrar Lleg. Puerto, no Booking.
+def test_estado_actual_se_queda_en_booking_hasta_que_lleg_puerto_tenga_fecha_real():
+    # Booking ya tiene fecha real pero Lleg. Puerto todavia no -> debe mostrar
+    # Booking, no adelantarse a Lleg. Puerto.
     r = {"log_fecha_entrega": "2026-01-01", "log_fecha_booking": "2026-01-17"}
-    assert _estado_actual(r) == "Lleg. Puerto"
+    assert _estado_actual(r) == "Booking"
 
 
 def test_estado_actual_usa_la_etapa_mas_avanzada_capturada():
@@ -44,7 +45,7 @@ def test_estado_actual_usa_la_etapa_mas_avanzada_capturada():
         "log_fecha_booking": "2026-01-17",
         "imp_llegada_contenedor_puerto": "2026-02-08",
     }
-    assert _estado_actual(r) == "Destino"
+    assert _estado_actual(r) == "Lleg. Puerto"
 
 
 def test_estado_actual_liberado_cuando_todo_esta_completo():
@@ -55,7 +56,7 @@ def test_estado_actual_liberado_cuando_todo_esta_completo():
 def test_estado_actual_ignora_rec_recepcion_odoo():
     # rec_recepcion_odoo no es parte de la secuencia de etapas -- no debe alterar el resultado.
     r = {"log_fecha_entrega": "2026-01-01", "rec_recepcion_odoo": "2026-01-05"}
-    assert _estado_actual(r) == "Booking"
+    assert _estado_actual(r) == "Entrega"
 
 
 # ── _buscar_regla_tiempos() ──────────────────────────────────────────────────
