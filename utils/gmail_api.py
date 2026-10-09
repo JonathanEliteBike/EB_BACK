@@ -4,6 +4,8 @@ Reemplaza el login SMTP usuario/contraseña (desactivado por Google para todo
 el Workspace de elitebike-mx.com) por una cuenta de servicio autorizada en el
 Admin console para enviar como cualquier cuenta del dominio.
 """
+from __future__ import annotations
+
 import base64
 import os
 from email.mime.text import MIMEText
