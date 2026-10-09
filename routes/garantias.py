@@ -5,7 +5,7 @@ import os
 import uuid
 from datetime import datetime, timedelta, timezone
 
-from flask import Blueprint, jsonify, request, send_file, g
+from flask import Blueprint, jsonify, request, send_file, send_from_directory, g
 from services.s3_service import subir_archivo_s3, generar_url_firmada_s3, existe_archivo_s3, descargar_archivo_s3
 from werkzeug.utils import secure_filename
 
@@ -26,6 +26,20 @@ UPLOAD_FOLDER = os.path.join(os.path.dirname(__file__), '..', 'uploads', 'garant
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
 ALLOWED_EXTENSIONS = {'pdf', 'jpg', 'jpeg', 'png', 'gif', 'mp4', 'mov', 'avi', 'webp'}
+
+_STATIC_EMAIL_DIR = os.path.join(os.path.dirname(__file__), '..', 'static', 'email')
+_STATIC_EMAIL_ARCHIVOS = {'logo_elite_icon.png', 'logos-marcas.png'}
+
+
+@garantias_bp.route("/assets/<nombre>", methods=["GET"])
+def servir_asset_email(nombre):
+    """Imagenes de marca (logo, tira de marcas) para los correos de garantias.
+    Publica a proposito -- sin datos de clientes, solo branding -- porque los
+    clientes de correo (Gmail, etc.) cargan imagenes sin poder mandar un token."""
+    if nombre not in _STATIC_EMAIL_ARCHIVOS:
+        return jsonify({"error": "No encontrado"}), 404
+    return send_from_directory(_STATIC_EMAIL_DIR, nombre, max_age=86400)
+
 
 # CDMX no usa horario de verano desde 2022: UTC-6 fijo.
 ZONA_CDMX = timezone(timedelta(hours=-6))
