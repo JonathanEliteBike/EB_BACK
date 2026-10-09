@@ -139,7 +139,7 @@ def get_dashboard_data(desde: str | None = None, hasta: str | None = None) -> di
 
         # Detalle por folio, para el drill-down al hacer clic en una pieza del dashboard.
         cursor.execute(f"""
-            SELECT folio, distribuidor, marca, estatus, pieza_reemplazo
+            SELECT id, folio, distribuidor, marca, estatus, pieza_reemplazo
             FROM garantia_formularios
             WHERE pieza_reemplazo IS NOT NULL
               AND pieza_reemplazo != ''
@@ -148,6 +148,7 @@ def get_dashboard_data(desde: str | None = None, hasta: str | None = None) -> di
             ORDER BY fecha_creacion DESC
         """, rango_params)
         piezas_detalle = [{
+            "id":             r['id'],
             "folio":          r['folio'],
             "distribuidor":   r['distribuidor'],
             "marca":          r['marca'],
