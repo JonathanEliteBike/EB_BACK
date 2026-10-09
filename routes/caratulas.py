@@ -13,6 +13,11 @@ from utils.temporada_utils import etiqueta_temporada
 import logging
 import traceback
 
+from utils.auth_decorators import (
+    requiere_autenticacion,
+    requiere_modulo,
+)
+
 caratulas_bp = Blueprint('caratulas', __name__, url_prefix='')
 
 # ── Caché Redis para detalle-compras-odoo (TTL = 30 min) ─────────────────────
@@ -1506,6 +1511,189 @@ def obtener_datos_previo():
     except Exception as e:
         logging.exception("Error en obtener_datos_previo MY27")
         return jsonify({'error': str(e)}), 500
+
+
+def _caratula_desglose_mensual_evacs(
+    cursor,
+    fecha_inicio_my27,
+    fecha_fin_my27,
+    fecha_desde=None,
+    fecha_hasta=None,
+):
+    """Ventas mensuales de APPAREL, VITTORIA y SYNCROS por EVAC A/B.
+
+    Replica el universo y las ventanas de resumen_caratulas_my27:
+    clientes normales activos presentes en previo y multimarcas activos,
+    sin duplicar las claves ya asignadas a clientes normales.
+    No asigna ventas no registradas ni EVAC GO arbitrariamente a A/B.
+    La categoría es exclusiva y se basa en _caratula_clasificacion_sql.
+    """
+    clasificacion = _caratula_clasificacion_sql("m")
+    scope = _caratula_normal_en_previo_sql("c")
+    scope_multimarcas = _caratula_normal_en_previo_sql("c_scope")
+    inicio_multi, fin_multi = _caratula_rango_general_efectivo(
+        fecha_inicio_my27, fecha_fin_my27, fecha_desde, fecha_hasta
+    )
+
+    # Misma ventana individual que _caratula_acumulados_normales_desde_monitor.
+    cursor.execute(f"""
+        SELECT x.mes, x.evac, x.clasificacion,
+               ROUND(SUM(x.venta_total), 2) AS total
+        FROM (
+            SELECT DATE_FORMAT(m.fecha_factura, '%Y-%m') AS mes,
+                   c.evac,
+                   COALESCE(m.venta_total, 0) AS venta_total,
+                   {clasificacion} AS clasificacion
+            FROM monitor m
+            INNER JOIN clientes c
+              ON TRIM(UPPER(c.clave)) = TRIM(UPPER(m.contacto_referencia))
+            WHERE c.activo = 1
+              AND c.evac IN ('A', 'B')
+              AND {scope}
+              AND m.fecha_factura >= CASE
+                    WHEN %s IS NULL THEN COALESCE(c.f_inicio, %s)
+                    ELSE GREATEST(%s, COALESCE(c.f_inicio, %s))
+                  END
+              AND m.fecha_factura < DATE_ADD(
+                    LEAST(
+                        COALESCE(c.f_fin, %s),
+                        COALESCE(%s, %s),
+                        CURDATE()
+                    ), INTERVAL 1 DAY
+                  )
+        ) x
+        WHERE x.clasificacion IN ('APPAREL', 'VITTORIA', 'SYNCROS')
+        GROUP BY x.mes, x.evac, x.clasificacion
+    """, (
+        fecha_desde, fecha_inicio_my27,
+        fecha_desde, fecha_inicio_my27,
+        fecha_fin_my27, fecha_hasta, fecha_fin_my27,
+    ))
+    filas_normales = cursor.fetchall()
+
+    # Misma adscripción y rango que _caratula_multimarcas_acumulados.
+    cursor.execute(f"""
+        SELECT x.mes, x.evac, x.clasificacion,
+               ROUND(SUM(x.venta_total), 2) AS total
+        FROM (
+            SELECT DATE_FORMAT(m.fecha_factura, '%Y-%m') AS mes,
+                   cm.evac,
+                   COALESCE(m.venta_total, 0) AS venta_total,
+                   {clasificacion} AS clasificacion
+            FROM monitor m
+            INNER JOIN clientes_multimarcas cm
+              ON (
+                   (TRIM(COALESCE(cm.clave, '')) <> ''
+                    AND TRIM(UPPER(cm.clave)) = TRIM(UPPER(m.contacto_referencia)))
+                   OR
+                   ((m.contacto_referencia IS NULL OR TRIM(m.contacto_referencia) = '')
+                    AND TRIM(COALESCE(cm.cliente_razon_social, '')) <> ''
+                    AND TRIM(UPPER(cm.cliente_razon_social)) = TRIM(UPPER(m.contacto_nombre)))
+                 )
+            WHERE cm.activo = 1
+              AND cm.evac IN ('A', 'B')
+              AND UPPER(TRIM(COALESCE(m.evac, ''))) = UPPER(CONCAT(TRIM(cm.evac), ' MULTIMARCAS'))
+              AND m.fecha_factura >= %s
+              AND m.fecha_factura < DATE_ADD(LEAST(%s, CURDATE()), INTERVAL 1 DAY)
+              AND NOT EXISTS (
+                  SELECT 1 FROM clientes c_scope
+                  WHERE c_scope.activo = 1
+                    AND c_scope.evac IN ('A', 'B')
+                    AND TRIM(UPPER(c_scope.clave)) = TRIM(UPPER(cm.clave))
+                    AND {scope_multimarcas}
+              )
+        ) x
+        WHERE x.clasificacion IN ('APPAREL', 'VITTORIA', 'SYNCROS')
+        GROUP BY x.mes, x.evac, x.clasificacion
+    """, (inicio_multi, fin_multi))
+    filas_multimarcas = cursor.fetchall()
+
+    categorias = ('apparel', 'vittoria', 'syncros')
+    import re as _re
+    import collections as _collections
+    cantidades = _collections.defaultdict(
+        lambda: {campo: Decimal('0') for campo in categorias}
+    )
+    for fila in [*filas_normales, *filas_multimarcas]:
+        mes = str(fila.get('mes') or '')
+        evac = str(fila.get('evac') or '').strip().upper()
+        categoria = str(fila.get('clasificacion') or '').strip().lower()
+        if (not _re.fullmatch(r'\d{4}-(0[1-9]|1[0-2])', mes)
+                or evac not in ('A', 'B') or categoria not in categorias):
+            continue
+        cantidades[(mes, evac)][categoria] += _caratula_decimal(fila.get('total'))
+
+    # Meses vacíos también aparecen en el periodo consultado. En vista oficial
+    # aparecen además meses de facturas anticipadas admitidas por f_inicio.
+    inicio_periodo = fecha_desde or fecha_inicio_my27
+    fin_periodo = min(fecha_hasta or fecha_fin_my27, datetime.now().date(), fecha_fin_my27)
+    meses = set()
+    if inicio_periodo <= fin_periodo:
+        numero = inicio_periodo.year * 12 + inicio_periodo.month - 1
+        ultimo = fin_periodo.year * 12 + fin_periodo.month - 1
+        while numero <= ultimo:
+            meses.add(f'{numero // 12:04d}-{numero % 12 + 1:02d}')
+            numero += 1
+    meses.update(mes for mes, _evac in cantidades)
+
+    totales = {
+        evac: {**{campo: Decimal('0') for campo in categorias}, 'total': Decimal('0')}
+        for evac in ('A', 'B', 'general')
+    }
+    resultado = []
+    for mes in sorted(meses):
+        for evac in ('A', 'B'):
+            montos = {
+                campo: _caratula_money(cantidades[(mes, evac)][campo])
+                for campo in categorias
+            }
+            total = sum(montos.values(), Decimal('0'))
+            for campo in categorias:
+                totales[evac][campo] += montos[campo]
+                totales['general'][campo] += montos[campo]
+            totales[evac]['total'] += total
+            totales['general']['total'] += total
+            resultado.append({
+                'mes': mes, 'evac': evac,
+                **{campo: float(montos[campo]) for campo in categorias},
+                'total': float(_caratula_money(total)),
+            })
+
+    return {
+        'filas': resultado,
+        'totales': {
+            evac: {campo: float(_caratula_money(monto)) for campo, monto in datos.items()}
+            for evac, datos in totales.items()
+        },
+    }
+
+
+@caratulas_bp.route('/ventas_lineas_evacs_mensual', methods=['GET'])
+@requiere_autenticacion
+@requiere_modulo('usuarios_caratula')
+def obtener_ventas_lineas_evacs_mensual():
+    """Consulta de solo lectura, independiente de la carátula y sus metas."""
+    conexion = None
+    cursor = None
+    try:
+        fecha_desde, fecha_hasta = _caratula_leer_rango_solicitado()
+        conexion = obtener_conexion()
+        cursor = conexion.cursor(dictionary=True)
+        inicio_my27, fin_my27 = _caratula_rango_my27(cursor)
+        datos = _caratula_desglose_mensual_evacs(
+            cursor, inicio_my27, fin_my27, fecha_desde, fecha_hasta
+        )
+        return jsonify(datos), 200
+    except ValueError as exc:
+        return jsonify({'error': str(exc)}), 400
+    except Exception:
+        logging.exception('Error en ventas_lineas_evacs_mensual')
+        return jsonify({'error': 'No se pudo consultar el desglose mensual.'}), 500
+    finally:
+        if cursor:
+            cursor.close()
+        if conexion and conexion.is_connected():
+            conexion.close()
 
 
 @caratulas_bp.route('/resumen_caratulas_my27', methods=['GET'])
