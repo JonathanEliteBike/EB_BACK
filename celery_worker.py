@@ -154,6 +154,22 @@ def enviar_caratula_pdf_async(data, usuario, historial_id):
         actualizar_estado_historial(historial_id, 'Fallido')
         return {"status": "error", "mensaje": f"Error al enviar email: {str(e)}"}
     
+@celery_app.task(name='tasks.enviar_notificacion_garantia_async')
+def enviar_notificacion_garantia_async(destinatario, folio, asunto, cuerpo_html, cc=None):
+    """Avisa por correo al distribuidor de una novedad en su ticket de garantía
+    (comentario nuevo o cambio de estatus). Via API de Gmail (OAuth2 + Domain-Wide
+    Delegation) -- el login SMTP usuario/contraseña ya no funciona para el
+    Workspace de elitebike-mx.com."""
+    try:
+        from utils.gmail_api import enviar_correo_gmail_api
+        enviar_correo_gmail_api(destinatario, asunto, cuerpo_html, cc=cc)
+        logging.info(f"[{datetime.now()}] Notificación de garantía {folio} enviada a {destinatario}" + (f" (cc: {cc})" if cc else "") + ".")
+        return {"status": "success"}
+    except Exception as e:
+        logging.error(f"[{datetime.now()}] Error notificando garantía {folio} a {destinatario}: {str(e)}")
+        return {"status": "error", "mensaje": str(e)}
+
+
 @celery_app.task(name='tasks.recalcular_previo_async')
 def recalcular_previo_async():
     """

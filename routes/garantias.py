@@ -604,6 +604,7 @@ def actualizar_estatus(form_id):
             (form_id, 'Sistema', f'Estatus actualizado a "{nuevo_estatus}" (fecha: {fecha})', 'estatus')
         )
         conn.commit()
+        _notificar_cambio_estatus(form_id, nuevo_estatus)
         return jsonify({"ok": True, "fecha_estatus": fecha})
     except Exception as e:
         logging.exception("Error al actualizar estatus: %s", e)
@@ -819,6 +820,8 @@ def actualizar_validacion_doc(form_id):
                 (form_id, 'Sistema', texto, 'validacion')
             )
         conn.commit()
+        if estado in ('valido', 'rechazado'):
+            _notificar_validacion_doc(form_id, nombre_legible, estado)
         return jsonify({"ok": True, "validacion_docs_json": val_json})
     except Exception as e:
         logging.exception("Error al validar documento: %s", e)
@@ -969,6 +972,184 @@ def get_stats():
         conn.close()
 
 
+# ── Notificaciones por correo al distribuidor ─────────────────────────────────
+
+_PORTAL_GARANTIAS_URL = "https://app.elite-bike.com/usuarios/garantias"
+_ASSETS_EMAIL_URL = "https://api.elite-bike.com/garantias/assets"
+_LOGO_ELITE_BIKE_ICON_URL = f"{_ASSETS_EMAIL_URL}/logo_elite_icon.png"
+_LOGOS_MARCAS_URL = f"{_ASSETS_EMAIL_URL}/logos-marcas.png"
+
+
+def _plantilla_email_garantia(folio: str, titulo: str, cuerpo_interno: str) -> str:
+    """Envoltura HTML con identidad de marca Elite Bike para los correos de
+    garantías -- logo recortado (el original tiene mucho margen transparente
+    y se ve casi invisible a tamaño de correo) + la tira de marcas que ya se
+    usa en el formulario de garantías."""
+    return f"""
+    <!DOCTYPE html>
+    <html>
+    <head><meta charset="UTF-8"></head>
+    <body style="margin:0;padding:0;background:#f4f4f4;font-family:'Segoe UI',Arial,sans-serif;">
+      <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#f4f4f4;padding:24px 0;">
+        <tr><td align="center">
+          <table role="presentation" width="100%" style="max-width:560px;background:#ffffff;border-radius:8px;overflow:hidden;border:1px solid #e5e5e5;">
+            <tr>
+              <td style="background:#1a1a2e;padding:18px 28px;">
+                <table role="presentation" cellpadding="0" cellspacing="0"><tr>
+                  <td style="vertical-align:middle;"><img src="{_LOGO_ELITE_BIKE_ICON_URL}" alt="" width="30" style="display:block;border:0;"></td>
+                  <td style="vertical-align:middle;padding-left:10px;"><span style="color:#ffffff;font-size:17px;font-weight:700;letter-spacing:.3px;">ELITE BIKE</span></td>
+                </tr></table>
+              </td>
+            </tr>
+            <tr><td style="height:4px;background:#EB5E28;line-height:4px;font-size:0;">&nbsp;</td></tr>
+            <tr>
+              <td style="padding:16px 28px;background:#fcfcfc;border-bottom:1px solid #eee;" align="center">
+                <img src="{_LOGOS_MARCAS_URL}" alt="Scott, Megamo, Syncros, Vittoria, Bold" style="max-width:480px;width:100%;height:auto;display:block;border:0;">
+              </td>
+            </tr>
+            <tr>
+              <td style="padding:28px;">
+                <p style="margin:0 0 4px;color:#999;font-size:12px;text-transform:uppercase;letter-spacing:.5px;">Ticket de garantía</p>
+                <h2 style="margin:0 0 18px;color:#1a1a2e;font-size:20px;">{titulo} <span style="color:#EB5E28;">{folio}</span></h2>
+                <div style="color:#333;font-size:14px;line-height:1.6;">{cuerpo_interno}</div>
+                <a href="{_PORTAL_GARANTIAS_URL}" style="display:inline-block;margin-top:22px;padding:11px 22px;background:#EB5E28;color:#ffffff;text-decoration:none;border-radius:6px;font-weight:600;font-size:13px;">Ver mi ticket</a>
+              </td>
+            </tr>
+            <tr>
+              <td style="padding:18px 28px;background:#fafafa;border-top:1px solid #eee;">
+                <p style="margin:0;font-size:12px;color:#999;">Correo automático del sistema de garantías de Elite Bike. Si tienes dudas, contacta a tu asesor.</p>
+              </td>
+            </tr>
+          </table>
+        </td></tr>
+      </table>
+    </body>
+    </html>
+    """
+
+
+def _enviar_notificacion_garantia(folio, email, asunto, cuerpo_html):
+    """Encola el envío (async vía Celery) -- nunca bloquea ni rompe la petición
+    que la dispara si Redis/Celery o el SMTP fallan."""
+    if not email:
+        return
+
+    cc = os.getenv('GARANTIAS_EMAIL_CC') or None
+
+    # Seguridad en pruebas: si hay un correo de override configurado (solo debe
+    # existir en .env local, NUNCA en producción), todo notificación se manda
+    # ahí en vez del destinatario real -- para no mandarle correos de prueba a
+    # distribuidores de verdad mientras se prueba en local.
+    override = os.getenv('GARANTIAS_EMAIL_OVERRIDE')
+    if override:
+        cuerpo_html = cuerpo_html.replace(
+            '<div style="color:#333;font-size:14px;line-height:1.6;">',
+            f'<p style="color:#888;font-size:12px;margin:0 0 14px;">[PRUEBA LOCAL -- este correo '
+            f'habria ido a <b>{email}</b>{f" (copia: {cc})" if cc else ""}]</p>'
+            '<div style="color:#333;font-size:14px;line-height:1.6;">',
+            1,
+        )
+        email = override
+        cc = None  # en pruebas locales, nada sale a direcciones reales, ni en copia
+
+    try:
+        from celery_worker import enviar_notificacion_garantia_async
+        enviar_notificacion_garantia_async.delay(email, folio, asunto, cuerpo_html, cc)
+    except Exception as e:
+        logging.exception("Error al encolar notificacion de garantia %s: %s", folio, e)
+
+
+def _email_contacto_formulario(row):
+    """Correo al que debe llegar la notificación: prioriza el que la persona
+    escribió a mano en el formulario (datos.email) -- es el que ve el admin en
+    pantalla -- y cae al correo de la cuenta (columna `email`) si ese viene
+    vacío o el JSON no trae nada usable."""
+    datos_raw = row.get('datos')
+    if datos_raw:
+        try:
+            datos = json.loads(datos_raw) if isinstance(datos_raw, str) else (datos_raw or {})
+            email_manual = (datos.get('email') or '').strip()
+            if email_manual:
+                return email_manual
+        except Exception:
+            pass
+    return row.get('email')
+
+
+def _notificar_comentario_admin(formulario_id, texto):
+    """Avisa al distribuidor que Elite Bike dejó un comentario nuevo en su ticket."""
+    conn = _conexion_garantias()
+    if not conn:
+        return
+    try:
+        cursor = conn.cursor(dictionary=True)
+        cursor.execute("SELECT folio, email, datos FROM garantia_formularios WHERE id = %s", (formulario_id,))
+        row = cursor.fetchone()
+    finally:
+        conn.close()
+    if not row:
+        return
+    cuerpo_interno = (
+        f"<p style=\"margin:0 0 14px;\">Hay un comentario nuevo de Elite Bike en tu ticket:</p>"
+        f"<p style=\"margin:0;padding:12px 16px;background:#f5f5f5;border-left:3px solid #EB5E28;border-radius:4px;\">{texto}</p>"
+    )
+    cuerpo = _plantilla_email_garantia(row['folio'], "Nuevo comentario en tu ticket", cuerpo_interno)
+    _enviar_notificacion_garantia(row['folio'], _email_contacto_formulario(row), f"Nuevo comentario en tu ticket {row['folio']}", cuerpo)
+
+
+def _notificar_cambio_estatus(formulario_id, nuevo_estatus):
+    """Avisa al distribuidor que el estatus principal de su ticket cambió."""
+    conn = _conexion_garantias()
+    if not conn:
+        return
+    try:
+        cursor = conn.cursor(dictionary=True)
+        cursor.execute("SELECT folio, email, datos FROM garantia_formularios WHERE id = %s", (formulario_id,))
+        row = cursor.fetchone()
+    finally:
+        conn.close()
+    if not row:
+        return
+    cuerpo_interno = (
+        f"<p style=\"margin:0;\">El estatus de tu ticket cambió a:</p>"
+        f"<p style=\"margin:10px 0 0;font-size:18px;font-weight:700;color:#1a1a2e;\">{nuevo_estatus}</p>"
+    )
+    cuerpo = _plantilla_email_garantia(row['folio'], "Actualización de estatus", cuerpo_interno)
+    _enviar_notificacion_garantia(row['folio'], _email_contacto_formulario(row), f"Actualización de tu ticket {row['folio']}: {nuevo_estatus}", cuerpo)
+
+
+def _notificar_validacion_doc(formulario_id, nombre_legible, estado):
+    """Avisa al distribuidor que un documento de su ticket fue validado o rechazado."""
+    conn = _conexion_garantias()
+    if not conn:
+        return
+    try:
+        cursor = conn.cursor(dictionary=True)
+        cursor.execute("SELECT folio, email, datos FROM garantia_formularios WHERE id = %s", (formulario_id,))
+        row = cursor.fetchone()
+    finally:
+        conn.close()
+    if not row:
+        return
+    if estado == 'rechazado':
+        asunto = f"Documento rechazado en tu ticket {row['folio']} -- se requiere corrección"
+        cuerpo_interno = (
+            f"<p style=\"margin:0 0 10px;\">El documento <b>\"{nombre_legible}\"</b> fue "
+            f"<span style=\"color:#e53935;font-weight:700;\">rechazado</span> y necesita corregirse.</p>"
+            f"<p style=\"margin:0;\">Sube el documento corregido desde tu portal.</p>"
+        )
+        titulo = "Documento rechazado"
+    else:
+        asunto = f"Documento validado en tu ticket {row['folio']}"
+        cuerpo_interno = (
+            f"<p style=\"margin:0;\">El documento <b>\"{nombre_legible}\"</b> fue "
+            f"<span style=\"color:#2e7d32;font-weight:700;\">validado</span> correctamente.</p>"
+        )
+        titulo = "Documento validado"
+    cuerpo = _plantilla_email_garantia(row['folio'], titulo, cuerpo_interno)
+    _enviar_notificacion_garantia(row['folio'], _email_contacto_formulario(row), asunto, cuerpo)
+
+
 # ── Comentarios de ticket ─────────────────────────────────────────────────────
 
 @garantias_bp.route("/ticket/<int:formulario_id>/comentarios", methods=["GET"])
@@ -1044,9 +1225,69 @@ def add_comentario(formulario_id):
             VALUES (%s, %s, %s, %s)
         """, (formulario_id, autor, texto, tipo))
         conn.commit()
+
+        if tipo == 'comentario' and int(g.usuario_actual.get('rol', 0)) in (1, 4):
+            _notificar_comentario_admin(formulario_id, texto)
+
         return jsonify({"ok": True, "id": cursor.lastrowid})
     except Exception as e:
         logging.exception("Error al agregar comentario: %s", e)
+        return jsonify({"error": str(e)}), 500
+    finally:
+        conn.close()
+
+
+@garantias_bp.route("/comentario/<int:comentario_id>", methods=["PUT"])
+@requiere_autenticacion
+@requiere_rol(1)
+@requiere_permiso_interno("garantias", "editar")
+def editar_comentario(comentario_id):
+    """Corrige el texto de un comentario o nota interna (ej. un dato mal escrito)."""
+    conn = _conexion_garantias()
+    if not conn:
+        return jsonify({"error": "Sin conexion a BD"}), 500
+    try:
+        datos = request.get_json(force=True) or {}
+        texto = (datos.get('texto') or '').strip()
+        if not texto:
+            return jsonify({"error": "El comentario no puede estar vacio"}), 400
+
+        cursor = conn.cursor()
+        cursor.execute(
+            "UPDATE garantia_comentarios SET texto = %s WHERE id = %s",
+            (texto, comentario_id)
+        )
+        if cursor.rowcount == 0:
+            conn.rollback()
+            return jsonify({"error": "Comentario no encontrado"}), 404
+        conn.commit()
+        return jsonify({"ok": True})
+    except Exception as e:
+        logging.exception("Error al editar comentario: %s", e)
+        return jsonify({"error": str(e)}), 500
+    finally:
+        conn.close()
+
+
+@garantias_bp.route("/comentario/<int:comentario_id>", methods=["DELETE"])
+@requiere_autenticacion
+@requiere_rol(1)
+@requiere_permiso_interno("garantias", "eliminar")
+def eliminar_comentario(comentario_id):
+    """Elimina un comentario o nota interna puesto por error."""
+    conn = _conexion_garantias()
+    if not conn:
+        return jsonify({"error": "Sin conexion a BD"}), 500
+    try:
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM garantia_comentarios WHERE id = %s", (comentario_id,))
+        if cursor.rowcount == 0:
+            conn.rollback()
+            return jsonify({"error": "Comentario no encontrado"}), 404
+        conn.commit()
+        return jsonify({"ok": True})
+    except Exception as e:
+        logging.exception("Error al eliminar comentario: %s", e)
         return jsonify({"error": str(e)}), 500
     finally:
         conn.close()
