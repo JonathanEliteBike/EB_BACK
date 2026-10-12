@@ -158,7 +158,7 @@ def get_dashboard_data(desde: str | None = None, hasta: str | None = None) -> di
 
         # ── Ubicación del daño y desglose de cuadros (desde JSON datos) ──────
         cursor.execute(f"""
-            SELECT folio, distribuidor, pieza_reemplazo, datos
+            SELECT id, folio, distribuidor, pieza_reemplazo, datos
             FROM garantia_formularios WHERE datos IS NOT NULL {rango_and}
         """, rango_params)
         ubic_dano: dict = {}
@@ -188,6 +188,7 @@ def get_dashboard_data(desde: str | None = None, hasta: str | None = None) -> di
                                     tipo_dano = str(otros).strip()
                             break
                     cuadros_detalle.append({
+                        "id":           row.get('id'),
                         "folio":        row.get('folio'),
                         "distribuidor": row.get('distribuidor'),
                         "tipo_marco":   tipo_marco,
