@@ -2370,16 +2370,20 @@ def _recalcular_campos(data: dict, conn=None) -> dict:
     )
 
     # ── Fechas proyectadas Booking→Almacén (solo lectura, calculadas) ──────────
-    # A partir de Entrega (real) + la regla de importaciones_tiempos_estimados
-    # que haga match exacto con origen + tipo de producto + vía. Se recalculan
-    # SIEMPRE que se guarde el embarque -- PERO solo se sobre-escriben cuando
-    # SÍ hay una regla que aplique. Si no hay regla, NO se tocan: muchos
-    # embarques (los de antes de que existiera esta función, con origen/tipo
-    # de producto en texto libre) ya traían estas fechas capturadas a mano, y
-    # machacarlas a NULL en cuanto alguien guardaba cualquier otro campo del
-    # embarque las borraba en silencio -- eso pasó de verdad en producción
-    # (ver incidente 2026-09-23, docs/superpowers/specs).
-    entrega       = data.get("log_fecha_entrega")
+    # A partir de Entrega (PROYECTADA) + la regla de
+    # importaciones_tiempos_estimados que haga match exacto con origen + tipo
+    # de producto + vía. Toda esta cadena son fechas proyectadas -- se ancla
+    # en la Entrega Proyectada, nunca en la Real (usar la real desfasaba la
+    # cadena completa en cuanto se capturaba, ~10 días en el caso real que lo
+    # evidenció: R26-1545, reportado por el usuario 2026-10-14). Se
+    # recalculan SIEMPRE que se guarde el embarque -- PERO solo se
+    # sobre-escriben cuando SÍ hay una regla que aplique. Si no hay regla, NO
+    # se tocan: muchos embarques (los de antes de que existiera esta función,
+    # con origen/tipo de producto en texto libre) ya traían estas fechas
+    # capturadas a mano, y machacarlas a NULL en cuanto alguien guardaba
+    # cualquier otro campo del embarque las borraba en silencio -- eso pasó
+    # de verdad en producción (ver incidente 2026-09-23, docs/superpowers/specs).
+    entrega       = data.get("log_fecha_entrega_prog")
     origen        = data.get("log_origen")
     tipo_producto = data.get("log_tipo_productos")
     via           = data.get("via_transporte")
