@@ -3,10 +3,11 @@ import json
 import logging
 import os
 import uuid
-from datetime import date, datetime
+
+from datetime import date, datetime, timedelta, timezone
 from functools import wraps
 
-from flask import Blueprint, jsonify, request, send_file, g
+from flask import Blueprint, jsonify, request, send_file, send_from_directory, g
 from services.s3_service import subir_archivo_s3, generar_url_firmada_s3, existe_archivo_s3, descargar_archivo_s3
 from werkzeug.utils import secure_filename
 
@@ -27,6 +28,38 @@ UPLOAD_FOLDER = os.path.join(os.path.dirname(__file__), '..', 'uploads', 'garant
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
 ALLOWED_EXTENSIONS = {'pdf', 'jpg', 'jpeg', 'png', 'gif', 'mp4', 'mov', 'avi', 'webp'}
+
+_STATIC_EMAIL_DIR = os.path.join(os.path.dirname(__file__), '..', 'static', 'email')
+_STATIC_EMAIL_ARCHIVOS = {'logo_elite_icon.png', 'logos-marcas.png'}
+
+
+@garantias_bp.route("/assets/<nombre>", methods=["GET"])
+def servir_asset_email(nombre):
+    """Imagenes de marca (logo, tira de marcas) para los correos de garantias.
+    Publica a proposito -- sin datos de clientes, solo branding -- porque los
+    clientes de correo (Gmail, etc.) cargan imagenes sin poder mandar un token."""
+    if nombre not in _STATIC_EMAIL_ARCHIVOS:
+        return jsonify({"error": "No encontrado"}), 404
+    return send_from_directory(_STATIC_EMAIL_DIR, nombre, max_age=86400)
+
+
+# CDMX no usa horario de verano desde 2022: UTC-6 fijo.
+ZONA_CDMX = timezone(timedelta(hours=-6))
+
+
+def _conexion_garantias():
+    """Conexión con la zona horaria de sesión en CDMX, para que NOW() y los DEFAULT
+    DATETIME de estas tablas guarden la hora local y no la del servidor (UTC)."""
+    conn = obtener_conexion()
+    if conn:
+        cur = conn.cursor()
+        cur.execute("SET time_zone = '-06:00'")
+        cur.close()
+    return conn
+
+
+def _hoy_cdmx():
+    return datetime.now(ZONA_CDMX).date()
 
 
 def allowed_file(filename):
@@ -178,7 +211,7 @@ def refrescar():
 @requiere_autenticacion
 @requiere_rol(1)
 def inicializar_tablas():
-    conn = obtener_conexion()
+    conn = _conexion_garantias()
     if not conn:
         return jsonify({"error": "Sin conexion a BD"}), 500
     try:
@@ -286,7 +319,7 @@ def inicializar_tablas():
 @requiere_modulo("usuarios_garantias")
 @requiere_permiso_interno("garantias", "crear")
 def enviar_formulario():
-    conn = obtener_conexion()
+    conn = _conexion_garantias()
     if not conn:
         return jsonify({"error": "Sin conexion a BD"}), 500
     try:
@@ -367,7 +400,7 @@ def enviar_formulario():
 @requiere_rol(1)
 @requiere_permiso_interno("garantias", "ver")
 def lista_formularios():
-    conn = obtener_conexion()
+    conn = _conexion_garantias()
     if not conn:
         return jsonify({"error": "Sin conexion a BD"}), 500
     try:
@@ -402,7 +435,7 @@ def lista_formularios():
 @requiere_modulo("usuarios_garantias")
 def actualizar_dato_usuario(form_id):
     """El usuario dueño del ticket actualiza un campo rechazado y resetea su validación."""
-    conn = obtener_conexion()
+    conn = _conexion_garantias()
     if not conn:
         return jsonify({"error": "Sin conexion a BD"}), 500
     try:
@@ -479,7 +512,7 @@ def mis_tickets():
     """
     user_id = g.usuario_actual['id']
 
-    conn = obtener_conexion()
+    conn = _conexion_garantias()
     if not conn:
         return jsonify({"error": "Sin conexion a BD"}), 500
     try:
@@ -530,7 +563,7 @@ def mis_tickets():
 @requiere_permiso_interno("garantias", "eliminar")
 def eliminar_formulario(form_id):
     """Elimina un ticket y renumera los folios consecutivamente. Solo admins."""
-    conn = obtener_conexion()
+    conn = _conexion_garantias()
     if not conn:
         return jsonify({"error": "Sin conexion a BD"}), 500
     try:
@@ -565,7 +598,7 @@ def eliminar_formulario(form_id):
 @requiere_modulo("usuarios_garantias")
 @requiere_permiso_interno("garantias", "ver")
 def obtener_formulario(form_id):
-    conn = obtener_conexion()
+    conn = _conexion_garantias()
     if not conn:
         return jsonify({"error": "Sin conexion a BD"}), 500
     try:
@@ -601,13 +634,13 @@ def obtener_formulario(form_id):
 @requiere_rol(1)
 @requiere_permiso_interno("garantias", "editar")
 def actualizar_estatus(form_id):
-    conn = obtener_conexion()
+    conn = _conexion_garantias()
     if not conn:
         return jsonify({"error": "Sin conexion a BD"}), 500
     try:
         datos = request.get_json(force=True) or {}
         nuevo_estatus = datos.get('estatus', 'Enviado')
-        fecha = datos.get('fecha') or date.today().isoformat()
+        fecha = datos.get('fecha') or _hoy_cdmx().isoformat()
         cursor = conn.cursor()
         cursor.execute(
             "UPDATE garantia_formularios SET estatus = %s, fecha_estatus = %s WHERE id = %s",
@@ -618,6 +651,7 @@ def actualizar_estatus(form_id):
             (form_id, 'Sistema', f'Estatus actualizado a "{nuevo_estatus}" (fecha: {fecha})', 'estatus')
         )
         conn.commit()
+        _notificar_cambio_estatus(form_id, nuevo_estatus)
         return jsonify({"ok": True, "fecha_estatus": fecha})
     except Exception as e:
         logging.exception("Error al actualizar estatus: %s", e)
@@ -632,12 +666,12 @@ def actualizar_estatus(form_id):
 @requiere_permiso_interno("garantias", "editar")
 def actualizar_fecha_estatus(form_id):
     """Edita solo la fecha del estatus actual sin cambiar el estatus."""
-    conn = obtener_conexion()
+    conn = _conexion_garantias()
     if not conn:
         return jsonify({"error": "Sin conexion a BD"}), 500
     try:
         datos = request.get_json(force=True) or {}
-        fecha = datos.get('fecha') or date.today().isoformat()
+        fecha = datos.get('fecha') or _hoy_cdmx().isoformat()
         cursor = conn.cursor()
         cursor.execute(
             "UPDATE garantia_formularios SET fecha_estatus = %s WHERE id = %s",
@@ -662,12 +696,12 @@ def actualizar_fecha_estatus(form_id):
 @requiere_permiso_interno("garantias", "editar")
 def actualizar_fecha_creacion(form_id):
     """Corrige la fecha de alta (creación) del ticket cuando se registró mal, sin borrar y recrear."""
-    conn = obtener_conexion()
+    conn = _conexion_garantias()
     if not conn:
         return jsonify({"error": "Sin conexion a BD"}), 500
     try:
         datos = request.get_json(force=True) or {}
-        fecha = datos.get('fecha') or date.today().isoformat()
+        fecha = datos.get('fecha') or _hoy_cdmx().isoformat()
         cursor = conn.cursor()
         cursor.execute(
             "UPDATE garantia_formularios SET fecha_creacion = %s WHERE id = %s",
@@ -691,7 +725,7 @@ def actualizar_fecha_creacion(form_id):
 @requiere_rol(1)
 @requiere_permiso_interno("garantias", "editar")
 def actualizar_pieza_reemplazo(form_id):
-    conn = obtener_conexion()
+    conn = _conexion_garantias()
     if not conn:
         return jsonify({"error": "Sin conexion a BD"}), 500
     try:
@@ -720,13 +754,13 @@ def actualizar_pieza_reemplazo(form_id):
 @requiere_rol(1)
 @requiere_permiso_interno("garantias", "editar")
 def actualizar_pieza(form_id):
-    conn = obtener_conexion()
+    conn = _conexion_garantias()
     if not conn:
         return jsonify({"error": "Sin conexion a BD"}), 500
     try:
         datos = request.get_json(force=True) or {}
         nuevo_estatus = datos.get('estatus_pieza', 'Sin pieza')
-        fecha = datos.get('fecha') or date.today().isoformat()
+        fecha = datos.get('fecha') or _hoy_cdmx().isoformat()
         cursor = conn.cursor()
         cursor.execute(
             "UPDATE garantia_formularios SET estatus_pieza = %s, fecha_pieza = %s WHERE id = %s",
@@ -751,12 +785,12 @@ def actualizar_pieza(form_id):
 @requiere_permiso_interno("garantias", "editar")
 def actualizar_fecha_pieza(form_id):
     """Edita solo la fecha del estatus de pieza sin cambiar el estatus."""
-    conn = obtener_conexion()
+    conn = _conexion_garantias()
     if not conn:
         return jsonify({"error": "Sin conexion a BD"}), 500
     try:
         datos = request.get_json(force=True) or {}
-        fecha = datos.get('fecha') or date.today().isoformat()
+        fecha = datos.get('fecha') or _hoy_cdmx().isoformat()
         cursor = conn.cursor()
         cursor.execute(
             "UPDATE garantia_formularios SET fecha_pieza = %s WHERE id = %s",
@@ -781,7 +815,7 @@ def actualizar_fecha_pieza(form_id):
 @requiere_permiso_interno("garantias", "editar")
 def actualizar_validacion_doc(form_id):
     """Valida o rechaza un documento individual. body: {campo, estado, nombre_legible}"""
-    conn = obtener_conexion()
+    conn = _conexion_garantias()
     if not conn:
         return jsonify({"error": "Sin conexion a BD"}), 500
     try:
@@ -833,6 +867,8 @@ def actualizar_validacion_doc(form_id):
                 (form_id, 'Sistema', texto, 'validacion')
             )
         conn.commit()
+        if estado in ('valido', 'rechazado'):
+            _notificar_validacion_doc(form_id, nombre_legible, estado)
         return jsonify({"ok": True, "validacion_docs_json": val_json})
     except Exception as e:
         logging.exception("Error al validar documento: %s", e)
@@ -846,7 +882,7 @@ def actualizar_validacion_doc(form_id):
 @requiere_rol(1)
 @requiere_permiso_interno("garantias", "editar")
 def actualizar_validacion(form_id):
-    conn = obtener_conexion()
+    conn = _conexion_garantias()
     if not conn:
         return jsonify({"error": "Sin conexion a BD"}), 500
     try:
@@ -896,7 +932,7 @@ def actualizar_validacion(form_id):
 @requiere_modulo("usuarios_garantias")
 @requiere_permiso_interno("garantias", "ver")
 def obtener_estructura():
-    conn = obtener_conexion()
+    conn = _conexion_garantias()
     if not conn:
         return jsonify({"error": "Sin conexion a BD"}), 500
     try:
@@ -922,7 +958,7 @@ def obtener_estructura():
 @requiere_rol(1)
 @requiere_permiso_interno("garantias", "editar")
 def guardar_estructura():
-    conn = obtener_conexion()
+    conn = _conexion_garantias()
     if not conn:
         return jsonify({"error": "Sin conexion a BD"}), 500
     try:
@@ -952,7 +988,7 @@ def guardar_estructura():
 @requiere_rol(1)
 @requiere_permiso_interno("garantias", "ver")
 def get_stats():
-    conn = obtener_conexion()
+    conn = _conexion_garantias()
     if not conn:
         return jsonify({"error": "Sin conexion a BD"}), 500
     try:
@@ -983,6 +1019,184 @@ def get_stats():
         conn.close()
 
 
+# ── Notificaciones por correo al distribuidor ─────────────────────────────────
+
+_PORTAL_GARANTIAS_URL = "https://app.elite-bike.com/usuarios/garantias"
+_ASSETS_EMAIL_URL = "https://api.elite-bike.com/garantias/assets"
+_LOGO_ELITE_BIKE_ICON_URL = f"{_ASSETS_EMAIL_URL}/logo_elite_icon.png"
+_LOGOS_MARCAS_URL = f"{_ASSETS_EMAIL_URL}/logos-marcas.png"
+
+
+def _plantilla_email_garantia(folio: str, titulo: str, cuerpo_interno: str) -> str:
+    """Envoltura HTML con identidad de marca Elite Bike para los correos de
+    garantías -- logo recortado (el original tiene mucho margen transparente
+    y se ve casi invisible a tamaño de correo) + la tira de marcas que ya se
+    usa en el formulario de garantías."""
+    return f"""
+    <!DOCTYPE html>
+    <html>
+    <head><meta charset="UTF-8"></head>
+    <body style="margin:0;padding:0;background:#f4f4f4;font-family:'Segoe UI',Arial,sans-serif;">
+      <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#f4f4f4;padding:24px 0;">
+        <tr><td align="center">
+          <table role="presentation" width="100%" style="max-width:560px;background:#ffffff;border-radius:8px;overflow:hidden;border:1px solid #e5e5e5;">
+            <tr>
+              <td style="background:#1a1a2e;padding:18px 28px;">
+                <table role="presentation" cellpadding="0" cellspacing="0"><tr>
+                  <td style="vertical-align:middle;"><img src="{_LOGO_ELITE_BIKE_ICON_URL}" alt="" width="30" style="display:block;border:0;"></td>
+                  <td style="vertical-align:middle;padding-left:10px;"><span style="color:#ffffff;font-size:17px;font-weight:700;letter-spacing:.3px;">ELITE BIKE</span></td>
+                </tr></table>
+              </td>
+            </tr>
+            <tr><td style="height:4px;background:#EB5E28;line-height:4px;font-size:0;">&nbsp;</td></tr>
+            <tr>
+              <td style="padding:16px 28px;background:#fcfcfc;border-bottom:1px solid #eee;" align="center">
+                <img src="{_LOGOS_MARCAS_URL}" alt="Scott, Megamo, Syncros, Vittoria, Bold" style="max-width:480px;width:100%;height:auto;display:block;border:0;">
+              </td>
+            </tr>
+            <tr>
+              <td style="padding:28px;">
+                <p style="margin:0 0 4px;color:#999;font-size:12px;text-transform:uppercase;letter-spacing:.5px;">Ticket de garantía</p>
+                <h2 style="margin:0 0 18px;color:#1a1a2e;font-size:20px;">{titulo} <span style="color:#EB5E28;">{folio}</span></h2>
+                <div style="color:#333;font-size:14px;line-height:1.6;">{cuerpo_interno}</div>
+                <a href="{_PORTAL_GARANTIAS_URL}" style="display:inline-block;margin-top:22px;padding:11px 22px;background:#EB5E28;color:#ffffff;text-decoration:none;border-radius:6px;font-weight:600;font-size:13px;">Ver mi ticket</a>
+              </td>
+            </tr>
+            <tr>
+              <td style="padding:18px 28px;background:#fafafa;border-top:1px solid #eee;">
+                <p style="margin:0;font-size:12px;color:#999;">Correo automático del sistema de garantías de Elite Bike. Si tienes dudas, contacta a tu asesor.</p>
+              </td>
+            </tr>
+          </table>
+        </td></tr>
+      </table>
+    </body>
+    </html>
+    """
+
+
+def _enviar_notificacion_garantia(folio, email, asunto, cuerpo_html):
+    """Encola el envío (async vía Celery) -- nunca bloquea ni rompe la petición
+    que la dispara si Redis/Celery o el SMTP fallan."""
+    if not email:
+        return
+
+    cc = os.getenv('GARANTIAS_EMAIL_CC') or None
+
+    # Seguridad en pruebas: si hay un correo de override configurado (solo debe
+    # existir en .env local, NUNCA en producción), todo notificación se manda
+    # ahí en vez del destinatario real -- para no mandarle correos de prueba a
+    # distribuidores de verdad mientras se prueba en local.
+    override = os.getenv('GARANTIAS_EMAIL_OVERRIDE')
+    if override:
+        cuerpo_html = cuerpo_html.replace(
+            '<div style="color:#333;font-size:14px;line-height:1.6;">',
+            f'<p style="color:#888;font-size:12px;margin:0 0 14px;">[PRUEBA LOCAL -- este correo '
+            f'habria ido a <b>{email}</b>{f" (copia: {cc})" if cc else ""}]</p>'
+            '<div style="color:#333;font-size:14px;line-height:1.6;">',
+            1,
+        )
+        email = override
+        cc = None  # en pruebas locales, nada sale a direcciones reales, ni en copia
+
+    try:
+        from celery_worker import enviar_notificacion_garantia_async
+        enviar_notificacion_garantia_async.delay(email, folio, asunto, cuerpo_html, cc)
+    except Exception as e:
+        logging.exception("Error al encolar notificacion de garantia %s: %s", folio, e)
+
+
+def _email_contacto_formulario(row):
+    """Correo al que debe llegar la notificación: prioriza el que la persona
+    escribió a mano en el formulario (datos.email) -- es el que ve el admin en
+    pantalla -- y cae al correo de la cuenta (columna `email`) si ese viene
+    vacío o el JSON no trae nada usable."""
+    datos_raw = row.get('datos')
+    if datos_raw:
+        try:
+            datos = json.loads(datos_raw) if isinstance(datos_raw, str) else (datos_raw or {})
+            email_manual = (datos.get('email') or '').strip()
+            if email_manual:
+                return email_manual
+        except Exception:
+            pass
+    return row.get('email')
+
+
+def _notificar_comentario_admin(formulario_id, texto):
+    """Avisa al distribuidor que Elite Bike dejó un comentario nuevo en su ticket."""
+    conn = _conexion_garantias()
+    if not conn:
+        return
+    try:
+        cursor = conn.cursor(dictionary=True)
+        cursor.execute("SELECT folio, email, datos FROM garantia_formularios WHERE id = %s", (formulario_id,))
+        row = cursor.fetchone()
+    finally:
+        conn.close()
+    if not row:
+        return
+    cuerpo_interno = (
+        f"<p style=\"margin:0 0 14px;\">Hay un comentario nuevo de Elite Bike en tu ticket:</p>"
+        f"<p style=\"margin:0;padding:12px 16px;background:#f5f5f5;border-left:3px solid #EB5E28;border-radius:4px;\">{texto}</p>"
+    )
+    cuerpo = _plantilla_email_garantia(row['folio'], "Nuevo comentario en tu ticket", cuerpo_interno)
+    _enviar_notificacion_garantia(row['folio'], _email_contacto_formulario(row), f"Nuevo comentario en tu ticket {row['folio']}", cuerpo)
+
+
+def _notificar_cambio_estatus(formulario_id, nuevo_estatus):
+    """Avisa al distribuidor que el estatus principal de su ticket cambió."""
+    conn = _conexion_garantias()
+    if not conn:
+        return
+    try:
+        cursor = conn.cursor(dictionary=True)
+        cursor.execute("SELECT folio, email, datos FROM garantia_formularios WHERE id = %s", (formulario_id,))
+        row = cursor.fetchone()
+    finally:
+        conn.close()
+    if not row:
+        return
+    cuerpo_interno = (
+        f"<p style=\"margin:0;\">El estatus de tu ticket cambió a:</p>"
+        f"<p style=\"margin:10px 0 0;font-size:18px;font-weight:700;color:#1a1a2e;\">{nuevo_estatus}</p>"
+    )
+    cuerpo = _plantilla_email_garantia(row['folio'], "Actualización de estatus", cuerpo_interno)
+    _enviar_notificacion_garantia(row['folio'], _email_contacto_formulario(row), f"Actualización de tu ticket {row['folio']}: {nuevo_estatus}", cuerpo)
+
+
+def _notificar_validacion_doc(formulario_id, nombre_legible, estado):
+    """Avisa al distribuidor que un documento de su ticket fue validado o rechazado."""
+    conn = _conexion_garantias()
+    if not conn:
+        return
+    try:
+        cursor = conn.cursor(dictionary=True)
+        cursor.execute("SELECT folio, email, datos FROM garantia_formularios WHERE id = %s", (formulario_id,))
+        row = cursor.fetchone()
+    finally:
+        conn.close()
+    if not row:
+        return
+    if estado == 'rechazado':
+        asunto = f"Documento rechazado en tu ticket {row['folio']} -- se requiere corrección"
+        cuerpo_interno = (
+            f"<p style=\"margin:0 0 10px;\">El documento <b>\"{nombre_legible}\"</b> fue "
+            f"<span style=\"color:#e53935;font-weight:700;\">rechazado</span> y necesita corregirse.</p>"
+            f"<p style=\"margin:0;\">Sube el documento corregido desde tu portal.</p>"
+        )
+        titulo = "Documento rechazado"
+    else:
+        asunto = f"Documento validado en tu ticket {row['folio']}"
+        cuerpo_interno = (
+            f"<p style=\"margin:0;\">El documento <b>\"{nombre_legible}\"</b> fue "
+            f"<span style=\"color:#2e7d32;font-weight:700;\">validado</span> correctamente.</p>"
+        )
+        titulo = "Documento validado"
+    cuerpo = _plantilla_email_garantia(row['folio'], titulo, cuerpo_interno)
+    _enviar_notificacion_garantia(row['folio'], _email_contacto_formulario(row), asunto, cuerpo)
+
+
 # ── Comentarios de ticket ─────────────────────────────────────────────────────
 
 @garantias_bp.route("/ticket/<int:formulario_id>/comentarios", methods=["GET"])
@@ -990,7 +1204,7 @@ def get_stats():
 @requiere_modulo("usuarios_garantias")
 @requiere_permiso_interno("garantias", "ver")
 def get_comentarios(formulario_id):
-    conn = obtener_conexion()
+    conn = _conexion_garantias()
     if not conn:
         return jsonify({"error": "Sin conexion a BD"}), 500
     try:
@@ -1027,7 +1241,7 @@ def get_comentarios(formulario_id):
 @requiere_modulo("usuarios_garantias")
 @requiere_permiso_interno("garantias", "crear")
 def add_comentario(formulario_id):
-    conn = obtener_conexion()
+    conn = _conexion_garantias()
     if not conn:
         return jsonify({"error": "Sin conexion a BD"}), 500
     try:
@@ -1058,9 +1272,69 @@ def add_comentario(formulario_id):
             VALUES (%s, %s, %s, %s)
         """, (formulario_id, autor, texto, tipo))
         conn.commit()
+
+        if tipo == 'comentario' and int(g.usuario_actual.get('rol', 0)) in (1, 4):
+            _notificar_comentario_admin(formulario_id, texto)
+
         return jsonify({"ok": True, "id": cursor.lastrowid})
     except Exception as e:
         logging.exception("Error al agregar comentario: %s", e)
+        return jsonify({"error": str(e)}), 500
+    finally:
+        conn.close()
+
+
+@garantias_bp.route("/comentario/<int:comentario_id>", methods=["PUT"])
+@requiere_autenticacion
+@requiere_rol(1)
+@requiere_permiso_interno("garantias", "editar")
+def editar_comentario(comentario_id):
+    """Corrige el texto de un comentario o nota interna (ej. un dato mal escrito)."""
+    conn = _conexion_garantias()
+    if not conn:
+        return jsonify({"error": "Sin conexion a BD"}), 500
+    try:
+        datos = request.get_json(force=True) or {}
+        texto = (datos.get('texto') or '').strip()
+        if not texto:
+            return jsonify({"error": "El comentario no puede estar vacio"}), 400
+
+        cursor = conn.cursor()
+        cursor.execute(
+            "UPDATE garantia_comentarios SET texto = %s WHERE id = %s",
+            (texto, comentario_id)
+        )
+        if cursor.rowcount == 0:
+            conn.rollback()
+            return jsonify({"error": "Comentario no encontrado"}), 404
+        conn.commit()
+        return jsonify({"ok": True})
+    except Exception as e:
+        logging.exception("Error al editar comentario: %s", e)
+        return jsonify({"error": str(e)}), 500
+    finally:
+        conn.close()
+
+
+@garantias_bp.route("/comentario/<int:comentario_id>", methods=["DELETE"])
+@requiere_autenticacion
+@requiere_rol(1)
+@requiere_permiso_interno("garantias", "eliminar")
+def eliminar_comentario(comentario_id):
+    """Elimina un comentario o nota interna puesto por error."""
+    conn = _conexion_garantias()
+    if not conn:
+        return jsonify({"error": "Sin conexion a BD"}), 500
+    try:
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM garantia_comentarios WHERE id = %s", (comentario_id,))
+        if cursor.rowcount == 0:
+            conn.rollback()
+            return jsonify({"error": "Comentario no encontrado"}), 404
+        conn.commit()
+        return jsonify({"ok": True})
+    except Exception as e:
+        logging.exception("Error al eliminar comentario: %s", e)
         return jsonify({"error": str(e)}), 500
     finally:
         conn.close()
@@ -1074,7 +1348,7 @@ def add_comentario(formulario_id):
 @requiere_permiso_interno("garantias", "ver")
 def get_latencias():
     """Devuelve latencia de atención y de cierre por ticket individual."""
-    conn = obtener_conexion()
+    conn = _conexion_garantias()
     if not conn:
         return jsonify({"error": "Sin conexion a BD"}), 500
     try:
@@ -1114,7 +1388,7 @@ def get_latencias():
 @requiere_rol(1)
 @requiere_permiso_interno("garantias", "ver")
 def listar_piezas():
-    conn = obtener_conexion()
+    conn = _conexion_garantias()
     if not conn:
         return jsonify({"error": "Sin conexion a BD"}), 500
     try:
@@ -1156,7 +1430,7 @@ def listar_piezas():
 @requiere_rol(1)
 @requiere_permiso_interno("garantias", "crear")
 def agregar_pieza():
-    conn = obtener_conexion()
+    conn = _conexion_garantias()
     if not conn:
         return jsonify({"error": "Sin conexion a BD"}), 500
     try:
@@ -1187,7 +1461,7 @@ def contar_uso_pieza():
     nombre = (request.args.get('nombre') or '').strip().upper()
     if not nombre:
         return jsonify({"error": "El nombre de la pieza es requerido"}), 400
-    conn = obtener_conexion()
+    conn = _conexion_garantias()
     if not conn:
         return jsonify({"error": "Sin conexion a BD"}), 500
     try:
@@ -1214,7 +1488,7 @@ def eliminar_pieza():
     duplicados o nombres capturados por error (ej. 'MAUBRIO'). No afecta los
     tickets que ya tengan esa pieza asignada, solo deja de ofrecerse en el
     selector de nuevas asignaciones."""
-    conn = obtener_conexion()
+    conn = _conexion_garantias()
     if not conn:
         return jsonify({"error": "Sin conexion a BD"}), 500
     try:
@@ -1268,7 +1542,7 @@ def _requiere_admin(request):
     payload = verificar_token(raw_token)
     if not payload or not payload.get('id'):
         return None, (jsonify({"error": "Token inválido"}), 401)
-    conn = obtener_conexion()
+    conn = _conexion_garantias()
     if not conn:
         return None, (jsonify({"error": "Sin conexión a BD"}), 500)
     try:
@@ -1373,7 +1647,7 @@ def descargar_plantilla_importacion():
     ws2.column_dimensions["A"].width = 35
     ws2.column_dimensions["B"].width = 35
 
-    conn = obtener_conexion()
+    conn = _conexion_garantias()
     if conn:
         try:
             cur = conn.cursor(dictionary=True)
@@ -1437,7 +1711,7 @@ def importar_garantias():
     ws = wb["Importar"] if "Importar" in wb.sheetnames else wb.active
 
     # Cargar usuarios del sistema para mapeo nombre → correo
-    conn = obtener_conexion()
+    conn = _conexion_garantias()
     if not conn:
         return jsonify({"error": "Sin conexión a BD"}), 500
 
@@ -1466,7 +1740,7 @@ def importar_garantias():
     errores    = []
     filas_datos = list(ws.iter_rows(min_row=4, values_only=True))  # fila 1=instrucción, 2=header, 3=ejemplo
 
-    conn = obtener_conexion()
+    conn = _conexion_garantias()
     if not conn:
         return jsonify({"error": "Sin conexión a BD"}), 500
 
@@ -1626,7 +1900,9 @@ def subir_archivo():
         return jsonify({"error": "Nombre de archivo vacio"}), 400
 
     if not allowed_file(file.filename):
-        return jsonify({"error": "Tipo de archivo no permitido"}), 400
+        if file.filename.lower().endswith(('.heic', '.heif')):
+            return jsonify({"error": "Formato HEIC no compatible. Convierte la foto a JPG antes de subirla."}), 400
+        return jsonify({"error": "Tipo de archivo no permitido. Formatos: JPG, PNG, WEBP, GIF, PDF, MP4, MOV, AVI."}), 400
 
     try:
         resultado = subir_archivo_s3(file)
@@ -1650,7 +1926,7 @@ def subir_archivo():
 @requiere_modulo("usuarios_garantias")
 @requiere_permiso_interno("garantias", "ver")
 def descargar_archivo(nombre):
-    conn = obtener_conexion()
+    conn = _conexion_garantias()
     if not conn:
         return jsonify({"error": "Sin conexion a BD"}), 500
     try:

@@ -340,7 +340,7 @@ CAMPOS_DESPACHO = [
 CAMPOS_ODOO = [
     "log_recepcion_documentos",
     "odoo_codificacion", "odoo_alta_catalogo", "odoo_alta_precios",
-    "odoo_alta_orden_compra", "odoo_folio_orden",
+    "odoo_folio_orden",
 ]
 
 CAMPOS_ALMACEN = [
@@ -454,9 +454,9 @@ def _estado_actual(r: dict) -> str:
     "Rec. Odoo" no se toma en cuenta para esto (pedido explícito), aunque sí
     se sigue mostrando en la fila de fechas del pipeline.
 
-    Una etapa con fecha real capturada (en verde) ya quedó atrás: el badge
-    debe avanzar a la siguiente etapa de la secuencia, no quedarse mostrando
-    la que ya se completó."""
+    El badge se queda en la última etapa con fecha real ya registrada (en
+    verde): solo avanza a la siguiente cuando esa siguiente etapa registra
+    su propia fecha real, no antes."""
     ultimo_completado = -1
     for i, (_, campo) in enumerate(_ETAPAS_ORDEN):
         if r.get(campo):
@@ -464,9 +464,7 @@ def _estado_actual(r: dict) -> str:
 
     if ultimo_completado == -1:
         return "Pendiente"
-    if ultimo_completado == len(_ETAPAS_ORDEN) - 1:
-        return "Liberado"
-    return _ETAPAS_ORDEN[ultimo_completado + 1][0]
+    return _ETAPAS_ORDEN[ultimo_completado][0]
 
 
 # Campos derivados que _recalcular_campos() inyecta en data — deben persistirse
@@ -1559,6 +1557,17 @@ def dashboard():
 
         def _fmt_d(v): return str(v)[:10] if v else None
 
+        def _campos_na(r):
+            raw = r.get("campos_na")
+            if isinstance(raw, str):
+                try:
+                    return set(_json.loads(raw) or [])
+                except Exception:
+                    return set()
+            if isinstance(raw, list):
+                return set(raw)
+            return set()
+
         # Tránsito (Resumen): proceso completo, Entrega del proveedor →
         # Liberación Final -- MISMO tramo para ambas vías (igual que
         # "lat_total" por embarque), filtrando solo por via_transporte, así
@@ -1700,6 +1709,8 @@ def dashboard():
         # ── Resumen por embarque ──────────────────────────────────────────────
         embarques_res = []
         for r in rows:
+            na_set = _campos_na(r)
+
             prog = _prog_cache[r["id"]]
             t = sum(s["total"] for s in prog.values())
             c = sum(s["completados"] for s in prog.values())
@@ -1775,16 +1786,16 @@ def dashboard():
                 # Cada etapa muestra el MISMO campo que usa _estado_actual() para
                 # avanzar el badge -- así el pipeline y el badge siempre coinciden.
                 "pipeline": {
-                    "entrega":         {"proy": _fmt_d(r.get("log_fecha_entrega_prog")),           "real": _fmt_d(r.get("log_fecha_entrega")),           "delta": _days_between(r.get("log_fecha_entrega_prog"), r.get("log_fecha_entrega"))},
-                    "booking":         {"proy": _fmt_d(r.get("log_fecha_booking_prog")),           "real": _fmt_d(r.get("log_fecha_booking")),           "delta": _days_between(r.get("log_fecha_booking_prog"), r.get("log_fecha_booking"))},
-                    "transito":        {"proy": _fmt_d(r.get("imp_llegada_contenedor_prog")),      "real": _fmt_d(r.get("imp_llegada_contenedor_puerto")),"delta": _days_between(r.get("imp_llegada_contenedor_prog"), r.get("imp_llegada_contenedor_puerto"))},
-                    "trans_dest":      {"proy": _fmt_d(r.get("des_fecha_cruce_prog")),             "real": _fmt_d(r.get("des_fecha_cruce_real")),        "delta": _days_between(r.get("des_fecha_cruce_prog"), r.get("des_fecha_cruce_real"))},
-                    "en_almacen":      {"proy": _fmt_d(r.get("des_fecha_entrega_almacen_prog")),   "real": _fmt_d(r.get("des_llegada_almacen")),         "delta": _days_between(r.get("des_fecha_entrega_almacen_prog"), r.get("des_llegada_almacen"))},
-                    "recepcion_odoo":  {"proy": _fmt_d(r.get("rec_recepcion_odoo_prog")),          "real": _fmt_d(r.get("rec_recepcion_odoo")),          "delta": _days_between(r.get("rec_recepcion_odoo_prog"), r.get("rec_recepcion_odoo"))},
-                    "verif":           {"proy": _fmt_d(r.get("alm_liberacion_uva_prog")),          "real": _fmt_d(r.get("alm_liberacion_uva")),          "delta": _days_between(r.get("alm_liberacion_uva_prog"), r.get("alm_liberacion_uva"))},
-                    "liberacion_verif":{"proy": _fmt_d(r.get("rec_liberacion_verificacion_prog")), "real": _fmt_d(r.get("rec_liberacion_verificacion")), "delta": _days_between(r.get("rec_liberacion_verificacion_prog"), r.get("rec_liberacion_verificacion"))},
-                    "etiquetado":      {"proy": _fmt_d(r.get("alm_terminacion_etiquetado_prog")),  "real": _fmt_d(r.get("alm_terminacion_etiquetado")),  "delta": _days_between(r.get("alm_terminacion_etiquetado_prog"), r.get("alm_terminacion_etiquetado"))},
-                    "liberado":        {"proy": _fmt_d(r.get("rec_liberacion_final_prog")),        "real": _fmt_d(r.get("rec_liberacion_final")),        "delta": _days_between(r.get("rec_liberacion_final_prog"), r.get("rec_liberacion_final"))},
+                    "entrega":         {"proy": _fmt_d(r.get("log_fecha_entrega_prog")),           "real": _fmt_d(r.get("log_fecha_entrega")),           "delta": _days_between(r.get("log_fecha_entrega_prog"), r.get("log_fecha_entrega")),                     "na_proy": "log_fecha_entrega_prog" in na_set,           "na_real": "log_fecha_entrega" in na_set},
+                    "booking":         {"proy": _fmt_d(r.get("log_fecha_booking_prog")),           "real": _fmt_d(r.get("log_fecha_booking")),           "delta": _days_between(r.get("log_fecha_booking_prog"), r.get("log_fecha_booking")),                     "na_proy": "log_fecha_booking_prog" in na_set,           "na_real": "log_fecha_booking" in na_set},
+                    "transito":        {"proy": _fmt_d(r.get("imp_llegada_contenedor_prog")),      "real": _fmt_d(r.get("imp_llegada_contenedor_puerto")),"delta": _days_between(r.get("imp_llegada_contenedor_prog"), r.get("imp_llegada_contenedor_puerto")),    "na_proy": "imp_llegada_contenedor_prog" in na_set,      "na_real": "imp_llegada_contenedor_puerto" in na_set},
+                    "trans_dest":      {"proy": _fmt_d(r.get("des_fecha_cruce_prog")),             "real": _fmt_d(r.get("des_fecha_cruce_real")),        "delta": _days_between(r.get("des_fecha_cruce_prog"), r.get("des_fecha_cruce_real")),                     "na_proy": "des_fecha_cruce_prog" in na_set,             "na_real": "des_fecha_cruce_real" in na_set},
+                    "en_almacen":      {"proy": _fmt_d(r.get("des_fecha_entrega_almacen_prog")),   "real": _fmt_d(r.get("des_llegada_almacen")),         "delta": _days_between(r.get("des_fecha_entrega_almacen_prog"), r.get("des_llegada_almacen")),           "na_proy": "des_fecha_entrega_almacen_prog" in na_set,   "na_real": "des_llegada_almacen" in na_set},
+                    "recepcion_odoo":  {"proy": _fmt_d(r.get("rec_recepcion_odoo_prog")),          "real": _fmt_d(r.get("rec_recepcion_odoo")),          "delta": _days_between(r.get("rec_recepcion_odoo_prog"), r.get("rec_recepcion_odoo")),                   "na_proy": "rec_recepcion_odoo_prog" in na_set,          "na_real": "rec_recepcion_odoo" in na_set},
+                    "verif":           {"proy": _fmt_d(r.get("alm_liberacion_uva_prog")),          "real": _fmt_d(r.get("alm_liberacion_uva")),          "delta": _days_between(r.get("alm_liberacion_uva_prog"), r.get("alm_liberacion_uva")),                   "na_proy": "alm_liberacion_uva_prog" in na_set,          "na_real": "alm_liberacion_uva" in na_set},
+                    "liberacion_verif":{"proy": _fmt_d(r.get("rec_liberacion_verificacion_prog")), "real": _fmt_d(r.get("rec_liberacion_verificacion")), "delta": _days_between(r.get("rec_liberacion_verificacion_prog"), r.get("rec_liberacion_verificacion")), "na_proy": "rec_liberacion_verificacion_prog" in na_set, "na_real": "rec_liberacion_verificacion" in na_set},
+                    "etiquetado":      {"proy": _fmt_d(r.get("alm_terminacion_etiquetado_prog")),  "real": _fmt_d(r.get("alm_terminacion_etiquetado")),  "delta": _days_between(r.get("alm_terminacion_etiquetado_prog"), r.get("alm_terminacion_etiquetado")),   "na_proy": "alm_terminacion_etiquetado_prog" in na_set,  "na_real": "alm_terminacion_etiquetado" in na_set},
+                    "liberado":        {"proy": _fmt_d(r.get("rec_liberacion_final_prog")),        "real": _fmt_d(r.get("rec_liberacion_final")),        "delta": _days_between(r.get("rec_liberacion_final_prog"), r.get("rec_liberacion_final")),               "na_proy": "rec_liberacion_final_prog" in na_set,        "na_real": "rec_liberacion_final" in na_set},
                 },
                 "lat_total": _days_between(r.get("log_fecha_entrega"), r.get("rec_liberacion_final")),
                 "estado_actual": _estado_actual(r),
@@ -2012,6 +2023,38 @@ def actualizar(id_imp):
             if not data:
                 return jsonify({"ok": True, "borrador": True}), 200  # no-op, nothing to save
 
+            # N/A es un estado oficial binario, no un valor a medio llenar --
+            # se aplica siempre a la columna real campos_na, aunque el resto
+            # del guardado sea de borrador. Si esto no se hiciera aquí, marcar
+            # o quitar un N/A desde un guardado de borrador nunca se vería
+            # reflejado fuera del formulario (dashboard, progreso) ni
+            # sobreviviría a volver a abrir el embarque, porque camposNA se
+            # inicializa siempre desde esta columna, no desde borradores.
+            existing_campos_na_raw = existing.get("campos_na") or "[]"
+            if isinstance(existing_campos_na_raw, str):
+                try: existing_campos_na = set(_json.loads(existing_campos_na_raw))
+                except Exception: existing_campos_na = set()
+            elif isinstance(existing_campos_na_raw, list):
+                existing_campos_na = set(existing_campos_na_raw)
+            else:
+                existing_campos_na = set()
+
+            campos_na_cambio = False
+            for campo, valor in data.items():
+                if valor == "__NA__":
+                    if campo not in existing_campos_na:
+                        existing_campos_na.add(campo)
+                        campos_na_cambio = True
+                elif campo in existing_campos_na:
+                    existing_campos_na.discard(campo)
+                    campos_na_cambio = True
+
+            if campos_na_cambio:
+                cursor.execute(
+                    "UPDATE importaciones SET campos_na = %s WHERE id = %s",
+                    (_json.dumps(sorted(existing_campos_na), ensure_ascii=False), id_imp),
+                )
+
             # Separar: campos que ya tienen valor en DB → actualizar columna directamente (correcciones)
             #          campos vacíos en DB → guardar en borradores JSON (rellenos nuevos pendientes)
             directo = {}
@@ -2035,15 +2078,18 @@ def actualizar(id_imp):
                     )
 
             if borrador_data:
+                # Un solo JSON_MERGE_PATCH (no dos anidados): un valor null en
+                # borrador_data debe borrar esa clave dentro de la sección
+                # (RFC 7396) -- si el null se resuelve antes en un merge
+                # interno separado, la clave ya ausente del resultado
+                # intermedio no vuelve a instruir el borrado en el merge
+                # externo, y el valor __NA__ viejo de esa clave sobrevive.
                 cursor.execute(
-                    f"""UPDATE importaciones SET borradores = JSON_MERGE_PATCH(
+                    """UPDATE importaciones SET borradores = JSON_MERGE_PATCH(
                         COALESCE(borradores, JSON_OBJECT()),
-                        JSON_OBJECT('{borrador_seccion}', JSON_MERGE_PATCH(
-                            COALESCE(JSON_EXTRACT(borradores, '$.{borrador_seccion}'), JSON_OBJECT()),
-                            CAST(%s AS JSON)
-                        ))
+                        JSON_OBJECT(%s, CAST(%s AS JSON))
                     ) WHERE id = %s""",
-                    (_json.dumps(borrador_data, ensure_ascii=False), id_imp),
+                    (borrador_seccion, _json.dumps(borrador_data, ensure_ascii=False), id_imp),
                 )
 
             conn.commit()
@@ -2336,16 +2382,20 @@ def _recalcular_campos(data: dict, conn=None) -> dict:
     )
 
     # ── Fechas proyectadas Booking→Almacén (solo lectura, calculadas) ──────────
-    # A partir de Entrega (real) + la regla de importaciones_tiempos_estimados
-    # que haga match exacto con origen + tipo de producto + vía. Se recalculan
-    # SIEMPRE que se guarde el embarque -- PERO solo se sobre-escriben cuando
-    # SÍ hay una regla que aplique. Si no hay regla, NO se tocan: muchos
-    # embarques (los de antes de que existiera esta función, con origen/tipo
-    # de producto en texto libre) ya traían estas fechas capturadas a mano, y
-    # machacarlas a NULL en cuanto alguien guardaba cualquier otro campo del
-    # embarque las borraba en silencio -- eso pasó de verdad en producción
-    # (ver incidente 2026-09-23, docs/superpowers/specs).
-    entrega       = data.get("log_fecha_entrega")
+    # A partir de Entrega (PROYECTADA) + la regla de
+    # importaciones_tiempos_estimados que haga match exacto con origen + tipo
+    # de producto + vía. Toda esta cadena son fechas proyectadas -- se ancla
+    # en la Entrega Proyectada, nunca en la Real (usar la real desfasaba la
+    # cadena completa en cuanto se capturaba, ~10 días en el caso real que lo
+    # evidenció: R26-1545, reportado por el usuario 2026-10-14). Se
+    # recalculan SIEMPRE que se guarde el embarque -- PERO solo se
+    # sobre-escriben cuando SÍ hay una regla que aplique. Si no hay regla, NO
+    # se tocan: muchos embarques (los de antes de que existiera esta función,
+    # con origen/tipo de producto en texto libre) ya traían estas fechas
+    # capturadas a mano, y machacarlas a NULL en cuanto alguien guardaba
+    # cualquier otro campo del embarque las borraba en silencio -- eso pasó
+    # de verdad en producción (ver incidente 2026-09-23, docs/superpowers/specs).
+    entrega       = data.get("log_fecha_entrega_prog")
     origen        = data.get("log_origen")
     tipo_producto = data.get("log_tipo_productos")
     via           = data.get("via_transporte")

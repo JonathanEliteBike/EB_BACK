@@ -137,9 +137,28 @@ def get_dashboard_data(desde: str | None = None, hasta: str | None = None) -> di
         """, rango_params)
         piezas_reemplazo = {r['pieza']: r['cnt'] for r in cursor.fetchall()}
 
+        # Detalle por folio, para el drill-down al hacer clic en una pieza del dashboard.
+        cursor.execute(f"""
+            SELECT id, folio, distribuidor, marca, estatus, pieza_reemplazo
+            FROM garantia_formularios
+            WHERE pieza_reemplazo IS NOT NULL
+              AND pieza_reemplazo != ''
+              AND pieza_reemplazo != 'N/A'
+              {rango_and}
+            ORDER BY fecha_creacion DESC
+        """, rango_params)
+        piezas_detalle = [{
+            "id":             r['id'],
+            "folio":          r['folio'],
+            "distribuidor":   r['distribuidor'],
+            "marca":          r['marca'],
+            "estatus":        r['estatus'],
+            "pieza_reemplazo": r['pieza_reemplazo'],
+        } for r in cursor.fetchall()]
+
         # ── Ubicación del daño y desglose de cuadros (desde JSON datos) ──────
         cursor.execute(f"""
-            SELECT folio, distribuidor, pieza_reemplazo, datos
+            SELECT id, folio, distribuidor, pieza_reemplazo, datos
             FROM garantia_formularios WHERE datos IS NOT NULL {rango_and}
         """, rango_params)
         ubic_dano: dict = {}
@@ -169,6 +188,7 @@ def get_dashboard_data(desde: str | None = None, hasta: str | None = None) -> di
                                     tipo_dano = str(otros).strip()
                             break
                     cuadros_detalle.append({
+                        "id":           row.get('id'),
                         "folio":        row.get('folio'),
                         "distribuidor": row.get('distribuidor'),
                         "tipo_marco":   tipo_marco,
@@ -192,6 +212,7 @@ def get_dashboard_data(desde: str | None = None, hasta: str | None = None) -> di
             "latencia_por_cliente":  lat_cliente,
             "garantias_por_cliente": gar_cliente,
             "piezas_reemplazo":      piezas_reemplazo,
+            "piezas_detalle":        piezas_detalle,
             "ubicacion_dano":        ubic_dano,
             "por_marca":             por_marca,
             "cuadros_por_tipo_marco": cuadros_por_tipo_marco,
@@ -209,7 +230,7 @@ def _empty() -> dict:
     return {
         "kpis": {"total": 0, "cerradas": 0, "en_proceso": 0, "lat_atencion": 0.0, "lat_cierre": 0.0},
         "por_estatus": {}, "latencia_mensual": {}, "latencia_por_cliente": {},
-        "garantias_por_cliente": {}, "piezas_reemplazo": {}, "ubicacion_dano": {},
+        "garantias_por_cliente": {}, "piezas_reemplazo": {}, "piezas_detalle": [], "ubicacion_dano": {},
         "por_marca": {}, "cuadros_por_tipo_marco": {}, "cuadros_detalle": [],
         "ultima_actualizacion": ahora_str("%d/%m/%Y %H:%M"),
     }

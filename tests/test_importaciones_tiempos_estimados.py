@@ -1,6 +1,6 @@
 """Tests del cálculo automático de fechas proyectadas Booking→Almacén
 (regla por origen+tipo_producto+vía en importaciones_tiempos_estimados) y de
-_estado_actual() (avance de etapa una vez que la anterior ya tiene fecha real).
+_estado_actual() (se queda en la última etapa con fecha real capturada).
 
 No golpean MySQL real: el `conn`/cursor que necesita _recalcular_campos() para
 consultar la tabla de reglas se mockea con unittest.mock.
@@ -26,16 +26,17 @@ def _mock_conn_con_regla(regla: dict | None):
     return conn
 
 
-# ── _estado_actual(): avanza a la siguiente etapa, no se queda en la última completada ──
+# ── _estado_actual(): se queda en la última etapa con fecha real, no se adelanta ──
 
 def test_estado_actual_pendiente_sin_nada_capturado():
     assert _estado_actual({}) == "Pendiente"
 
 
-def test_estado_actual_avanza_a_la_siguiente_etapa_tras_completar_booking():
-    # Booking ya tiene fecha real -> debe mostrar Lleg. Puerto, no Booking.
+def test_estado_actual_se_queda_en_booking_hasta_que_lleg_puerto_tenga_fecha_real():
+    # Booking ya tiene fecha real pero Lleg. Puerto todavia no -> debe mostrar
+    # Booking, no adelantarse a Lleg. Puerto.
     r = {"log_fecha_entrega": "2026-01-01", "log_fecha_booking": "2026-01-17"}
-    assert _estado_actual(r) == "Lleg. Puerto"
+    assert _estado_actual(r) == "Booking"
 
 
 def test_estado_actual_usa_la_etapa_mas_avanzada_capturada():
@@ -44,7 +45,7 @@ def test_estado_actual_usa_la_etapa_mas_avanzada_capturada():
         "log_fecha_booking": "2026-01-17",
         "imp_llegada_contenedor_puerto": "2026-02-08",
     }
-    assert _estado_actual(r) == "Destino"
+    assert _estado_actual(r) == "Lleg. Puerto"
 
 
 def test_estado_actual_liberado_cuando_todo_esta_completo():
@@ -55,7 +56,7 @@ def test_estado_actual_liberado_cuando_todo_esta_completo():
 def test_estado_actual_ignora_rec_recepcion_odoo():
     # rec_recepcion_odoo no es parte de la secuencia de etapas -- no debe alterar el resultado.
     r = {"log_fecha_entrega": "2026-01-01", "rec_recepcion_odoo": "2026-01-05"}
-    assert _estado_actual(r) == "Booking"
+    assert _estado_actual(r) == "Entrega"
 
 
 # ── _buscar_regla_tiempos() ──────────────────────────────────────────────────
@@ -82,7 +83,12 @@ def test_recalcular_campos_calcula_cadena_completa_con_regla():
     }
     conn = _mock_conn_con_regla(regla)
     data = {
-        "log_fecha_entrega": "2026-01-01",
+        "log_fecha_entrega_prog": "2026-01-01",
+        # Fecha REAL distinta a propósito -- toda la cadena son fechas
+        # proyectadas, así que debe anclarse en la Entrega Proyectada, NUNCA
+        # en la Real (si usara la real, saldría 2026-02-04, no 2026-01-16;
+        # ver el siguiente test para la prueba explícita de esto).
+        "log_fecha_entrega": "2026-01-20",
         "log_origen": "TAIWAN",
         "log_tipo_productos": "Bicicleta",
         "via_transporte": "MARITIMO",
@@ -95,10 +101,31 @@ def test_recalcular_campos_calcula_cadena_completa_con_regla():
     assert out["tiempos_estimados_faltantes"] is False
 
 
+def test_recalcular_campos_ignora_la_fecha_real_si_hay_proyectada():
+    # Prueba explícita y aislada de la regla de negocio: con AMBAS presentes,
+    # debe ganar la Proyectada. Reportado por el usuario viendo datos reales
+    # en producción -- el embarque R26-1545 traía un desfase de ~10 días
+    # porque el cálculo usaba la Entrega Real en vez de la Proyectada.
+    regla = {
+        "dias_hasta_booking": 15, "dias_booking_a_puerto": 0,
+        "dias_puerto_a_destino": 0, "dias_destino_a_almacen": 0,
+    }
+    conn = _mock_conn_con_regla(regla)
+    data = {
+        "log_fecha_entrega_prog": "2026-09-28",
+        "log_fecha_entrega": "2026-10-08",
+        "log_origen": "ESPAÑA",
+        "log_tipo_productos": "Bicicleta",
+        "via_transporte": "MARITIMO",
+    }
+    out = _recalcular_campos(data, conn)
+    assert out["log_fecha_booking_prog"] == "2026-10-13"  # 28/09 + 15, NO 23/10 (08/10 + 15)
+
+
 def test_recalcular_campos_sin_regla_marca_alerta_sin_tocar_las_fechas():
     conn = _mock_conn_con_regla(None)
     data = {
-        "log_fecha_entrega": "2026-01-01",
+        "log_fecha_entrega_prog": "2026-01-01",
         "log_origen": "VIETNAM",
         "log_tipo_productos": "Cascos",
         "via_transporte": "MARITIMO",
@@ -122,7 +149,7 @@ def test_recalcular_campos_sin_regla_no_borra_fecha_capturada_a_mano():
     # (2026-09-23): guardar cualquier otro campo del embarque la borraba.
     conn = _mock_conn_con_regla(None)
     data = {
-        "log_fecha_entrega": "2026-01-01",
+        "log_fecha_entrega_prog": "2026-01-01",
         "log_origen": "TAIWAN",
         "log_tipo_productos": "BICICLETAS SPARK Y FOIL Y ADDICT RC",
         "via_transporte": "MARITIMO",
@@ -133,7 +160,7 @@ def test_recalcular_campos_sin_regla_no_borra_fecha_capturada_a_mano():
     assert out["tiempos_estimados_faltantes"] is True
 
 
-def test_recalcular_campos_sin_entrega_no_toca_las_fechas_proyectadas():
+def test_recalcular_campos_sin_entrega_proyectada_no_toca_las_fechas_proyectadas():
     conn = _mock_conn_con_regla({
         "dias_hasta_booking": 15, "dias_booking_a_puerto": 23,
         "dias_puerto_a_destino": 15, "dias_destino_a_almacen": 2,
@@ -145,8 +172,26 @@ def test_recalcular_campos_sin_entrega_no_toca_las_fechas_proyectadas():
         "log_fecha_booking_prog": "2026-05-01",  # valor previo en edición (merged)
     }
     out = _recalcular_campos(data, conn)
-    # Sin Entrega no hay base para calcular -- se conserva lo que ya traía `data`.
+    # Sin Entrega Proyectada no hay base para calcular -- se conserva lo que
+    # ya traía `data`, aunque exista una Entrega Real.
     assert out["log_fecha_booking_prog"] == "2026-05-01"
+
+
+def test_recalcular_campos_con_solo_entrega_real_no_calcula():
+    # Antes del fix, esto SI calculaba (anclado en la real). Ahora, sin
+    # Entrega Proyectada, no hay base -- aunque la real este presente.
+    conn = _mock_conn_con_regla({
+        "dias_hasta_booking": 15, "dias_booking_a_puerto": 23,
+        "dias_puerto_a_destino": 15, "dias_destino_a_almacen": 2,
+    })
+    data = {
+        "log_fecha_entrega": "2026-01-01",
+        "log_origen": "TAIWAN",
+        "log_tipo_productos": "Bicicleta",
+        "via_transporte": "MARITIMO",
+    }
+    out = _recalcular_campos(data, conn)
+    assert "log_fecha_booking_prog" not in out
 
 
 # ── _validar_payload_tiempo() ─────────────────────────────────────────────────

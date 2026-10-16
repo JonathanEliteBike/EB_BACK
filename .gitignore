@@ -8,6 +8,7 @@ _pycache_/
 
 .env
 .vscode/
+secrets/
 
 uploads/
 parse_debug.txt
