@@ -1,0 +1,17 @@
+﻿marca,familia,productos_unicos,lineas_venta,sin_modelo,sin_submodelo,atributos_estructurados_aprovechables,plantilla_candidata_modelo,informacion_insuficiente,clasificacion_ambigua,pct_sin_modelo,pct_sin_submodelo
+SCOTT,ROPA,168,275,168,168,0,167,1,0,100.0,100.0
+Sin marca,SERVICIOS,3,145,3,3,0,0,3,0,100.0,100.0
+SCOTT,BICICLETA,66,122,0,1,0,0,0,0,0.0,1.52
+MEGAMO,BICICLETA,13,19,0,0,0,0,0,0,0.0,0.0
+SCOTT,REFACCIONES,12,12,12,12,0,1,11,0,100.0,100.0
+SYNCROS,ACCESORIOS,7,11,7,7,0,1,6,0,100.0,100.0
+SYNCROS,COMPONENTES,10,10,10,10,0,4,6,0,100.0,100.0
+AVINOX,REFACCIONES,4,4,4,4,0,0,4,0,100.0,100.0
+Sin marca,Sin producto,3,3,3,3,0,3,0,0,100.0,100.0
+VITTORIA,DIVERSOS,2,3,2,2,0,0,2,0,100.0,100.0
+VITTORIA,LLANTAS,3,3,3,3,0,0,3,0,100.0,100.0
+AVINOX,BATERIA,1,2,1,1,0,0,1,0,100.0,100.0
+AVINOX,CARGADOR,2,2,2,2,0,0,2,0,100.0,100.0
+MEGAMO,ACCESORIOS,1,1,1,1,0,0,1,0,100.0,100.0
+VITTORIA,CAMARAS,1,1,1,1,0,0,1,0,100.0,100.0
+VITTORIA,Sin producto,1,1,1,1,0,0,1,0,100.0,100.0

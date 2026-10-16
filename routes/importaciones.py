@@ -7,7 +7,7 @@ from flask import Blueprint, jsonify, request, make_response
 from datetime import datetime, date, timedelta, timezone
 from decimal import Decimal
 from db_conexion import obtener_conexion
-from utils.auth_decorators import requiere_autenticacion
+from utils.auth_decorators import requiere_autenticacion, requiere_permiso_interno
 
 importaciones_bp = Blueprint("importaciones", __name__, url_prefix="/importaciones")
 
@@ -1152,6 +1152,8 @@ def _validar_payload_hito(data: dict) -> str | None:
 
 
 @importaciones_bp.route("/hitos-auditoria", methods=["GET"])
+@requiere_autenticacion
+@requiere_permiso_interno('importaciones', 'ver')
 def listar_hitos_auditoria():
     conn = obtener_conexion()
     if not conn:
@@ -1169,6 +1171,8 @@ def listar_hitos_auditoria():
 
 
 @importaciones_bp.route("/hitos-auditoria", methods=["POST"])
+@requiere_autenticacion
+@requiere_permiso_interno('importaciones', 'crear')
 def crear_hito_auditoria():
     data = request.get_json() or {}
     error = _validar_payload_hito(data)
@@ -1200,6 +1204,8 @@ def crear_hito_auditoria():
 
 
 @importaciones_bp.route("/hitos-auditoria/<int:id_hito>", methods=["PUT"])
+@requiere_autenticacion
+@requiere_permiso_interno('importaciones', 'editar')
 def actualizar_hito_auditoria(id_hito):
     data = request.get_json() or {}
     error = _validar_payload_hito(data)
@@ -1234,6 +1240,8 @@ def actualizar_hito_auditoria(id_hito):
 
 
 @importaciones_bp.route("/hitos-auditoria/<int:id_hito>", methods=["DELETE"])
+@requiere_autenticacion
+@requiere_permiso_interno('importaciones', 'eliminar')
 def eliminar_hito_auditoria(id_hito):
     conn = obtener_conexion()
     if not conn:
@@ -1252,6 +1260,8 @@ def eliminar_hito_auditoria(id_hito):
 
 
 @importaciones_bp.route("/<int:id_imp>/auditoria", methods=["GET"])
+@requiere_autenticacion
+@requiere_permiso_interno('importaciones', 'ver')
 def obtener_auditoria(id_imp):
     conn = obtener_conexion()
     if not conn:
@@ -1266,6 +1276,8 @@ def obtener_auditoria(id_imp):
 
 
 @importaciones_bp.route("/auditoria-resumen", methods=["GET"])
+@requiere_autenticacion
+@requiere_permiso_interno('importaciones', 'ver')
 def obtener_auditoria_resumen():
     conn = obtener_conexion()
     if not conn:

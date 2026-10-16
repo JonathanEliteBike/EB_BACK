@@ -3,7 +3,9 @@ import json
 import logging
 import os
 import uuid
-from datetime import datetime, timedelta, timezone
+
+from datetime import date, datetime, timedelta, timezone
+from functools import wraps
 
 from flask import Blueprint, jsonify, request, send_file, send_from_directory, g
 from services.s3_service import subir_archivo_s3, generar_url_firmada_s3, existe_archivo_s3, descargar_archivo_s3
@@ -62,6 +64,51 @@ def _hoy_cdmx():
 
 def allowed_file(filename):
     return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
+
+
+def _requiere_permiso_archivo_garantia(f):
+    """Valida la acción real de una carga de evidencia para el rol interno."""
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        accion = request.form.get('accion')
+        if accion not in {'crear', 'editar'}:
+            return jsonify({
+                "error": "Debe indicar si el archivo corresponde a crear o editar una garantía."
+            }), 400
+
+        try:
+            rol_id = int(g.usuario_actual.get('rol'))
+        except (AttributeError, TypeError, ValueError):
+            return jsonify({"error": "Rol no autorizado."}), 403
+
+        # La capa de permisos internos sólo aplica al rol 4. Los roles de
+        # distribuidores e hijos conservan la validación histórica de módulo
+        # dentro de la función, sin aceptar una acción enviada por el cliente.
+        if rol_id == 4:
+            from services.permisos_internos_service import PermisosInternosService
+
+            permitido = (
+                PermisosInternosService.validar_permiso_usuario(
+                    g.usuario_actual['id'], 'garantias', 'ver'
+                )
+                and PermisosInternosService.validar_permiso_usuario(
+                    g.usuario_actual['id'], 'garantias', accion
+                )
+            )
+            if not permitido:
+                return jsonify({
+                    "error": (
+                        "Acceso denegado: Sin permiso interno de "
+                        f"'{accion}' en 'garantias'."
+                    )
+                }), 403
+
+        return f(*args, **kwargs)
+
+    # Evita que requiere_autenticacion resuelva la operación condicional con
+    # una regla estática del endpoint antes de conocer request.form['accion'].
+    decorated_function._permiso_interno = ('garantias', 'archivo_condicional')
+    return decorated_function
 
 
 def _usuario_actual_puede_ver_formulario(cursor, formulario_id):
@@ -1835,11 +1882,9 @@ def importar_garantias():
 
 @garantias_bp.route("/archivo/subir", methods=["POST"])
 @requiere_autenticacion
-@requiere_permiso_interno("garantias", "crear")
+@_requiere_permiso_archivo_garantia
 def subir_archivo():
     accion = request.form.get('accion')
-    if accion not in {'crear', 'editar'}:
-        return jsonify({"error": "Debe indicar si el archivo corresponde a crear o editar una garantía."}), 400
 
     if int(g.usuario_actual.get('rol', 0)) != 4:
         permitido, error = usuario_actual_tiene_modulo('usuarios_garantias')

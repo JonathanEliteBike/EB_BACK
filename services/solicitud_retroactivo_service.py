@@ -514,6 +514,22 @@ def obtener_cliente_odoo_usuario(cursor, usuario_id):
     return cursor.fetchone()
 
 
+def obtener_cliente_odoo_retroactivo(cursor, cliente_id):
+    """Resuelve un cliente elegible de Retroactivos por su id local.
+
+    Sólo se usa para el contexto explícitamente elegido por un administrador.
+    La clave Odoo siempre se obtiene localmente y el cliente debe pertenecer al
+    catálogo de distribuidores expuesto por el propio formulario.
+    """
+    cursor.execute("""
+        SELECT DISTINCT c.id, c.clave, c.nombre_cliente
+        FROM clientes c
+        INNER JOIN usuarios u ON u.cliente_id = c.id
+        WHERE c.id = %s AND u.rol_id = 2
+    """, (cliente_id,))
+    return cursor.fetchone()
+
+
 def _m2o_id(valor):
     """Extrae el ID de un many2one XML-RPC sin asumir su representación."""
     if isinstance(valor, (list, tuple)) and valor:
@@ -783,19 +799,12 @@ def obtener_series_entregadas_odoo(clave_cliente, razon_social, sku=None, produc
     }
 
 
-def validar_serie_entregada_odoo(cursor, usuario_id, sku_real, numero_serie):
-    """Valida una serie contra las entregas elegibles del cliente del JWT.
-
-    Se reutiliza la misma cadena Odoo de ``obtener_series_entregadas_odoo``;
-    la identidad del cliente se obtiene localmente, nunca del multipart que
-    envía el navegador. Se consulta sin filtro de SKU para poder distinguir
-    una serie propia de otro producto de una serie no entregada al cliente.
-    """
-    cliente = obtener_cliente_odoo_usuario(cursor, usuario_id)
+def validar_serie_entregada_cliente_odoo(cliente, sku_real, numero_serie):
+    """Valida una serie contra las entregas del cliente local ya resuelto."""
     if not cliente or not cliente.get('clave'):
         raise SeriesOdooError(
             'cliente_sin_clave_odoo',
-            'El usuario autenticado no tiene un cliente con clave Odoo asociada.',
+            'El cliente seleccionado no tiene una clave Odoo asociada.',
             403,
         )
 
@@ -811,7 +820,7 @@ def validar_serie_entregada_odoo(cursor, usuario_id, sku_real, numero_serie):
     if not coincidencias:
         raise SeriesOdooError(
             'serie_no_pertenece_distribuidor',
-            'El número de serie no corresponde a una bicicleta entregada al distribuidor autenticado.',
+            'El número de serie no corresponde a una bicicleta entregada al distribuidor seleccionado.',
             422,
         )
 
@@ -830,6 +839,24 @@ def validar_serie_entregada_odoo(cursor, usuario_id, sku_real, numero_serie):
             422,
         )
     return serie_valida
+
+
+def validar_serie_entregada_odoo(cursor, usuario_id, sku_real, numero_serie):
+    """Valida una serie contra las entregas elegibles del cliente del JWT.
+
+    Se reutiliza la misma cadena Odoo de ``obtener_series_entregadas_odoo``;
+    la identidad del cliente se obtiene localmente, nunca del multipart que
+    envía el navegador. Se consulta sin filtro de SKU para poder distinguir
+    una serie propia de otro producto de una serie no entregada al cliente.
+    """
+    cliente = obtener_cliente_odoo_usuario(cursor, usuario_id)
+    if not cliente or not cliente.get('clave'):
+        raise SeriesOdooError(
+            'cliente_sin_clave_odoo',
+            'El usuario autenticado no tiene un cliente con clave Odoo asociada.',
+            403,
+        )
+    return validar_serie_entregada_cliente_odoo(cliente, sku_real, numero_serie)
 
 
 def _respuesta_series_vacia(estado, campo_cantidad, origen_partner):

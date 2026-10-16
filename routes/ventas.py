@@ -1,11 +1,25 @@
 from __future__ import annotations
-from flask import Blueprint, jsonify, request, current_app
+from flask import Blueprint, jsonify, request, current_app, g
 from utils.odoo_utils import get_odoo_models, ODOO_DB, ODOO_PASSWORD, ODOO_COMPANY_ID
 from db_conexion import obtener_conexion
 from utils.auth_decorators import requiere_autenticacion, requiere_permiso_interno
+from utils.dashboard_clasificacion_comercial import (
+    clasificar_jerarquia_b2b_no_bicicleta,
+    obtener_clasificacion_comercial,
+    obtener_modelo_fallback_nombre_producto,
+    obtener_submodelo_dinamico_no_bicicleta,
+    obtener_submodelo_aprobado,
+)
+from services.politica_montos_service import PoliticaMontosService
 from datetime import date as _date, timedelta as _timedelta
 import logging
 import time
+import json
+import hashlib
+import os
+import re
+import unicodedata
+import threading
 
 def _build_consolidation_map(partner_totals: dict, models, uid) -> dict:
     """
@@ -291,6 +305,1641 @@ MESES = {
 
 # Solo facturas confirmadas Y cobradas (total o parcialmente)
 PAYMENT_FILTER = ['payment_state', 'in', ['paid', 'partial']]
+
+
+def _debe_ocultar_montos_ventas() -> bool:
+    return PoliticaMontosService.debe_ocultar_montos(g.usuario_actual['id'], 'ventas_monitor')
+
+
+# ── Consulta dinámica del Dashboard de Ventas ───────────────────────────────
+_DASHBOARD_DIMENSIONES_SOPORTADAS = (
+    'marca', 'producto', 'categoria', 'subcategoria', 'talla', 'color',
+    'modelo', 'submodelo', 'estado', 'cliente', 'integral',
+)
+_DASHBOARD_DIMENSIONES_PENDIENTES = ('tienda',)
+_DASHBOARD_TODAS_DIMENSIONES = (
+    *_DASHBOARD_DIMENSIONES_SOPORTADAS,
+    *_DASHBOARD_DIMENSIONES_PENDIENTES,
+)
+_DASHBOARD_ORDENES = ('pzas', 'existencia', 'venta', 'participacion')
+_DASHBOARD_LABELS = {
+    'marca': 'Marca', 'producto': 'Producto', 'categoria': 'Categoría',
+    'subcategoria': 'Subcategoría', 'modelo': 'Modelo', 'submodelo': 'Submodelo',
+    'talla': 'Talla', 'color': 'Color',
+    'estado': 'Estado', 'cliente': 'Cliente', 'integral': 'Integral',
+}
+# Los catálogos libres sirven para armar comparaciones y sólo dependen del
+# universo temporal. Las dimensiones comerciales detalladas conservan un
+# contexto acotado para que sus listas sigan siendo útiles y manejables.
+_DASHBOARD_CONTEXTO_FILTROS = {
+    'marca': (), 'producto': ('marca',), 'categoria': ('producto',),
+    'subcategoria': ('producto', 'categoria'),
+    'estado': (), 'cliente': (), 'integral': (),
+    'modelo': ('marca', 'producto', 'categoria', 'subcategoria'),
+    'submodelo': ('marca', 'producto', 'categoria', 'subcategoria', 'modelo'),
+    'talla': ('marca', 'producto', 'categoria', 'subcategoria', 'modelo', 'submodelo'),
+    'color': ('marca', 'producto', 'categoria', 'subcategoria', 'modelo', 'submodelo'),
+}
+
+# Familias observadas en el catálogo comercial de Odoo. La llave se normaliza
+# sólo para comparar; el valor es la etiqueta que se expone al dashboard.
+_DASHBOARD_FAMILIAS_PRODUCTO = {
+    'BICICLETA': 'BICICLETA',
+    'APPAREL': 'APPAREL',
+    'ACCESORIOS': 'ACCESORIOS',
+    'ACCESORIOS VARIOS': 'ACCESORIOS',
+    'COMPONENTES': 'COMPONENTES',
+    'REEMPLAZO': 'REFACCIONES',
+    'REEMPLAZOS': 'REFACCIONES',
+    'CUADRO': 'CUADRO',
+    'HERRAMIENTAS': 'HERRAMIENTAS',
+    'PERIFERICOS': 'PERIFERICOS',
+    'SERVICIOS': 'SERVICIOS',
+}
+_DASHBOARD_SUBCATEGORIAS_BICICLETA = {'MONTANA', 'ELECTRICA'}
+# Odoo no conserva el tipo comercial en las rutas JUNIOR de estos modelos.
+# Este mapeo sólo cubre modelos confirmados del catálogo comercial; los que no
+# estén aquí permanecen sin subcategoría para no inferir un tipo incorrecto.
+_DASHBOARD_SUBCATEGORIAS_JUNIOR_POR_MODELO = {
+    'CONTRAIL 200': 'MONTAÑA',
+    'CONTRAIL 400': 'MONTAÑA',
+    'ROXTER': 'MONTAÑA',
+    'SCALE 24': 'MONTAÑA',
+}
+_DASHBOARD_UNIVERSO_TTL = 180
+_DASHBOARD_CLASIFICACION_COMERCIAL_VERSION = 14
+_DASHBOARD_REDIS_TTL_CONSULTA = 300
+_DASHBOARD_REDIS_TTL_FILTROS = 300
+_DASHBOARD_REDIS_TTL_SIN_VENTA = 180
+_DASHBOARD_REDIS_URL = os.getenv('REDIS_URL') or os.getenv('CELERY_BROKER_URL')
+_dashboard_redis = None
+_dashboard_redis_inicializado = False
+_dashboard_redis_reintento_en = 0.0
+_dashboard_universo_cache: dict[tuple, tuple[float, list[dict]]] = {}
+_dashboard_universo_lock = threading.RLock()
+_dashboard_sin_venta_cache: dict[tuple, tuple[float, dict]] = {}
+_dashboard_sin_venta_lock = threading.RLock()
+_DASHBOARD_MESES_CORTOS = ('Ene', 'Feb', 'Mar', 'Abr', 'May', 'Jun', 'Jul', 'Ago', 'Sep', 'Oct', 'Nov', 'Dic')
+
+
+def _dashboard_redis_cliente():
+    """Crea el cliente Redis bajo demanda para no bloquear el arranque."""
+    global _dashboard_redis, _dashboard_redis_inicializado
+    if time.time() < _dashboard_redis_reintento_en:
+        return None
+    if _dashboard_redis_inicializado:
+        return _dashboard_redis
+    _dashboard_redis_inicializado = True
+    if not _DASHBOARD_REDIS_URL:
+        return None
+    try:
+        import redis
+        _dashboard_redis = redis.from_url(
+            _DASHBOARD_REDIS_URL,
+            decode_responses=True,
+            socket_connect_timeout=0.3,
+            socket_timeout=0.3,
+        )
+    except Exception as exc:
+        logging.warning('[ventas-cache] Redis unavailable during initialization: %s', type(exc).__name__)
+        _dashboard_redis = None
+    return _dashboard_redis
+
+
+def _dashboard_redis_no_disponible(etiqueta: str, exc: Exception) -> None:
+    """Evita que Redis caído agregue timeout y warnings en cada request."""
+    global _dashboard_redis_reintento_en
+    _dashboard_redis_reintento_en = time.time() + 30
+    logging.warning('[ventas-cache] Redis unavailable during %s: %s', etiqueta, type(exc).__name__)
+
+
+def _dashboard_redis_key(tipo: str, contenido: dict) -> str:
+    """Genera una clave corta y determinista sin exponer el payload."""
+    serializado = json.dumps(contenido, sort_keys=True, ensure_ascii=False, separators=(',', ':'), default=str)
+    digest = hashlib.sha256(serializado.encode('utf-8')).hexdigest()
+    return f'ventas:dashboard:{tipo}:v{_DASHBOARD_CLASIFICACION_COMERCIAL_VERSION}:{digest}'
+
+
+def _dashboard_redis_get(clave: str, etiqueta: str):
+    cliente = _dashboard_redis_cliente()
+    if not cliente:
+        return None
+    try:
+        crudo = cliente.get(clave)
+        if not crudo:
+            logging.info('[ventas-cache] MISS %s', etiqueta)
+            return None
+        logging.info('[ventas-cache] HIT %s', etiqueta)
+        return json.loads(crudo)
+    except Exception as exc:
+        _dashboard_redis_no_disponible(f'GET {etiqueta}', exc)
+        return None
+
+
+def _dashboard_redis_set(clave: str, valor, ttl: int, etiqueta: str) -> None:
+    cliente = _dashboard_redis_cliente()
+    if not cliente:
+        return
+    try:
+        cliente.setex(clave, ttl, json.dumps(valor, ensure_ascii=False, separators=(',', ':'), default=str))
+    except Exception as exc:
+        _dashboard_redis_no_disponible(f'SET {etiqueta}', exc)
+
+
+def _dashboard_lotes(items: list, tamanio: int = 500):
+    """Genera lotes para las lecturas XML-RPC; evita una llamada por registro."""
+    for inicio in range(0, len(items), tamanio):
+        yield items[inicio:inicio + tamanio]
+
+
+def _dashboard_ruta_categoria(valor) -> list[str]:
+    """Normaliza complete_name sin asumir posiciones absolutas en la ruta."""
+    segmentos = []
+    for indice, segmento in enumerate(str(valor or '').split('/')):
+        limpio = segmento.strip()
+        # Algunas rutas de Odoo incluyen un identificador numérico de compañía
+        # como primer nivel. Los números posteriores sí pueden ser una versión
+        # comercial (p. ej. FACTORY / 15), por lo que deben conservarse.
+        if not limpio or limpio.upper() == 'ALL' or (indice == 0 and limpio.isdigit()):
+            continue
+        segmentos.append(limpio)
+    return segmentos
+
+
+def _dashboard_marcas_por_ruta(rutas) -> dict[str, str]:
+    """Detecta raíces comerciales por estructura, sin catálogo fijo de marcas.
+
+    Una raíz con descendientes es una candidata a marca siempre que no sea una
+    familia operativa conocida (por ejemplo, APPAREL o SERVICIOS). Esto permite
+    incorporar marcas nuevas que tengan su propia rama de categorías.
+    """
+    marcas = {}
+    for ruta in rutas:
+        if len(ruta) < 2:
+            continue
+        raiz = ruta[0]
+        clave = _dashboard_clave_texto(raiz)
+        if clave not in _DASHBOARD_FAMILIAS_PRODUCTO:
+            marcas.setdefault(clave, raiz)
+    return marcas
+
+
+def _dashboard_clave_texto(valor) -> str:
+    texto = unicodedata.normalize('NFD', str(valor or ''))
+    return ''.join(c for c in texto if unicodedata.category(c) != 'Mn').strip().upper()
+
+
+def _dashboard_submodelo_desde_template(nombre_template, modelo: str | None) -> str | None:
+    """Obtiene una versión sólo si el template conserva el modelo como prefijo comercial."""
+    if not nombre_template or not modelo:
+        return None
+    texto = ' '.join(str(nombre_template).split())
+    coincidencia = re.search(re.escape(modelo), texto, flags=re.IGNORECASE)
+    if not coincidencia:
+        return None
+    candidato = texto[coincidencia.start():]
+    candidato = re.split(r'\s+(?:MY\s*\d{2,4}|20\d{2})\b', candidato, maxsplit=1, flags=re.IGNORECASE)[0].strip()
+    return candidato if candidato and _dashboard_clave_texto(candidato) != _dashboard_clave_texto(modelo) else None
+
+
+def _dashboard_subcategoria_junior_por_modelo(modelo, nombre_template) -> str | None:
+    """Resuelve únicamente modelos JUNIOR verificados fuera de la jerarquía."""
+    candidatos = [_dashboard_clave_texto(modelo), _dashboard_clave_texto(nombre_template)]
+    for modelo_mapeado, subcategoria in _DASHBOARD_SUBCATEGORIAS_JUNIOR_POR_MODELO.items():
+        clave_modelo = _dashboard_clave_texto(modelo_mapeado)
+        if any(clave_modelo in candidato for candidato in candidatos if candidato):
+            return subcategoria
+    return None
+
+
+def _dashboard_dimensiones_producto(
+    ruta: list[str], atributos: list[dict], nombre_template=None, marcas_por_ruta=None
+) -> dict:
+    """Clasifica catálogo por familia comercial, sin asumir posiciones absolutas.
+
+    Una marca sólo existe cuando hay una familia de producto reconocida después
+    de ella; las ramas raíz operativas (por ejemplo, servicios) no se inventan
+    como marcas. Modelo/submodelo se habilitan únicamente para bicicletas,
+    donde la taxonomía del catálogo sí contiene esos niveles de forma estable.
+    """
+    marcas_por_ruta = marcas_por_ruta or {}
+    familia_indice = next(
+        (i for i, segmento in enumerate(ruta)
+         if _dashboard_clave_texto(segmento) in _DASHBOARD_FAMILIAS_PRODUCTO),
+        None,
+    )
+    marca = marcas_por_ruta.get(_dashboard_clave_texto(ruta[0])) if ruta else None
+    if familia_indice is not None:
+        producto = _DASHBOARD_FAMILIAS_PRODUCTO[_dashboard_clave_texto(ruta[familia_indice])]
+        niveles = ruta[familia_indice + 1:]
+    elif marca and len(ruta) > 1:
+        # Marcas como VITTORIA organizan su primer nivel comercial con tipos
+        # propios (LLANTAS, CÁMARAS, etc.), sin una familia raíz intermedia.
+        producto = ruta[1]
+        niveles = ruta[2:]
+    else:
+        producto = None
+        niveles = []
+    categoria = niveles[0] if niveles else None
+    subcategoria = None
+    indice_modelo = 1
+    if producto == 'BICICLETA' and _dashboard_clave_texto(categoria) in ('JUNIOR', 'INFANTIL') and len(niveles) > 1:
+        candidato = niveles[1]
+        if _dashboard_clave_texto(candidato) in _DASHBOARD_SUBCATEGORIAS_BICICLETA:
+            subcategoria = candidato
+            indice_modelo = 2
+    modelo = None
+    submodelo = None
+    if producto == 'BICICLETA' and len(niveles) > indice_modelo:
+        modelo = niveles[indice_modelo]
+        if len(niveles) > indice_modelo + 1:
+            submodelo = niveles[indice_modelo + 1]
+        else:
+            submodelo = _dashboard_submodelo_desde_template(nombre_template, modelo)
+
+    if producto == 'BICICLETA' and _dashboard_clave_texto(categoria) == 'JUNIOR' and not subcategoria:
+        subcategoria = _dashboard_subcategoria_junior_por_modelo(modelo, nombre_template)
+
+    if producto != 'BICICLETA':
+        jerarquia_b2b = clasificar_jerarquia_b2b_no_bicicleta(niveles, nombre_template, producto)
+        categoria = jerarquia_b2b['categoria']
+        subcategoria = jerarquia_b2b['subcategoria']
+        modelo = jerarquia_b2b['modelo']
+        submodelo = jerarquia_b2b['submodelo']
+
+    talla = None
+    color = None
+    for atributo in atributos:
+        nombre = str(atributo.get('atributo') or '').upper()
+        valor = (atributo.get('valor') or '').strip() or None
+        if not valor:
+            continue
+        if any(clave in nombre for clave in ('COLOR', 'COLO', 'COLOUR')):
+            color = valor
+        elif any(clave in nombre for clave in ('TALLA', 'TAMAÑO', 'TAMANO', 'SIZE')):
+            talla = valor
+
+    return {
+        'marca': marca, 'producto': producto, 'categoria': categoria,
+        'subcategoria': subcategoria, 'modelo': modelo, 'submodelo': submodelo,
+        'talla': talla, 'color': color,
+    }
+
+
+def _dashboard_dimensiones_comerciales_producto(
+    product_id, ruta: list[str], atributos: list[dict], nombre_template=None, marcas_por_ruta=None,
+    nombre_producto=None,
+) -> tuple[dict, str | None]:
+    """Combina la jerarquía B2B y los respaldos comerciales sin tocar ventas."""
+    dimensiones = _dashboard_dimensiones_producto(ruta, atributos, nombre_template, marcas_por_ruta)
+    referencia_comercial = None
+    clasificacion_manual = obtener_clasificacion_comercial(product_id)
+
+    # Las bicicletas conservan exactamente su clasificación actual: no pasan
+    # por ninguna regla nueva de jerarquía B2B ni de modelo/submodelo dinámico.
+    if dimensiones.get('producto') == 'BICICLETA':
+        referencia_comercial = _dashboard_aplicar_clasificacion_comercial(product_id, dimensiones)
+        return dimensiones, referencia_comercial
+
+    # Una decisión comercial explícita de no promover una línea a Modelo no se
+    # contradice con una regla dinámica posterior. Esto preserva los mapeos
+    # históricos; la segunda pasada sólo cubre productos sin decisión manual.
+    if clasificacion_manual and clasificacion_manual.get('c') in {
+        'LINEA_CONFIRMADA', 'POR_VALIDAR', 'NO_ESPECIFICADO', 'RECHAZADO',
+    }:
+        referencia_comercial = _dashboard_aplicar_clasificacion_comercial(product_id, dimensiones)
+    else:
+        # La regla por familia/ruta tiene prioridad para productos nuevos. El
+        # mapeo comercial validado sigue siendo respaldo cuando no hay evidencia
+        # dinámica suficiente; nunca se elimina ni se usa para inferir submodelo.
+        if not dimensiones.get('modelo'):
+            referencia_comercial = _dashboard_aplicar_clasificacion_comercial(product_id, dimensiones)
+
+        submodelo_aprobado = obtener_submodelo_aprobado(product_id)
+        if submodelo_aprobado and dimensiones.get('modelo'):
+            dimensiones['submodelo'] = submodelo_aprobado
+        elif dimensiones.get('modelo'):
+            dimensiones['submodelo'] = obtener_submodelo_dinamico_no_bicicleta(
+                dimensiones.get('producto'), dimensiones.get('categoria'), dimensiones.get('modelo'), nombre_template,
+            )
+
+    if not dimensiones.get('modelo'):
+        dimensiones['modelo'] = obtener_modelo_fallback_nombre_producto(nombre_producto)
+    return dimensiones, referencia_comercial
+
+
+def _dashboard_aplicar_clasificacion_comercial(product_id, dimensiones: dict) -> str | None:
+    """Aplica sólo la consolidación validada de SCOTT / ROPA por product_id.
+
+    La referencia comercial es informativa: nunca participa como filtro ni
+    desglose. Modelo conserva únicamente valores confirmados.
+    """
+    clasificacion = obtener_clasificacion_comercial(product_id)
+    if not clasificacion:
+        return None
+
+    estado = clasificacion.get('c')
+    if estado == 'MODELO_CONFIRMADO':
+        dimensiones['modelo'] = clasificacion.get('m') or None
+        submodelo_aprobado = obtener_submodelo_aprobado(product_id)
+        if submodelo_aprobado:
+            dimensiones['submodelo'] = submodelo_aprobado
+        return None
+    if estado == 'LINEA_CONFIRMADA':
+        dimensiones['modelo'] = None
+        return f"{clasificacion.get('r')} · Línea"
+    if estado == 'POR_VALIDAR':
+        dimensiones['modelo'] = None
+        return f"{clasificacion.get('r')} · Por validar"
+    if estado == 'NO_ESPECIFICADO':
+        dimensiones['modelo'] = None
+        return 'No especificado'
+    if estado == 'RECHAZADO':
+        dimensiones['modelo'] = None
+    return None
+
+
+def _dashboard_referencia_comercial_agregada(referencias: set[str]) -> list[str]:
+    """Devuelve referencias únicas y deterministas para una fila agregada."""
+    return sorted(
+        referencias,
+        key=lambda referencia: (referencia == 'No especificado', referencia.casefold()),
+    )
+
+
+def _dashboard_dimension(valor, etiqueta_sin_dato: str) -> dict:
+    """Mantiene un contrato uniforme para dimensiones presentes o ausentes."""
+    if valor is None or str(valor).strip() == '':
+        return {'id': None, 'label': etiqueta_sin_dato}
+    return {'id': str(valor), 'label': str(valor)}
+
+
+def _dashboard_coincide_filtro(dimension: dict, valores: list[str]) -> bool:
+    if not valores:
+        return True
+    comparables = {
+        str(dimension.get('id') or '').strip().casefold(),
+        str(dimension.get('label') or '').strip().casefold(),
+    }
+    return any(str(valor).strip().casefold() in comparables for valor in valores)
+
+
+def _dashboard_integrales_por_clave(claves: set[str]) -> dict[str, dict]:
+    """Resuelve la relación existente clientes → grupo_clientes en una consulta."""
+    if not claves:
+        return {}
+    conn = obtener_conexion()
+    cur = conn.cursor(dictionary=True)
+    try:
+        placeholders = ','.join(['%s'] * len(claves))
+        cur.execute(f"""
+            SELECT c.clave, gc.id AS grupo_id, gc.nombre_grupo
+            FROM clientes c
+            LEFT JOIN grupo_clientes gc ON gc.id = c.id_grupo
+            WHERE UPPER(c.clave) IN ({placeholders})
+        """, list(claves))
+        return {
+            str(fila['clave']).strip().upper(): {
+                'id': fila['grupo_id'], 'label': fila['nombre_grupo']
+            }
+            for fila in cur.fetchall()
+            if fila.get('grupo_id') and fila.get('nombre_grupo')
+        }
+    finally:
+        cur.close()
+        conn.close()
+
+
+def _dashboard_universo_enriquecido(consulta: dict) -> list[dict]:
+    """Obtiene y enriquece una vez las líneas del universo del dashboard.
+
+    La caché sólo contiene dimensiones y métricas sin transformar permisos. El
+    ocultamiento de montos se sigue resolviendo al construir cada respuesta.
+    """
+    clave_cache = (
+        consulta['fecha_inicio'], consulta['fecha_fin'], consulta['vista'], ODOO_COMPANY_ID,
+        _DASHBOARD_CLASIFICACION_COMERCIAL_VERSION,
+    )
+    clave_redis = _dashboard_redis_key('universo', {
+        'fecha_inicio': consulta['fecha_inicio'],
+        'fecha_fin': consulta['fecha_fin'],
+        'vista': consulta['vista'],
+        'company_id': ODOO_COMPANY_ID,
+    })
+    universo_redis = _dashboard_redis_get(clave_redis, 'universo')
+    if isinstance(universo_redis, list):
+        with _dashboard_universo_lock:
+            _dashboard_universo_cache[clave_cache] = (time.time(), universo_redis)
+        return universo_redis
+
+    ahora = time.time()
+    with _dashboard_universo_lock:
+        vigente = _dashboard_universo_cache.get(clave_cache)
+        if vigente and ahora - vigente[0] < _DASHBOARD_UNIVERSO_TTL:
+            # Las entradas previas a la tendencia no incluían fecha; se
+            # reconstruyen una vez para que la serie mensual sea consistente.
+            if all('fecha' in fila for fila in vigente[1]):
+                _dashboard_redis_set(clave_redis, vigente[1], _DASHBOARD_REDIS_TTL_CONSULTA, 'universo')
+                return vigente[1]
+            _dashboard_universo_cache.pop(clave_cache, None)
+
+        uid, models, err = get_odoo_models()
+        if not uid:
+            raise RuntimeError(err or 'No se pudo conectar a Odoo')
+
+        domain_line = [
+            ['move_id.move_type', '=', 'out_invoice'],
+            ['move_id.state', '=', 'posted'],
+            *([['move_id.payment_state', 'in', ['paid', 'partial']]]
+              if consulta['vista'] == 'cobranza' else []),
+            ['move_id.invoice_date', '>=', consulta['fecha_inicio']],
+            ['move_id.invoice_date', '<=', consulta['fecha_fin']],
+            ['move_id.company_id', '=', ODOO_COMPANY_ID],
+            ['display_type', '=', 'product'],
+            ['product_id', '!=', False],
+        ]
+        lineas = models.execute_kw(
+            ODOO_DB, uid, ODOO_PASSWORD, 'account.move.line', 'search_read',
+            [domain_line], {'fields': ['product_id', 'quantity', 'price_total', 'move_id'], 'limit': 0}
+        )
+        product_ids = sorted({linea['product_id'][0] for linea in lineas if linea.get('product_id')})
+        move_ids = sorted({linea['move_id'][0] for linea in lineas if linea.get('move_id')})
+
+        productos = []
+        for ids in _dashboard_lotes(product_ids, 1000):
+            productos.extend(models.execute_kw(
+                ODOO_DB, uid, ODOO_PASSWORD, 'product.product', 'read', [ids],
+                {'fields': [
+                    'id', 'display_name', 'categ_id', 'product_tmpl_id',
+                    'product_template_attribute_value_ids', 'virtual_available',
+                ]}
+            ))
+        productos_por_id = {producto['id']: producto for producto in productos}
+        template_ids = sorted({p['product_tmpl_id'][0] for p in productos if p.get('product_tmpl_id')})
+        templates = []
+        for ids in _dashboard_lotes(template_ids, 1000):
+            templates.extend(models.execute_kw(
+                ODOO_DB, uid, ODOO_PASSWORD, 'product.template', 'read', [ids], {'fields': ['id', 'name']}
+            ))
+        templates_por_id = {template['id']: template for template in templates}
+        categ_ids = sorted({p['categ_id'][0] for p in productos if p.get('categ_id')})
+        categorias = []
+        for ids in _dashboard_lotes(categ_ids, 1000):
+            categorias.extend(models.execute_kw(
+                ODOO_DB, uid, ODOO_PASSWORD, 'product.category', 'read', [ids],
+                {'fields': ['id', 'complete_name']}
+            ))
+        rutas_categoria = {
+            categoria['id']: _dashboard_ruta_categoria(categoria.get('complete_name'))
+            for categoria in categorias
+        }
+        marcas_por_ruta = _dashboard_marcas_por_ruta(rutas_categoria.values())
+        attr_ids = sorted({
+            atributo_id for producto in productos
+            for atributo_id in (producto.get('product_template_attribute_value_ids') or [])
+        })
+        atributos = []
+        for ids in _dashboard_lotes(attr_ids, 1000):
+            atributos.extend(models.execute_kw(
+                ODOO_DB, uid, ODOO_PASSWORD, 'product.template.attribute.value', 'read', [ids],
+                {'fields': ['id', 'attribute_id', 'name']}
+            ))
+        atributos_por_id = {
+            atributo['id']: {
+                'atributo': (atributo.get('attribute_id') or [None, ''])[1],
+                'valor': atributo.get('name'),
+            }
+            for atributo in atributos
+        }
+
+        moves = []
+        for ids in _dashboard_lotes(move_ids, 1000):
+            moves.extend(models.execute_kw(
+                ODOO_DB, uid, ODOO_PASSWORD, 'account.move', 'read', [ids],
+                {'fields': ['id', 'partner_id', 'commercial_partner_id', 'invoice_date']}
+            ))
+        move_partner = {
+            move['id']: (move.get('commercial_partner_id') or move.get('partner_id') or [None])[0]
+            for move in moves
+        }
+        move_fechas = {move['id']: move.get('invoice_date') for move in moves}
+        partner_ids = sorted({partner_id for partner_id in move_partner.values() if partner_id})
+        partners = []
+        for ids in _dashboard_lotes(partner_ids, 1000):
+            partners.extend(models.execute_kw(
+                ODOO_DB, uid, ODOO_PASSWORD, 'res.partner', 'read', [ids],
+                {'fields': ['id', 'name', 'ref', 'parent_id', 'state_id']}
+            ))
+        partners_por_id = {partner['id']: partner for partner in partners}
+        parent_ids = sorted({
+            (partner.get('parent_id') or [None])[0] for partner in partners
+            if partner.get('parent_id') and (partner.get('parent_id') or [None])[0] not in partners_por_id
+        })
+        for ids in _dashboard_lotes(parent_ids, 1000):
+            for partner in models.execute_kw(
+                ODOO_DB, uid, ODOO_PASSWORD, 'res.partner', 'read', [ids],
+                {'fields': ['id', 'name', 'ref', 'parent_id', 'state_id']}
+            ):
+                partners_por_id[partner['id']] = partner
+        claves = set()
+        for partner in partners_por_id.values():
+            ref = (partner.get('ref') or '').strip().upper()
+            if not ref and partner.get('parent_id'):
+                ref = (partners_por_id.get((partner.get('parent_id') or [None])[0], {}).get('ref') or '').strip().upper()
+            if ref:
+                claves.add(ref)
+        integrales_por_clave = _dashboard_integrales_por_clave(claves)
+
+        # La clasificación comercial y los datos del cliente sólo cambian por
+        # producto y partner, respectivamente. Las líneas de factura pueden
+        # repetir ambos miles de veces; prepararlos una sola vez evita volver a
+        # ejecutar clasificación, normalización de atributos y búsquedas de
+        # padres para cada línea del universo.
+        dimensiones_producto_por_id = {}
+        for producto_id, producto in productos_por_id.items():
+            atributos_producto = [
+                atributos_por_id[atributo_id]
+                for atributo_id in (producto.get('product_template_attribute_value_ids') or [])
+                if atributo_id in atributos_por_id
+            ]
+            dimensiones_producto, referencia_comercial = _dashboard_dimensiones_comerciales_producto(
+                producto_id,
+                rutas_categoria.get((producto.get('categ_id') or [None])[0], []),
+                atributos_producto,
+                templates_por_id.get((producto.get('product_tmpl_id') or [None])[0], {}).get('name'),
+                marcas_por_ruta,
+                producto.get('display_name'),
+            )
+            dimensiones_producto_por_id[producto_id] = (
+                {
+                    nombre: _dashboard_dimension(valor, f'Sin {_DASHBOARD_LABELS[nombre].lower()}')
+                    for nombre, valor in dimensiones_producto.items()
+                },
+                referencia_comercial,
+            )
+
+        dimensiones_cliente_por_id = {}
+        for partner_id, partner in partners_por_id.items():
+            parent = (
+                partners_por_id.get((partner.get('parent_id') or [None])[0], {})
+                if partner.get('parent_id') else {}
+            )
+            clave_cliente = (partner.get('ref') or parent.get('ref') or '').strip().upper()
+            estado = partner.get('state_id')
+            integral = integrales_por_clave.get(clave_cliente)
+            dimensiones_cliente_por_id[partner_id] = {
+                'cliente': {
+                    'id': clave_cliente or (f"odoo:{partner['id']}" if partner.get('id') else None),
+                    'label': (partner.get('name') or parent.get('name') or '').strip() or 'Sin cliente',
+                    'extra': {'clave': clave_cliente} if clave_cliente else {},
+                },
+                'estado': _dashboard_dimension(
+                    estado[1] if isinstance(estado, (list, tuple)) and len(estado) > 1 else None,
+                    'Sin estado',
+                ),
+                'integral': {
+                    'id': str(integral['id']) if integral else None,
+                    'label': integral['label'] if integral else 'Sin integral',
+                },
+            }
+
+        universo = []
+        for linea in lineas:
+            producto_id = (linea.get('product_id') or [None])[0]
+            contexto_producto = dimensiones_producto_por_id.get(producto_id)
+            if not contexto_producto:
+                continue
+            dimensiones_producto, referencia_comercial = contexto_producto
+            partner_id = move_partner.get((linea.get('move_id') or [None])[0])
+            dimensiones_cliente = dimensiones_cliente_por_id.get(partner_id)
+            if dimensiones_cliente is None:
+                dimensiones_cliente = {
+                    'cliente': {'id': None, 'label': 'Sin cliente', 'extra': {}},
+                    'estado': _dashboard_dimension(None, 'Sin estado'),
+                    'integral': {'id': None, 'label': 'Sin integral'},
+                }
+            dimensiones = {**dimensiones_producto, **dimensiones_cliente}
+            universo.append({
+                'product_id': producto_id,
+                'producto_nombre': productos_por_id[producto_id].get('display_name') or '',
+                'dimensiones': dimensiones,
+                'pzas': float(linea.get('quantity') or 0),
+                'venta': float(linea.get('price_total') or 0),
+                # virtual_available es la Cantidad pronosticada de Odoo. Se
+                # lee una vez por product_id y se deduplica al agrupar.
+                'existencia': float(productos_por_id[producto_id].get('virtual_available') or 0),
+                'fecha': move_fechas.get((linea.get('move_id') or [None])[0]),
+                'referencia_comercial': referencia_comercial,
+            })
+        _dashboard_universo_cache[clave_cache] = (time.time(), universo)
+        _dashboard_redis_set(clave_redis, universo, _DASHBOARD_REDIS_TTL_CONSULTA, 'universo')
+        return universo
+
+
+def _dashboard_filtrar_universo(universo: list[dict], filtros: dict) -> list[dict]:
+    return [
+        fila for fila in universo
+        if all(
+            _dashboard_coincide_filtro(fila['dimensiones'].get(clave, {}), valores)
+            for clave, valores in filtros.items()
+            if clave in _DASHBOARD_DIMENSIONES_SOPORTADAS and valores
+        )
+    ]
+
+
+def _dashboard_periodos_mensuales(fecha_inicio: str, fecha_fin: str) -> list[dict]:
+    """Construye la serie completa, incluidos meses sin movimientos."""
+    inicio = _date.fromisoformat(fecha_inicio).replace(day=1)
+    fin = _date.fromisoformat(fecha_fin).replace(day=1)
+    incluye_varios_anios = inicio.year != fin.year
+    periodos = []
+    actual = inicio
+    while actual <= fin:
+        etiqueta = _DASHBOARD_MESES_CORTOS[actual.month - 1]
+        if incluye_varios_anios:
+            etiqueta = f'{etiqueta} {str(actual.year)[-2:]}'
+        periodos.append({
+            'periodo': actual.strftime('%Y-%m'), 'label': etiqueta,
+            'pzas': 0.0, 'venta': 0.0,
+        })
+        actual = _date(actual.year + (actual.month == 12), 1 if actual.month == 12 else actual.month + 1, 1)
+    return periodos
+
+
+def _validar_consulta_dashboard(data: dict):
+    if not isinstance(data, dict):
+        return None, (jsonify({'error': 'El cuerpo JSON debe ser un objeto.'}), 400)
+
+    fecha_inicio = data.get('fecha_inicio')
+    fecha_fin = data.get('fecha_fin')
+    if not fecha_inicio or not fecha_fin:
+        return None, (jsonify({'error': 'Se requieren fecha_inicio y fecha_fin.'}), 400)
+    try:
+        inicio = _date.fromisoformat(str(fecha_inicio))
+        fin = _date.fromisoformat(str(fecha_fin))
+    except (TypeError, ValueError):
+        return None, (jsonify({'error': 'Las fechas deben usar formato YYYY-MM-DD.'}), 400)
+    if inicio > fin:
+        return None, (jsonify({'error': 'fecha_inicio no puede ser mayor que fecha_fin.'}), 400)
+
+    vista = data.get('vista', 'cobranza')
+    if vista not in ('facturas', 'cobranza'):
+        return None, (jsonify({'error': 'Vista no válida.'}), 400)
+
+    filtros_entrada = data.get('filtros', {})
+    if not isinstance(filtros_entrada, dict):
+        return None, (jsonify({'error': 'filtros debe ser un objeto.'}), 400)
+    filtros_desconocidos = set(filtros_entrada) - set(_DASHBOARD_TODAS_DIMENSIONES)
+    if filtros_desconocidos:
+        return None, (jsonify({
+            'error': f"Filtro no válido: {sorted(filtros_desconocidos)[0]}."
+        }), 400)
+    filtros = {}
+    for dimension in _DASHBOARD_TODAS_DIMENSIONES:
+        valores = filtros_entrada.get(dimension, [])
+        if not isinstance(valores, list):
+            return None, (jsonify({'error': f'El filtro {dimension} debe ser una lista.'}), 400)
+        if any(valor is None or isinstance(valor, (dict, list)) for valor in valores):
+            return None, (jsonify({'error': f'El filtro {dimension} contiene valores inválidos.'}), 400)
+        filtros[dimension] = [str(valor).strip() for valor in valores if str(valor).strip()]
+        if dimension in _DASHBOARD_DIMENSIONES_PENDIENTES and filtros[dimension]:
+            return None, (jsonify({
+                'error': f'La dimensión {dimension} aún no está soportada en el dashboard.',
+                'dimensiones_pendientes': list(_DASHBOARD_DIMENSIONES_PENDIENTES),
+            }), 400)
+
+    desgloses_entrada = data.get('desgloses')
+    if desgloses_entrada is None:
+        # Compatibilidad temporal con el contrato de un solo desglose.
+        desglose_legacy = data.get('desglose')
+        desgloses_entrada = [] if desglose_legacy is None else [desglose_legacy]
+    if not isinstance(desgloses_entrada, list):
+        return None, (jsonify({'error': 'desgloses debe ser una lista.'}), 400)
+    desgloses = []
+    for dimension in desgloses_entrada:
+        if dimension not in _DASHBOARD_TODAS_DIMENSIONES:
+            return None, (jsonify({'error': 'desgloses contiene una dimensión no válida.'}), 400)
+        if dimension in _DASHBOARD_DIMENSIONES_PENDIENTES:
+            return None, (jsonify({
+                'error': f'La dimensión {dimension} aún no está soportada en el dashboard.',
+                'dimensiones_pendientes': list(_DASHBOARD_DIMENSIONES_PENDIENTES),
+            }), 400)
+        if dimension not in desgloses:
+            desgloses.append(dimension)
+
+    orden = data.get('orden') or {'campo': 'venta', 'direccion': 'desc'}
+    if not isinstance(orden, dict):
+        return None, (jsonify({'error': 'orden debe ser un objeto.'}), 400)
+    campo_orden = orden.get('campo', 'venta')
+    direccion_orden = orden.get('direccion', 'desc')
+    if campo_orden not in _DASHBOARD_ORDENES:
+        return None, (jsonify({'error': 'orden.campo no es válido.'}), 400)
+    if direccion_orden not in ('asc', 'desc'):
+        return None, (jsonify({'error': 'orden.direccion debe ser asc o desc.'}), 400)
+
+    return {
+        'fecha_inicio': inicio.isoformat(), 'fecha_fin': fin.isoformat(),
+        'vista': vista, 'filtros': filtros, 'desgloses': desgloses,
+        'desglose': desgloses[0] if len(desgloses) == 1 else None,
+        'orden': {'campo': campo_orden, 'direccion': direccion_orden},
+    }, None
+
+
+@ventas_bp.route('/dashboard/consulta', methods=['POST'])
+@requiere_autenticacion
+@requiere_permiso_interno('ventas_monitor', 'ver')
+def dashboard_consulta():
+    """Consulta dinámica base del Dashboard de Ventas.
+
+    Odoo conserva la fuente financiera. Las dimensiones se enriquecen por
+    lotes desde producto, categoría, atributos y partner, sin depender de SKU
+    como identificador técnico ni realizar consultas XML-RPC por línea.
+    """
+    consulta, error = _validar_consulta_dashboard(request.get_json(silent=True))
+    if error:
+        return error
+
+    ocultar_montos = _debe_ocultar_montos_ventas()
+    clave_redis = _dashboard_redis_key('consulta', {
+        'consulta': consulta,
+        # La respuesta final se separa por esta política para no compartir
+        # importes con usuarios que no tienen ver_montos.
+        'ocultar_montos': ocultar_montos,
+    })
+    respuesta_redis = _dashboard_redis_get(clave_redis, 'consulta')
+    if isinstance(respuesta_redis, dict):
+        return jsonify(respuesta_redis), 200
+
+    try:
+        universo = _dashboard_universo_enriquecido(consulta)
+        filtradas = _dashboard_filtrar_universo(universo, consulta['filtros'])
+        columnas_dimensiones = [
+            clave for clave in _DASHBOARD_DIMENSIONES_SOPORTADAS if consulta['filtros'][clave]
+        ]
+        for desglose in consulta['desgloses']:
+            if desglose not in columnas_dimensiones:
+                columnas_dimensiones.append(desglose)
+        # La cantidad pronosticada es global por producto, no por cliente ni
+        # integral. En esos desgloses se omite para no repetir el mismo stock
+        # en varias filas y sugerir una suma que no existe.
+        existencia_aplicable = not any(
+            dimension in columnas_dimensiones for dimension in ('cliente', 'integral')
+        )
+        agrupado = {}
+        for fila in filtradas:
+            llave = tuple(fila['dimensiones'][clave].get('id') for clave in columnas_dimensiones)
+            acumulado = agrupado.setdefault(llave, {
+                'dimensiones': {clave: fila['dimensiones'][clave] for clave in columnas_dimensiones},
+                'pzas': 0.0, 'venta': 0.0, 'referencias_comerciales': set(),
+                'productos_existencia': {},
+            })
+            acumulado['pzas'] += fila['pzas']
+            acumulado['venta'] += fila['venta']
+            acumulado['productos_existencia'][fila['product_id']] = fila['existencia']
+            if fila.get('referencia_comercial'):
+                acumulado['referencias_comerciales'].add(fila['referencia_comercial'])
+        total_pzas = sum(fila['pzas'] for fila in agrupado.values())
+        total_venta = sum(fila['venta'] for fila in agrupado.values())
+        filas = [{
+            'dimensiones': fila['dimensiones'], 'pzas': round(fila['pzas'], 2),
+            'venta': round(fila['venta'], 2),
+            'existencia': round(sum(fila['productos_existencia'].values()), 2)
+            if existencia_aplicable else None,
+            'participacion': round((fila['venta'] / total_venta * 100) if total_venta else 0, 2),
+            'referencia_comercial': _dashboard_referencia_comercial_agregada(fila['referencias_comerciales']),
+        } for fila in agrupado.values()]
+        filas.sort(
+            key=lambda fila: fila[consulta['orden']['campo']]
+            if fila[consulta['orden']['campo']] is not None else float('-inf'),
+            reverse=consulta['orden']['direccion'] == 'desc',
+        )
+        columnas = [{'key': clave, 'label': _DASHBOARD_LABELS[clave], 'tipo': 'dimension'} for clave in columnas_dimensiones]
+        if any(fila['referencia_comercial'] for fila in filas):
+            columnas.append({'key': 'referencia_comercial', 'label': 'Referencia comercial', 'tipo': 'informativa'})
+        columnas.append({'key': 'pzas', 'label': 'Pzas', 'tipo': 'metrica'})
+        columnas.append({'key': 'existencia', 'label': 'Existencia', 'tipo': 'metrica'})
+        if not ocultar_montos:
+            columnas.append({'key': 'venta', 'label': 'Venta', 'tipo': 'metrica'})
+        columnas.append({'key': 'participacion', 'label': 'Participación', 'tipo': 'metrica'})
+        respuesta = {
+            'consulta': consulta, 'columnas': columnas, 'filas': filas,
+            'totales': {'pzas': round(total_pzas, 2), 'venta': round(total_venta, 2)},
+            'permisos': {'ocultar_montos': ocultar_montos},
+            'dimensiones_soportadas': list(_DASHBOARD_DIMENSIONES_SOPORTADAS),
+            'dimensiones_pendientes': list(_DASHBOARD_DIMENSIONES_PENDIENTES),
+        }
+        if ocultar_montos:
+            respuesta['totales'].pop('venta', None)
+            for fila in respuesta['filas']:
+                fila.pop('venta', None)
+        _dashboard_redis_set(clave_redis, respuesta, _DASHBOARD_REDIS_TTL_CONSULTA, 'consulta')
+        return jsonify(respuesta), 200
+
+        uid, models, err = get_odoo_models()
+        if not uid:
+            return jsonify({'error': 'No se pudo conectar a Odoo', 'detail': err}), 500
+
+        domain_line = [
+            ['move_id.move_type', '=', 'out_invoice'],
+            ['move_id.state', '=', 'posted'],
+            *([['move_id.payment_state', 'in', ['paid', 'partial']]]
+              if consulta['vista'] == 'cobranza' else []),
+            ['move_id.invoice_date', '>=', consulta['fecha_inicio']],
+            ['move_id.invoice_date', '<=', consulta['fecha_fin']],
+            ['move_id.company_id', '=', ODOO_COMPANY_ID],
+            ['display_type', '=', 'product'],
+            ['product_id', '!=', False],
+        ]
+        lineas = models.execute_kw(
+            ODOO_DB, uid, ODOO_PASSWORD, 'account.move.line', 'search_read',
+            [domain_line],
+            {'fields': ['product_id', 'quantity', 'price_total', 'move_id'], 'limit': 0}
+        )
+
+        product_ids = sorted({linea['product_id'][0] for linea in lineas if linea.get('product_id')})
+        move_ids = sorted({linea['move_id'][0] for linea in lineas if linea.get('move_id')})
+
+        productos = []
+        for ids in _dashboard_lotes(product_ids):
+            productos.extend(models.execute_kw(
+                ODOO_DB, uid, ODOO_PASSWORD, 'product.product', 'read', [ids],
+                {'fields': ['id', 'default_code', 'categ_id', 'product_tmpl_id',
+                            'product_template_attribute_value_ids']}
+            ))
+        productos_por_id = {producto['id']: producto for producto in productos}
+
+        template_ids = sorted({
+            producto['product_tmpl_id'][0] for producto in productos
+            if producto.get('product_tmpl_id')
+        })
+        templates = []
+        for ids in _dashboard_lotes(template_ids):
+            templates.extend(models.execute_kw(
+                ODOO_DB, uid, ODOO_PASSWORD, 'product.template', 'read', [ids],
+                {'fields': ['id', 'name']}
+            ))
+        templates_por_id = {template['id']: template for template in templates}
+
+        categ_ids = sorted({p['categ_id'][0] for p in productos if p.get('categ_id')})
+        categorias = []
+        for ids in _dashboard_lotes(categ_ids):
+            categorias.extend(models.execute_kw(
+                ODOO_DB, uid, ODOO_PASSWORD, 'product.category', 'read', [ids],
+                {'fields': ['id', 'complete_name']}
+            ))
+        rutas_categoria = {
+            categoria['id']: _dashboard_ruta_categoria(categoria.get('complete_name'))
+            for categoria in categorias
+        }
+        marcas_por_ruta = _dashboard_marcas_por_ruta(rutas_categoria.values())
+
+        attr_ids = sorted({
+            atributo_id for producto in productos
+            for atributo_id in (producto.get('product_template_attribute_value_ids') or [])
+        })
+        atributos = []
+        for ids in _dashboard_lotes(attr_ids):
+            atributos.extend(models.execute_kw(
+                ODOO_DB, uid, ODOO_PASSWORD, 'product.template.attribute.value', 'read', [ids],
+                {'fields': ['id', 'attribute_id', 'name']}
+            ))
+        atributos_por_id = {
+            atributo['id']: {
+                'atributo': (atributo.get('attribute_id') or [None, ''])[1],
+                'valor': atributo.get('name'),
+            }
+            for atributo in atributos
+        }
+
+        moves = []
+        for ids in _dashboard_lotes(move_ids):
+            moves.extend(models.execute_kw(
+                ODOO_DB, uid, ODOO_PASSWORD, 'account.move', 'read', [ids],
+                {'fields': ['id', 'partner_id', 'commercial_partner_id']}
+            ))
+        move_partner = {
+            move['id']: (
+                (move.get('commercial_partner_id') or move.get('partner_id') or [None])[0]
+            )
+            for move in moves
+        }
+        partner_ids = sorted({partner_id for partner_id in move_partner.values() if partner_id})
+        partners = []
+        for ids in _dashboard_lotes(partner_ids):
+            partners.extend(models.execute_kw(
+                ODOO_DB, uid, ODOO_PASSWORD, 'res.partner', 'read', [ids],
+                {'fields': ['id', 'name', 'ref', 'parent_id', 'state_id']}
+            ))
+        partners_por_id = {partner['id']: partner for partner in partners}
+
+        parent_ids = sorted({
+            (partner.get('parent_id') or [None])[0]
+            for partner in partners
+            if partner.get('parent_id')
+            and (partner.get('parent_id') or [None])[0] not in partners_por_id
+        })
+        for ids in _dashboard_lotes(parent_ids):
+            for partner in models.execute_kw(
+                ODOO_DB, uid, ODOO_PASSWORD, 'res.partner', 'read', [ids],
+                {'fields': ['id', 'name', 'ref', 'parent_id', 'state_id']}
+            ):
+                partners_por_id[partner['id']] = partner
+
+        claves = set()
+        for partner in partners_por_id.values():
+            ref = (partner.get('ref') or '').strip().upper()
+            if not ref and partner.get('parent_id'):
+                padre = partners_por_id.get((partner.get('parent_id') or [None])[0], {})
+                ref = (padre.get('ref') or '').strip().upper()
+            if ref:
+                claves.add(ref)
+        integrales_por_clave = _dashboard_integrales_por_clave(claves)
+
+        filtradas = []
+        for linea in lineas:
+            producto_id = (linea.get('product_id') or [None])[0]
+            producto = productos_por_id.get(producto_id)
+            if not producto:
+                continue
+            atributos_producto = [
+                atributos_por_id[atributo_id]
+                for atributo_id in (producto.get('product_template_attribute_value_ids') or [])
+                if atributo_id in atributos_por_id
+            ]
+            categ_id = (producto.get('categ_id') or [None])[0]
+            dimensiones = {
+                clave: _dashboard_dimension(valor, f'Sin {_DASHBOARD_LABELS[clave].lower()}')
+                for clave, valor in _dashboard_dimensiones_comerciales_producto(
+                    producto.get('id'), rutas_categoria.get(categ_id, []), atributos_producto,
+                    templates_por_id.get((producto.get('product_tmpl_id') or [None])[0], {}).get('name'),
+                    marcas_por_ruta,
+                )[0].items()
+            }
+
+            move_id = (linea.get('move_id') or [None])[0]
+            partner = partners_por_id.get(move_partner.get(move_id), {})
+            parent = partners_por_id.get((partner.get('parent_id') or [None])[0], {}) if partner.get('parent_id') else {}
+            clave_cliente = (partner.get('ref') or parent.get('ref') or '').strip().upper()
+            nombre_cliente = (partner.get('name') or parent.get('name') or '').strip() or None
+            estado = partner.get('state_id')
+            dimensiones['cliente'] = {
+                'id': clave_cliente or (f"odoo:{partner['id']}" if partner.get('id') else None),
+                'label': nombre_cliente or 'Sin cliente',
+                'extra': {'clave': clave_cliente} if clave_cliente else {},
+            }
+            dimensiones['estado'] = _dashboard_dimension(
+                estado[1] if isinstance(estado, (list, tuple)) and len(estado) > 1 else None,
+                'Sin estado'
+            )
+            integral = integrales_por_clave.get(clave_cliente)
+            dimensiones['integral'] = {
+                'id': str(integral['id']) if integral else None,
+                'label': integral['label'] if integral else 'Sin integral',
+            }
+
+            if not all(_dashboard_coincide_filtro(dimensiones[clave], valores)
+                       for clave, valores in consulta['filtros'].items()
+                       if clave in _DASHBOARD_DIMENSIONES_SOPORTADAS):
+                continue
+            filtradas.append({
+                'dimensiones': dimensiones,
+                'pzas': float(linea.get('quantity') or 0),
+                # price_total es el importe de línea con impuestos incluidos.
+                'venta': float(linea.get('price_total') or 0),
+            })
+
+        columnas_dimensiones = [
+            clave for clave in _DASHBOARD_DIMENSIONES_SOPORTADAS
+            if consulta['filtros'][clave]
+        ]
+        if consulta['desglose'] and consulta['desglose'] not in columnas_dimensiones:
+            columnas_dimensiones.append(consulta['desglose'])
+
+        agrupado = {}
+        for fila in filtradas:
+            llave = tuple(
+                fila['dimensiones'][clave].get('id')
+                for clave in columnas_dimensiones
+            )
+            acumulado = agrupado.setdefault(llave, {
+                'dimensiones': {clave: fila['dimensiones'][clave] for clave in columnas_dimensiones},
+                'pzas': 0.0, 'venta': 0.0,
+            })
+            acumulado['pzas'] += fila['pzas']
+            acumulado['venta'] += fila['venta']
+
+        total_pzas = sum(fila['pzas'] for fila in agrupado.values())
+        total_venta = sum(fila['venta'] for fila in agrupado.values())
+        filas = []
+        for fila in agrupado.values():
+            venta = round(fila['venta'], 2)
+            filas.append({
+                'dimensiones': fila['dimensiones'],
+                'pzas': round(fila['pzas'], 2),
+                'venta': venta,
+                'participacion': round((fila['venta'] / total_venta * 100) if total_venta else 0, 2),
+            })
+
+        campo_orden = consulta['orden']['campo']
+        filas.sort(
+            key=lambda fila: fila[campo_orden],
+            reverse=consulta['orden']['direccion'] == 'desc'
+        )
+
+        ocultar_montos = _debe_ocultar_montos_ventas()
+        columnas = [
+            {'key': clave, 'label': _DASHBOARD_LABELS[clave], 'tipo': 'dimension'}
+            for clave in columnas_dimensiones
+        ]
+        columnas.append({'key': 'pzas', 'label': 'Pzas', 'tipo': 'metrica'})
+        if not ocultar_montos:
+            columnas.append({'key': 'venta', 'label': 'Venta', 'tipo': 'metrica'})
+        columnas.append({'key': 'participacion', 'label': 'Participación', 'tipo': 'metrica'})
+
+        respuesta = {
+            'consulta': consulta,
+            'columnas': columnas,
+            'filas': filas,
+            'totales': {'pzas': round(total_pzas, 2), 'venta': round(total_venta, 2)},
+            'permisos': {'ocultar_montos': ocultar_montos},
+            'dimensiones_soportadas': list(_DASHBOARD_DIMENSIONES_SOPORTADAS),
+            'dimensiones_pendientes': list(_DASHBOARD_DIMENSIONES_PENDIENTES),
+        }
+        if ocultar_montos:
+            respuesta['totales'].pop('venta', None)
+            for fila in respuesta['filas']:
+                fila.pop('venta', None)
+        return jsonify(respuesta), 200
+    except Exception as exc:
+        logging.exception('ventas.dashboard_consulta error')
+        return jsonify({'error': 'No se pudo cargar la consulta del dashboard'}), 500
+
+
+@ventas_bp.route('/dashboard/tendencia', methods=['POST'])
+@requiere_autenticacion
+@requiere_permiso_interno('ventas_monitor', 'ver')
+def dashboard_tendencia():
+    """Serie mensual del mismo universo enriquecido usado por la consulta."""
+    consulta, error = _validar_consulta_dashboard(request.get_json(silent=True))
+    if error:
+        return error
+
+    try:
+        periodos = _dashboard_periodos_mensuales(consulta['fecha_inicio'], consulta['fecha_fin'])
+        por_periodo = {periodo['periodo']: periodo for periodo in periodos}
+        universo = _dashboard_universo_enriquecido(consulta)
+        for fila in _dashboard_filtrar_universo(universo, consulta['filtros']):
+            fecha = str(fila.get('fecha') or '')
+            periodo = por_periodo.get(fecha[:7])
+            if not periodo:
+                continue
+            periodo['pzas'] += fila['pzas']
+            periodo['venta'] += fila['venta']
+
+        for periodo in periodos:
+            periodo['pzas'] = round(periodo['pzas'], 2)
+            periodo['venta'] = round(periodo['venta'], 2)
+
+        ocultar_montos = _debe_ocultar_montos_ventas()
+        respuesta = {
+            'periodos': periodos,
+            'permisos': {'ocultar_montos': ocultar_montos},
+        }
+        if ocultar_montos:
+            for periodo in respuesta['periodos']:
+                periodo.pop('venta', None)
+        return jsonify(respuesta), 200
+    except Exception:
+        logging.exception('ventas.dashboard_tendencia error')
+        return jsonify({'error': 'No se pudo cargar la tendencia de ventas'}), 500
+
+
+@ventas_bp.route('/dashboard/sin-venta', methods=['POST'])
+@requiere_autenticacion
+@requiere_permiso_interno('ventas_monitor', 'ver')
+def dashboard_sin_venta():
+    """Productos del universo filtrado con más de 60 días sin facturación.
+
+    La consulta principal sigue ligera: este cálculo histórico sólo se ejecuta
+    al abrir la visualización y reutiliza su universo enriquecido en caché.
+    ``invoice_date`` es un related almacenado en account.move.line, por lo que
+    read_group resuelve la última factura por producto en lotes, sin N+1.
+    """
+    consulta, error = _validar_consulta_dashboard(request.get_json(silent=True))
+    if error:
+        return error
+
+    clave_cache = (
+        consulta['fecha_inicio'], consulta['fecha_fin'], consulta['vista'], ODOO_COMPANY_ID,
+        json.dumps(consulta['filtros'], sort_keys=True, ensure_ascii=False),
+        _DASHBOARD_CLASIFICACION_COMERCIAL_VERSION,
+    )
+    clave_redis = _dashboard_redis_key('sin-venta', {
+        'fecha_inicio': consulta['fecha_inicio'],
+        'fecha_fin': consulta['fecha_fin'],
+        'vista': consulta['vista'],
+        'filtros': consulta['filtros'],
+        'company_id': ODOO_COMPANY_ID,
+    })
+    respuesta_redis = _dashboard_redis_get(clave_redis, 'sin-venta')
+    if isinstance(respuesta_redis, dict):
+        with _dashboard_sin_venta_lock:
+            _dashboard_sin_venta_cache[clave_cache] = (time.time(), respuesta_redis)
+        return jsonify(respuesta_redis), 200
+
+    ahora = time.time()
+    with _dashboard_sin_venta_lock:
+        vigente = _dashboard_sin_venta_cache.get(clave_cache)
+        if vigente and ahora - vigente[0] < _DASHBOARD_UNIVERSO_TTL:
+            _dashboard_redis_set(clave_redis, vigente[1], _DASHBOARD_REDIS_TTL_SIN_VENTA, 'sin-venta')
+            return jsonify(vigente[1]), 200
+
+    try:
+        universo = _dashboard_universo_enriquecido(consulta)
+        productos = {}
+        for fila in _dashboard_filtrar_universo(universo, consulta['filtros']):
+            product_id = fila.get('product_id')
+            if not product_id:
+                continue
+            productos.setdefault(product_id, {
+                'product_id': product_id,
+                'etiqueta': fila.get('producto_nombre') or f'Producto {product_id}',
+                'existencia': float(fila.get('existencia') or 0),
+            })
+
+        if not productos:
+            respuesta = {
+                'fecha_corte': consulta['fecha_fin'], 'productos': [], 'top': [],
+                'total': 0, 'nunca_vendidos': 0,
+            }
+            with _dashboard_sin_venta_lock:
+                _dashboard_sin_venta_cache[clave_cache] = (time.time(), respuesta)
+            _dashboard_redis_set(clave_redis, respuesta, _DASHBOARD_REDIS_TTL_SIN_VENTA, 'sin-venta')
+            return jsonify(respuesta), 200
+
+        uid, models, err = get_odoo_models()
+        if not uid:
+            raise RuntimeError(err or 'No se pudo conectar a Odoo')
+
+        fechas_ultima_venta = {}
+        # La actividad histórica siempre se define por factura publicada, aun
+        # cuando el universo actual provenga de la vista Cobranza.
+        for ids in _dashboard_lotes(sorted(productos), 500):
+            domain = [
+                ['move_id.move_type', '=', 'out_invoice'],
+                ['move_id.state', '=', 'posted'],
+                ['invoice_date', '<=', consulta['fecha_fin']],
+                ['move_id.company_id', '=', ODOO_COMPANY_ID],
+                ['display_type', '=', 'product'],
+                ['product_id', 'in', ids],
+            ]
+            grupos = models.execute_kw(
+                ODOO_DB, uid, ODOO_PASSWORD, 'account.move.line', 'read_group',
+                [domain, ['product_id', 'invoice_date:max'], ['product_id']], {'lazy': False},
+            )
+            for grupo in grupos:
+                product_id = (grupo.get('product_id') or [None])[0]
+                fecha = grupo.get('invoice_date')
+                if product_id and fecha:
+                    fechas_ultima_venta[product_id] = str(fecha)
+
+        fecha_corte = _date.fromisoformat(consulta['fecha_fin'])
+        resultados = []
+        for producto in productos.values():
+            fecha_ultima_venta = fechas_ultima_venta.get(producto['product_id'])
+            dias_sin_venta = None
+            if fecha_ultima_venta:
+                dias_sin_venta = (fecha_corte - _date.fromisoformat(fecha_ultima_venta)).days
+                if dias_sin_venta <= 60:
+                    continue
+            resultados.append({
+                **producto,
+                'ultima_venta': fecha_ultima_venta,
+                'dias_sin_venta': dias_sin_venta,
+                'con_existencia': producto['existencia'] > 0,
+            })
+
+        # Primero inventario disponible; dentro de cada bloque, mayor tiempo
+        # sin vender. Los nunca vendidos quedan sólo en la tabla completa.
+        resultados.sort(key=lambda fila: (
+            not fila['con_existencia'],
+            fila['dias_sin_venta'] is None,
+            -(fila['dias_sin_venta'] or 0),
+            str(fila['etiqueta']).casefold(),
+        ))
+        top = [fila for fila in resultados if fila['dias_sin_venta'] is not None][:10]
+        respuesta = {
+            'fecha_corte': consulta['fecha_fin'],
+            'productos': resultados,
+            'top': top,
+            'total': len(resultados),
+            'nunca_vendidos': sum(fila['dias_sin_venta'] is None for fila in resultados),
+        }
+        with _dashboard_sin_venta_lock:
+            _dashboard_sin_venta_cache[clave_cache] = (time.time(), respuesta)
+        _dashboard_redis_set(clave_redis, respuesta, _DASHBOARD_REDIS_TTL_SIN_VENTA, 'sin-venta')
+        return jsonify(respuesta), 200
+    except Exception:
+        logging.exception('ventas.dashboard_sin_venta error')
+        return jsonify({'error': 'No se pudo cargar el análisis sin venta'}), 500
+
+
+@ventas_bp.route('/dashboard/filtros', methods=['POST'])
+@requiere_autenticacion
+@requiere_permiso_interno('ventas_monitor', 'ver')
+def dashboard_filtros():
+    """Opciones buscables y dependientes para los filtros del dashboard.
+
+    El filtro de la dimensión que se está consultando se omite temporalmente;
+    así el usuario puede ampliar una multiselección sin quedar bloqueado por su
+    propia selección actual.
+    """
+    data = request.get_json(silent=True)
+    consulta, error = _validar_consulta_dashboard(data)
+    if error:
+        return error
+
+    dimension = data.get('dimension')
+    if dimension in _DASHBOARD_DIMENSIONES_PENDIENTES:
+        return jsonify({
+            'error': f'La dimensión {dimension} aún no está soportada en el dashboard.',
+            'dimensiones_pendientes': list(_DASHBOARD_DIMENSIONES_PENDIENTES),
+        }), 400
+    if dimension not in _DASHBOARD_DIMENSIONES_SOPORTADAS:
+        return jsonify({'error': 'dimension no es válida.'}), 400
+
+    buscar = data.get('buscar', '')
+    if not isinstance(buscar, str):
+        return jsonify({'error': 'buscar debe ser un texto.'}), 400
+    buscar_normalizado = buscar.strip().casefold()
+
+    limite = data.get('limite', 50)
+    if isinstance(limite, bool) or not isinstance(limite, int) or limite < 1:
+        return jsonify({'error': 'limite debe ser un entero mayor que cero.'}), 400
+    limite = min(limite, 100)
+
+    filtros_contexto = {
+        clave: consulta['filtros'][clave]
+        for clave in _DASHBOARD_CONTEXTO_FILTROS[dimension]
+        if consulta['filtros'][clave]
+    }
+    clave_redis = _dashboard_redis_key('filtros', {
+        'consulta': consulta,
+        'dimension': dimension,
+        'buscar': buscar,
+        'limite': limite,
+        'filtros_contexto': filtros_contexto,
+    })
+    respuesta_redis = _dashboard_redis_get(clave_redis, 'filtros')
+    if isinstance(respuesta_redis, dict):
+        return jsonify(respuesta_redis), 200
+
+    try:
+        universo = _dashboard_universo_enriquecido(consulta)
+        opciones_por_llave = {}
+        identificadores_validos = set()
+        for fila in _dashboard_filtrar_universo(universo, filtros_contexto):
+            opcion = fila['dimensiones'].get(dimension)
+            if not opcion or opcion.get('id') is None or not str(opcion.get('label') or '').strip():
+                continue
+            etiqueta = str(opcion['label']).strip()
+            identificador = str(opcion['id']).strip()
+            if dimension == 'producto':
+                identificadores_validos.add(identificador)
+            if buscar_normalizado and buscar_normalizado not in etiqueta.casefold() and buscar_normalizado not in identificador.casefold():
+                continue
+            llave = (identificador, etiqueta.casefold())
+            opciones_por_llave.setdefault(llave, {
+                'id': identificador, 'label': etiqueta,
+                **({'extra': opcion['extra']} if opcion.get('extra') else {}),
+            })
+        opciones = sorted(opciones_por_llave.values(), key=lambda opcion: (opcion['label'].casefold(), opcion['id'].casefold()))
+        respuesta = {
+            'dimension': dimension, 'buscar': buscar, 'opciones': opciones[:limite],
+            'total': len(opciones), 'limit': limite,
+            # Permite al cliente retirar sólo selecciones de Producto que ya
+            # no existen al cambiar Marca, aun si no caben en el límite o no
+            # coinciden con el texto de búsqueda actual.
+            **({'selecciones_validas': sorted(identificadores_validos)} if dimension == 'producto' else {}),
+        }
+        _dashboard_redis_set(clave_redis, respuesta, _DASHBOARD_REDIS_TTL_FILTROS, 'filtros')
+        return jsonify(respuesta), 200
+
+        uid, models, err = get_odoo_models()
+        if not uid:
+            return jsonify({'error': 'No se pudo conectar a Odoo', 'detail': err}), 500
+
+        domain_line = [
+            ['move_id.move_type', '=', 'out_invoice'],
+            ['move_id.state', '=', 'posted'],
+            *([['move_id.payment_state', 'in', ['paid', 'partial']]]
+              if consulta['vista'] == 'cobranza' else []),
+            ['move_id.invoice_date', '>=', consulta['fecha_inicio']],
+            ['move_id.invoice_date', '<=', consulta['fecha_fin']],
+            ['move_id.company_id', '=', ODOO_COMPANY_ID],
+            ['display_type', '=', 'product'],
+            ['product_id', '!=', False],
+        ]
+        lineas = models.execute_kw(
+            ODOO_DB, uid, ODOO_PASSWORD, 'account.move.line', 'search_read',
+            [domain_line], {'fields': ['product_id', 'move_id'], 'limit': 0}
+        )
+
+        productos_por_id = {}
+        rutas_categoria = {}
+        atributos_por_id = {}
+        templates_por_id = {}
+        marcas_por_ruta = {}
+        if requiere_producto:
+            product_ids = sorted({
+                linea['product_id'][0] for linea in lineas if linea.get('product_id')
+            })
+            productos = []
+            for ids in _dashboard_lotes(product_ids):
+                productos.extend(models.execute_kw(
+                    ODOO_DB, uid, ODOO_PASSWORD, 'product.product', 'read', [ids],
+                    {'fields': ['id', 'categ_id', 'product_tmpl_id', 'product_template_attribute_value_ids']}
+                ))
+            productos_por_id = {producto['id']: producto for producto in productos}
+
+            template_ids = sorted({
+                producto['product_tmpl_id'][0] for producto in productos
+                if producto.get('product_tmpl_id')
+            })
+            templates = []
+            for ids in _dashboard_lotes(template_ids):
+                templates.extend(models.execute_kw(
+                    ODOO_DB, uid, ODOO_PASSWORD, 'product.template', 'read', [ids],
+                    {'fields': ['id', 'name']}
+                ))
+            templates_por_id = {template['id']: template for template in templates}
+
+            categ_ids = sorted({p['categ_id'][0] for p in productos if p.get('categ_id')})
+            categorias = []
+            for ids in _dashboard_lotes(categ_ids):
+                categorias.extend(models.execute_kw(
+                    ODOO_DB, uid, ODOO_PASSWORD, 'product.category', 'read', [ids],
+                    {'fields': ['id', 'complete_name']}
+                ))
+            rutas_categoria = {
+                categoria['id']: _dashboard_ruta_categoria(categoria.get('complete_name'))
+                for categoria in categorias
+            }
+            marcas_por_ruta = _dashboard_marcas_por_ruta(rutas_categoria.values())
+
+            attr_ids = sorted({
+                atributo_id for producto in productos
+                for atributo_id in (producto.get('product_template_attribute_value_ids') or [])
+            })
+            atributos = []
+            for ids in _dashboard_lotes(attr_ids):
+                atributos.extend(models.execute_kw(
+                    ODOO_DB, uid, ODOO_PASSWORD,
+                    'product.template.attribute.value', 'read', [ids],
+                    {'fields': ['id', 'attribute_id', 'name']}
+                ))
+            atributos_por_id = {
+                atributo['id']: {
+                    'atributo': (atributo.get('attribute_id') or [None, ''])[1],
+                    'valor': atributo.get('name'),
+                }
+                for atributo in atributos
+            }
+
+        partners_por_id = {}
+        move_partner = {}
+        integrales_por_clave = {}
+        if requiere_partner:
+            move_ids = sorted({linea['move_id'][0] for linea in lineas if linea.get('move_id')})
+            moves = []
+            for ids in _dashboard_lotes(move_ids):
+                moves.extend(models.execute_kw(
+                    ODOO_DB, uid, ODOO_PASSWORD, 'account.move', 'read', [ids],
+                    {'fields': ['id', 'partner_id', 'commercial_partner_id']}
+                ))
+            move_partner = {
+                move['id']: (
+                    (move.get('commercial_partner_id') or move.get('partner_id') or [None])[0]
+                )
+                for move in moves
+            }
+            partner_ids = sorted({partner_id for partner_id in move_partner.values() if partner_id})
+            partners = []
+            for ids in _dashboard_lotes(partner_ids):
+                partners.extend(models.execute_kw(
+                    ODOO_DB, uid, ODOO_PASSWORD, 'res.partner', 'read', [ids],
+                    {'fields': ['id', 'name', 'ref', 'parent_id', 'state_id']}
+                ))
+            partners_por_id = {partner['id']: partner for partner in partners}
+
+            parent_ids = sorted({
+                (partner.get('parent_id') or [None])[0]
+                for partner in partners
+                if partner.get('parent_id')
+                and (partner.get('parent_id') or [None])[0] not in partners_por_id
+            })
+            for ids in _dashboard_lotes(parent_ids):
+                for partner in models.execute_kw(
+                    ODOO_DB, uid, ODOO_PASSWORD, 'res.partner', 'read', [ids],
+                    {'fields': ['id', 'name', 'ref', 'parent_id', 'state_id']}
+                ):
+                    partners_por_id[partner['id']] = partner
+
+            if dimension == 'integral' or 'integral' in filtros_contexto:
+                claves = set()
+                for partner in partners_por_id.values():
+                    ref = (partner.get('ref') or '').strip().upper()
+                    if not ref and partner.get('parent_id'):
+                        padre = partners_por_id.get((partner.get('parent_id') or [None])[0], {})
+                        ref = (padre.get('ref') or '').strip().upper()
+                    if ref:
+                        claves.add(ref)
+                integrales_por_clave = _dashboard_integrales_por_clave(claves)
+
+        opciones_por_llave = {}
+        for linea in lineas:
+            dimensiones = {}
+            if requiere_producto:
+                producto_id = (linea.get('product_id') or [None])[0]
+                producto = productos_por_id.get(producto_id)
+                if not producto:
+                    continue
+                atributos_producto = [
+                    atributos_por_id[atributo_id]
+                    for atributo_id in (producto.get('product_template_attribute_value_ids') or [])
+                    if atributo_id in atributos_por_id
+                ]
+                categ_id = (producto.get('categ_id') or [None])[0]
+                dimensiones.update({
+                    clave: _dashboard_dimension(valor, f'Sin {_DASHBOARD_LABELS[clave].lower()}')
+                    for clave, valor in _dashboard_dimensiones_comerciales_producto(
+                        producto.get('id'), rutas_categoria.get(categ_id, []), atributos_producto,
+                        templates_por_id.get((producto.get('product_tmpl_id') or [None])[0], {}).get('name'),
+                        marcas_por_ruta,
+                    )[0].items()
+                })
+
+            if requiere_partner:
+                move_id = (linea.get('move_id') or [None])[0]
+                partner = partners_por_id.get(move_partner.get(move_id), {})
+                parent = (partners_por_id.get((partner.get('parent_id') or [None])[0], {})
+                          if partner.get('parent_id') else {})
+                clave_cliente = (partner.get('ref') or parent.get('ref') or '').strip().upper()
+                nombre_cliente = (partner.get('name') or parent.get('name') or '').strip() or None
+                estado = partner.get('state_id')
+                dimensiones['cliente'] = {
+                    'id': clave_cliente or (f"odoo:{partner['id']}" if partner.get('id') else None),
+                    'label': nombre_cliente or 'Sin cliente',
+                    'extra': {'clave': clave_cliente} if clave_cliente else {},
+                }
+                dimensiones['estado'] = _dashboard_dimension(
+                    estado[1] if isinstance(estado, (list, tuple)) and len(estado) > 1 else None,
+                    'Sin estado'
+                )
+                integral = integrales_por_clave.get(clave_cliente)
+                dimensiones['integral'] = {
+                    'id': str(integral['id']) if integral else None,
+                    'label': integral['label'] if integral else 'Sin integral',
+                }
+
+            # Se aplican todos los filtros activos salvo el de la dimensión
+            # consultada: eso permite ampliar su propia multiselección.
+            if not all(
+                _dashboard_coincide_filtro(dimensiones.get(clave, {}), valores)
+                for clave, valores in filtros_contexto.items()
+            ):
+                continue
+
+            opcion = dimensiones.get(dimension)
+            if not opcion or opcion.get('id') is None or not str(opcion.get('label') or '').strip():
+                continue
+            etiqueta = str(opcion['label']).strip()
+            identificador = str(opcion['id']).strip()
+            if buscar_normalizado and (
+                buscar_normalizado not in etiqueta.casefold()
+                and buscar_normalizado not in identificador.casefold()
+            ):
+                continue
+            llave = (identificador, etiqueta.casefold())
+            opciones_por_llave.setdefault(llave, {
+                'id': identificador,
+                'label': etiqueta,
+                **({'extra': opcion['extra']} if opcion.get('extra') else {}),
+            })
+
+        opciones = sorted(
+            opciones_por_llave.values(),
+            key=lambda opcion: (opcion['label'].casefold(), opcion['id'].casefold())
+        )
+        total = len(opciones)
+        return jsonify({
+            'dimension': dimension,
+            'buscar': buscar,
+            'opciones': opciones[:limite],
+            'total': total,
+            'limit': limite,
+        }), 200
+    except Exception:
+        logging.exception('ventas.dashboard_filtros error')
+        return jsonify({'error': 'No se pudieron cargar las opciones de filtro'}), 500
+
+
+@ventas_bp.route('/dashboard/categorias', methods=['GET'])
+@requiere_autenticacion
+@requiere_permiso_interno('ventas_monitor', 'ver')
+def dashboard_categorias():
+    """Ventas por categoría de producto para el nuevo Dashboard.
+
+    Usa líneas de factura de Odoo para conservar el mismo periodo y filtro de
+    cobranza del Monitor. Los importes son ``price_subtotal`` (sin IVA), por lo
+    que nunca se mezclan con ``account.move.amount_total`` (con IVA).
+    """
+    fecha_inicio = request.args.get('fecha_inicio')
+    fecha_fin = request.args.get('fecha_fin')
+    vista = request.args.get('vista', 'cobranza')
+    categoria_filtro = (request.args.get('categoria') or '').strip()
+
+    if not fecha_inicio or not fecha_fin:
+        return jsonify({'error': 'Se requieren fecha_inicio y fecha_fin'}), 400
+    if vista not in ('facturas', 'cobranza'):
+        return jsonify({'error': 'Vista no válida'}), 400
+
+    try:
+        uid, models, err = get_odoo_models()
+        if not uid:
+            return jsonify({'error': 'No se pudo conectar a Odoo', 'detail': err}), 500
+
+        domain_line = [
+            ['move_id.move_type', '=', 'out_invoice'],
+            ['move_id.state', '=', 'posted'],
+            *([['move_id.payment_state', 'in', ['paid', 'partial']]] if vista == 'cobranza' else []),
+            ['move_id.invoice_date', '>=', fecha_inicio],
+            ['move_id.invoice_date', '<=', fecha_fin],
+            ['move_id.company_id', '=', ODOO_COMPANY_ID],
+            ['display_type', '=', 'product'],
+            ['product_id', '!=', False],
+            ['quantity', '>', 0],
+        ]
+        lineas = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD,
+            'account.move.line', 'search_read', [domain_line],
+            {'fields': ['product_id', 'quantity', 'price_subtotal'], 'limit': 0})
+
+        product_ids = list({l['product_id'][0] for l in lineas if l.get('product_id')})
+        product_categ = {}
+        # sale.report evita depender del acceso directo a producto; se conserva
+        # el respaldo de product.product que usa la sincronización de monitor.
+        for inicio in range(0, len(product_ids), 500):
+            ids = product_ids[inicio:inicio + 500]
+            for fila in models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, 'sale.report', 'search_read',
+                [[['product_id', 'in', ids]]], {'fields': ['product_id', 'categ_id'], 'limit': 0}):
+                if fila.get('product_id') and fila.get('categ_id'):
+                    product_categ.setdefault(fila['product_id'][0], fila['categ_id'][0])
+        faltantes = [pid for pid in product_ids if pid not in product_categ]
+        if faltantes:
+            for inicio in range(0, len(faltantes), 500):
+                for prod in models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, 'product.product', 'read',
+                    [faltantes[inicio:inicio + 500]], {'fields': ['id', 'categ_id']}):
+                    if prod.get('categ_id'):
+                        product_categ[prod['id']] = prod['categ_id'][0]
+
+        categoria_nombre = {}
+        categ_ids = list(set(product_categ.values()))
+        for inicio in range(0, len(categ_ids), 500):
+            for categ in models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, 'product.category', 'read',
+                [categ_ids[inicio:inicio + 500]], {'fields': ['id', 'complete_name']}):
+                nombre = (categ.get('complete_name') or '').strip()
+                if nombre.startswith('All / '): nombre = nombre[6:].strip()
+                elif nombre.startswith('All/'): nombre = nombre[4:].strip()
+                categoria_nombre[categ['id']] = nombre or 'Sin categoría'
+
+        acumulado = {}
+        for linea in lineas:
+            product = linea.get('product_id')
+            if not product:
+                continue
+            nombre = categoria_nombre.get(product_categ.get(product[0]), 'Sin categoría')
+            if categoria_filtro and nombre != categoria_filtro:
+                continue
+            dato = acumulado.setdefault(nombre, {'unidades': 0.0, 'venta': 0.0})
+            dato['unidades'] += float(linea.get('quantity') or 0)
+            dato['venta'] += float(linea.get('price_subtotal') or 0)
+
+        total_venta = sum(d['venta'] for d in acumulado.values())
+        categorias = sorted([
+            {'categoria': nombre, 'unidades': round(d['unidades'], 2), 'venta': round(d['venta'], 2),
+             'participacion': round((d['venta'] / total_venta * 100) if total_venta else 0, 2)}
+            for nombre, d in acumulado.items()], key=lambda d: d['venta'], reverse=True)
+        respuesta = {'total_venta': round(total_venta, 2),
+                     'total_unidades': round(sum(d['unidades'] for d in acumulado.values()), 2),
+                     'categorias': categorias}
+        if _debe_ocultar_montos_ventas():
+            respuesta.pop('total_venta', None)
+            for fila in respuesta['categorias']:
+                fila.pop('venta', None)
+        return jsonify(respuesta), 200
+    except Exception as e:
+        logging.exception('ventas.dashboard_categorias error')
+        return jsonify({'error': 'No se pudo cargar la venta por categoría'}), 500
 
 
 def _ym_from_group(g: dict):

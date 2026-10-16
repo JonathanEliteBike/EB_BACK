@@ -16,6 +16,7 @@ import time
 import logging
 from utils.odoo_utils import get_odoo_models, ODOO_DB, ODOO_PASSWORD, ODOO_COMPANY_ID
 from utils.temporada_utils import rangos_bimestres_temporada
+from utils.auth_decorators import requiere_autenticacion, requiere_permiso_interno
 
 monitor_odoo_bp = Blueprint('monitor_odoo', __name__, url_prefix='')
 
@@ -27,6 +28,8 @@ monitor_odoo_bp = Blueprint('monitor_odoo', __name__, url_prefix='')
 RETROACTIVO_ANALYTIC_ACCOUNT_ID = 174
 
 @monitor_odoo_bp.route('/monitor_odoo', methods=['GET'])
+@requiere_autenticacion
+@requiere_permiso_interno('monitor', 'ver')
 def obtener_monitor():
     """Sin ?temporada: comportamiento histórico, sin filtrar (usado por las
     pantallas que hacen su propio filtrado por cliente/fecha en el front,
@@ -107,6 +110,8 @@ def obtener_monitor():
             conexion.close()
 
 @monitor_odoo_bp.route('/ultima_actualizacion', methods=['GET'])
+@requiere_autenticacion
+@requiere_permiso_interno('monitor', 'ver')
 def obtener_ultima_actualizacion():
     t_inicio = time.time() # ⏱️ INICIO
     
@@ -155,6 +160,8 @@ def obtener_ultima_actualizacion():
         if conexion: conexion.close()
 
 @monitor_odoo_bp.route('/importar_facturas', methods=['POST'])
+@requiere_autenticacion
+@requiere_permiso_interno('monitor', 'editar')
 def importar_facturas():
     if 'file' not in request.files:
         return jsonify({'success': False, 'error': 'No se proporcionó archivo'}), 400
@@ -597,6 +604,8 @@ def _construir_buscar_evac(clientes_db):
 # ─────────────────────────────────────────────────────────────────────────────
 
 @monitor_odoo_bp.route('/sync-monitor-odoo', methods=['POST'])
+@requiere_autenticacion
+@requiere_permiso_interno('monitor', 'editar')
 def sync_monitor_odoo():
     """
     Reemplaza el flujo manual de exportar Excel desde Odoo y subirlo.
@@ -1350,6 +1359,8 @@ def _recalcular_acumulados_previo(conexion, cursor, fecha_corte_override=None, f
 
 
 @monitor_odoo_bp.route('/recalcular-previo-desde-monitor', methods=['POST'])
+@requiere_autenticacion
+@requiere_permiso_interno('monitor', 'editar')
 def recalcular_previo_desde_monitor():
     """
     Recalcula acumulado_anticipado y sub-marcas en previo sumando desde monitor.

@@ -1,4 +1,5 @@
 from flask import Blueprint, jsonify, request
+from utils.auth_decorators import requiere_autenticacion, requiere_permiso_interno
 from db_conexion import obtener_conexion
 from decimal import Decimal
 from datetime import date, datetime
@@ -29,6 +30,8 @@ dashboard_flujo_bp = Blueprint('dashboard_flujo_bp', __name__, url_prefix='/fluj
 # 1. LECTURA: TABLERO MENSUAL (USANDO TABLAS UNIFICADAS)
 # ==============================================================================
 @dashboard_flujo_bp.route('/tablero-mensual', methods=['GET'])
+@requiere_autenticacion
+@requiere_permiso_interno('flujo_dashboard', 'ver')
 def obtener_tablero_mensual():
     conexion = None
     try:
@@ -92,6 +95,8 @@ def obtener_tablero_mensual():
 # 2. LECTURA: PROYECCIÓN ANUAL (USANDO TABLAS UNIFICADAS)
 # ==============================================================================
 @dashboard_flujo_bp.route('/proyeccion-anual', methods=['GET'])
+@requiere_autenticacion
+@requiere_permiso_interno('flujo_tablero_anual', 'ver')
 def obtener_proyeccion_anual():
     conexion = None
     try:
@@ -171,6 +176,8 @@ def obtener_proyeccion_anual():
 # 3. ESCRITURA: GUARDAR VALOR Y RECALCULAR (LÓGICA CORREGIDA)
 # ==============================================================================
 @dashboard_flujo_bp.route('/guardar-valor', methods=['POST'])
+@requiere_autenticacion
+@requiere_permiso_interno('flujo_tablero', 'editar')
 def guardar_valor():
     auth_header = request.headers.get('Authorization')
     token = auth_header.split(" ")[1] if auth_header and " " in auth_header else None
@@ -218,6 +225,8 @@ def guardar_valor():
 # 4. SINCRONIZACIÓN CON ODOO (ACTUALIZADA CON CÁLCULO DE MES ANTERIOR)
 # ==============================================================================
 @dashboard_flujo_bp.route('/sincronizar-odoo', methods=['POST'])
+@requiere_autenticacion
+@requiere_permiso_interno('flujo_tablero', 'editar')
 def sincronizar_odoo():
     data = request.get_json()
     try:
@@ -346,6 +355,8 @@ def sincronizar_odoo():
 # 5. GENERACIÓN DE REPORTES EN EXCEL
 # ==============================================================================
 @dashboard_flujo_bp.route('/reporte-excel', methods=['GET'])
+@requiere_autenticacion
+@requiere_permiso_interno('flujo_tablero', 'ver')
 def exportar_excel():
     conexion = None
     try:
@@ -403,6 +414,8 @@ def exportar_excel():
         if conexion: conexion.close()
 
 @dashboard_flujo_bp.route('/verificar-permiso/<int:id_usuario>', methods=['GET'])
+@requiere_autenticacion
+@requiere_permiso_interno('flujo_dashboard', 'ver')
 def verificar_permiso_joker(id_usuario):
     conexion = None
     try:
@@ -428,6 +441,8 @@ def verificar_permiso_joker(id_usuario):
 # 6. AUDITORÍA DEL FLUJO DE EFECTIVO
 # ==============================================================================
 @dashboard_flujo_bp.route('/auditoria', methods=['GET'])
+@requiere_autenticacion
+@requiere_permiso_interno('flujo_auditoria', 'ver')
 def obtener_auditoria_flujo():
     conexion = None
     cursor = None

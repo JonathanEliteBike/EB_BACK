@@ -83,6 +83,47 @@ def _cliente_id_autenticado(cursor):
     return int(usuario['cliente_id'])
 
 
+def _resolver_cliente_series(cursor, cliente_id_solicitado=None):
+    """Resuelve el cliente de series sin aceptar identidad Odoo del navegador."""
+    try:
+        rol_id = int(g.usuario_actual.get('rol', 0))
+    except (TypeError, ValueError):
+        raise data.SeriesOdooError('rol_no_autorizado', 'Rol no autorizado.', 403)
+
+    if rol_id == 1:
+        try:
+            cliente_id = int(cliente_id_solicitado)
+        except (TypeError, ValueError):
+            raise data.SeriesOdooError(
+                'cliente_requerido',
+                'Selecciona una Razón Social antes de consultar las series.',
+                400,
+            )
+        if cliente_id <= 0:
+            raise data.SeriesOdooError(
+                'cliente_requerido',
+                'Selecciona una Razón Social antes de consultar las series.',
+                400,
+            )
+        cliente = data.obtener_cliente_odoo_retroactivo(cursor, cliente_id)
+        if not cliente or not cliente.get('clave'):
+            raise data.SeriesOdooError(
+                'cliente_invalido',
+                'La Razón Social seleccionada no es válida para Retroactivos.',
+                403,
+            )
+        return cliente
+
+    cliente = data.obtener_cliente_odoo_usuario(cursor, g.usuario_actual['id'])
+    if not cliente or not cliente.get('clave'):
+        raise data.SeriesOdooError(
+            'cliente_sin_clave_odoo',
+            'El usuario autenticado no tiene un cliente con clave Odoo asociada.',
+            403,
+        )
+    return cliente
+
+
 def _parsear_validacion_docs(raw):
     """validacion_docs_json puede venir como dict (ya parseado), str (JSON
     crudo) o None (nadie ha revisado nada todavía)."""
@@ -190,11 +231,10 @@ def registrar_venta():
     cursor = conexion.cursor(dictionary=True, buffered=True)
 
     try:
-        # La identidad del distribuidor viene siempre del JWT, no de
-        # id_usuario/id_cliente enviados en el multipart.
-        cliente_id_autenticado = _cliente_id_autenticado(cursor)
-        if cliente_id_autenticado is not None:
-            datos['id_cliente'] = str(cliente_id_autenticado)
+        # Para distribuidor/hijo se conserva el cliente del JWT. El rol 1
+        # debe elegir una Razón Social validada localmente.
+        cliente_series = _resolver_cliente_series(cursor, datos.get('id_cliente'))
+        datos['id_cliente'] = str(cliente_series['id'])
         datos['id_usuario'] = str(g.usuario_actual['id'])
 
         # Resolver nombre_completo y nombre_sucursal si se enviaron IDs de cliente/tienda.
@@ -205,13 +245,13 @@ def registrar_venta():
             if nom_suc:
                 datos['nombre_sucursal'] = nom_suc
 
-        if cliente_id_autenticado is not None and datos.get('id_tienda'):
+        if datos.get('id_tienda'):
             cursor.execute(
                 "SELECT 1 FROM tiendas WHERE id = %s AND cliente_id = %s",
-                (datos['id_tienda'], cliente_id_autenticado),
+                (datos['id_tienda'], cliente_series['id']),
             )
             if not cursor.fetchone():
-                return jsonify({'error': 'La tienda no pertenece al cliente autenticado.'}), 403
+                return jsonify({'error': 'La tienda no pertenece al cliente seleccionado.'}), 403
 
         if not datos.get('nombre_completo'):
             datos['nombre_completo'] = request.form.get('nombre_completo') or 'Cliente'
@@ -240,11 +280,9 @@ def registrar_venta():
                 "codigo": "sku_no_corresponde_producto"
             }), 422
 
-        # Reutiliza la consulta Odoo de series entregadas. Sólo continúa si la
-        # serie fue entregada a este distribuidor y corresponde al SKU local.
-        data.validar_serie_entregada_odoo(
-            cursor,
-            g.usuario_actual['id'],
+        # La misma Razón Social validada para el formulario autoriza la serie.
+        data.validar_serie_entregada_cliente_odoo(
+            cliente_series,
             sku_real,
             datos['numero_serie'],
         )
@@ -494,13 +532,14 @@ def marcas_por_campania(id_campania):
 
 @solicitud_retroactivo_bp.route('/api/solicitud-retroactivo/series-disponibles', methods=['GET'])
 @requiere_autenticacion
-@requiere_rol(2, 3)
+@requiere_rol(1, 2, 3)
 @requiere_modulos('usuarios_retroactivos', 'usuarios_solicitudes_retroactivos')
 def series_disponibles():
-    """Devuelve únicamente series entregadas al cliente del JWT.
+    """Devuelve únicamente series entregadas al cliente autorizado.
 
-    ``sku``, ``producto`` y ``serie`` son filtros opcionales; nunca identifican al
-    distribuidor. La autoridad para ello siempre es usuarios.cliente_id.
+    Los distribuidores y sus hijos siempre usan ``usuarios.cliente_id``. El
+    administrador debe proporcionar sólo el id local de una Razón Social, que
+    se valida y resuelve en backend antes de usar su clave Odoo.
     """
     conexion = obtener_conexion()
     if not conexion:
@@ -508,12 +547,7 @@ def series_disponibles():
 
     cursor = conexion.cursor(dictionary=True, buffered=True)
     try:
-        cliente = data.obtener_cliente_odoo_usuario(cursor, g.usuario_actual['id'])
-        if not cliente or not cliente.get('clave'):
-            return jsonify({
-                'error': 'El usuario autenticado no tiene un cliente con clave Odoo asociada.',
-                'codigo': 'cliente_sin_clave_odoo'
-            }), 403
+        cliente = _resolver_cliente_series(cursor, request.args.get('cliente_id'))
 
         resultado = data.obtener_series_entregadas_cacheadas_odoo(
             cliente_id=cliente['id'],
