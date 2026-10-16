@@ -18,7 +18,7 @@ from routes.forecast import (SKU_CATALOG, FORECAST_SKU_WHITELIST,
                              _SCOTT_CORRECT_NAMES, _SCOTT_COLORS, _SCOTT_TALLAS,
                              _ensure_scott_names, _redis_get, _redis_set)
 from utils.odoo_utils import get_odoo_models, ODOO_DB, ODOO_PASSWORD, ODOO_COMPANY_ID
-from utils.auth_decorators import requiere_autenticacion
+from utils.auth_decorators import requiere_autenticacion, requiere_permiso_interno
 from services.politica_montos_service import PoliticaMontosService
 
 try:
@@ -568,6 +568,8 @@ def _get_datos_consolidados(periodo: str = '') -> dict:
 # ─────────────────────────────────────────────────────────────────────────────
 
 @proyecciones_my27_bp.route('', methods=['GET'])
+@requiere_autenticacion
+@requiere_permiso_interno('proyecciones_my27', 'ver')
 def listar():
     """
     Retorna los 92 artículos MY27 con cantidades consolidadas por mes.
@@ -625,6 +627,7 @@ def debug_ordenes():
 
 @proyecciones_my27_bp.route('/exportar', methods=['GET'])
 @requiere_autenticacion
+@requiere_permiso_interno('proyecciones_my27', 'ver')
 def exportar_excel():
     """
     Exporta el resumen de proyecciones MY27 a Excel con formato profesional.
@@ -909,6 +912,8 @@ def _generar_excel(data: dict, ocultar_montos: bool = False) -> bytes:
 # ─────────────────────────────────────────────────────────────────────────────
 
 @proyecciones_my27_bp.route('/inventario-megamo', methods=['POST'])
+@requiere_autenticacion
+@requiere_permiso_interno('proyecciones_my27', 'editar')
 def subir_inventario_megamo():
     """
     POST /proyecciones-my27/inventario-megamo
@@ -1035,6 +1040,8 @@ def subir_inventario_megamo():
 # ─────────────────────────────────────────────────────────────────────────────
 
 @proyecciones_my27_bp.route('/inventario-megamo', methods=['GET'])
+@requiere_autenticacion
+@requiere_permiso_interno('proyecciones_my27', 'ver')
 def get_inventario_megamo():
     """GET /proyecciones-my27/inventario-megamo?periodo=2026-2027"""
     periodo = request.args.get('periodo', '2026-2027').strip()
@@ -1403,6 +1410,8 @@ def _compute_distribucion_prioritaria(periodo: str) -> list:
 
 
 @proyecciones_my27_bp.route('/cobertura-megamo', methods=['GET'])
+@requiere_autenticacion
+@requiere_permiso_interno('proyecciones_my27', 'ver')
 def get_cobertura_megamo():
     """
     GET /proyecciones-my27/cobertura-megamo?periodo=2026-2027&refresh=1
@@ -1437,6 +1446,7 @@ def get_cobertura_megamo():
 
 @proyecciones_my27_bp.route('/exportar-cobertura', methods=['GET'])
 @requiere_autenticacion
+@requiere_permiso_interno('proyecciones_my27', 'ver')
 def exportar_cobertura():
     """
     Exporta el análisis de cobertura FIFO (Inventario Entrante) a Excel.
@@ -1593,6 +1603,8 @@ def exportar_cobertura():
 
 
 @proyecciones_my27_bp.route('/distribucion-prioritaria', methods=['GET'])
+@requiere_autenticacion
+@requiere_permiso_interno('proyecciones_my27', 'ver')
 def get_distribucion_prioritaria():
     """
     GET /proyecciones-my27/distribucion-prioritaria?periodo=2026-2027
@@ -1613,6 +1625,8 @@ def get_distribucion_prioritaria():
 # ─────────────────────────────────────────────────────────────────────────────
 
 @proyecciones_my27_bp.route('/generar-orden-odoo', methods=['POST'])
+@requiere_autenticacion
+@requiere_permiso_interno('proyecciones_my27', 'crear')
 def generar_orden_odoo():
     """
     POST /proyecciones-my27/generar-orden-odoo

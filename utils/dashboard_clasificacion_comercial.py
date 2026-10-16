@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import base64
 import json
+import re
+import unicodedata
 import zlib
 
 # Generado desde clasificacion_final_productos.csv. No consulta archivos en runtime.
@@ -133,6 +135,328 @@ SUBMODELOS_APROBADOS_POR_PRODUCT_ID = {
     5871: "PRO SHIELD METAVERSE",
     17987: "MTB RC ULTIMATE",
 }
+
+
+# Términos taxonómicos que describen tipo, disciplina o línea genérica. Aunque
+# sean el último nodo de la ruta B2B, no representan por sí mismos un Modelo.
+_NIVELES_B2B_GENERICOS = frozenset({
+    'ACCESORIOS', 'ALL MOUNTAIN', 'ASIENTOS', 'BOLSA PARA COMPUTADORA',
+    'CALCETAS', 'CASCO', 'COMPONENTES', 'ENDURANCE', 'GOGLES', 'GUANTES',
+    'HERRAMIENTAS', 'JERSEY', 'LLANTAS', 'LIFESTYLE', 'MTB', 'PANTS',
+    'PARA COMPONENTES', 'PERFORMANCE', 'PORTANFORAS', 'PROTECTOR DE CUADRO',
+    'RACING', 'ROPA', 'RUTA', 'SHORT', 'SPORT', 'TRAIL', 'ZAPATOS',
+})
+
+# La promoción dinámica queda cerrada a familias comerciales confirmadas. Los
+# demás nombres siguen dependiendo del respaldo validado por product_id; una
+# simple coincidencia de texto no debe reclasificar una línea genérica nueva.
+_FAMILIAS_B2B_MODELO_DINAMICO = frozenset({'APPAREL', 'RUNNING'})
+
+# Segunda pasada global: líneas que permanecían sin modelo aun cuando la ruta
+# B2B y la plantilla las confirman juntas. Son catálogos cerrados por
+# familia/tipo; no se infieren por la primera palabra de un nombre ni por IDs.
+# El primer valor es el nodo B2B, el segundo el Modelo canónico y los restantes
+# son las formas que deben estar explícitamente presentes en la plantilla.
+_MODELOS_B2B_ADICIONALES_POR_TIPO = {
+    ('APPAREL', 'CASCO'): (
+        ('ARX', 'ARX', ('ARX',)),
+    ),
+    ('APPAREL', 'GOGLES'): (
+        ('FURY', 'FURY', ('FURY',)),
+        ('PRIMAL', 'PRIMAL', ('PRIMAL',)),
+        ('PROSPECT', 'PROSPECT', ('PROSPECT',)),
+    ),
+    ('APPAREL', 'MOCHILAS'): (
+        ('GEAR', 'GEAR', ('GEAR',)),
+        ('PERFORM EVO HY', 'PERFORM EVO HY', ('PERFORM EVO HY',)),
+        ('ROCKET', 'ROCKET', ('ROCKET',)),
+        ('TRAIL PROTECT', 'TRAIL PROTECT', ('TRAIL PROTECT',)),
+    ),
+    ('APPAREL', 'PROTECCIONES'): (
+        ('AIRFLEX PROTECTOR', 'AIRFLEX', ('AIRFLEX',)),
+        ('MISSION EVO JUNIOR', 'MISSION EVO', ('MISSION EVO',)),
+        ('SOFTCON', 'SOFTCON', ('SOFTCON',)),
+    ),
+    ('APPAREL', 'CALCETAS'): (
+        ('BLOCK STRIKE', 'BLOCK STRIPE', ('BLOCK STRIPE', 'BLOCK STRIP')),
+        ('BLOCK STRIPE', 'BLOCK STRIPE', ('BLOCK STRIPE', 'BLOCK STRIP')),
+        ('GRADIENTS STRIPE CREW', 'GRADIENT STRIPES CREW', ('GRADIENT STRIPES CREW',)),
+        ('RETRO CASUAL CREW', 'RETRO CASUAL CREW', ('RETRO CASUAL CREW',)),
+        ('RETRO CASUAL', 'RETRO CASUAL CREW', ('RETRO CASUAL CREW',)),
+        ('RINGS CREW', 'RINGS CREW', ('RINGS CREW',)),
+        ('TRAIL TUNED CREW', 'TRAIL TUNED', ('TRAIL TUNED',)),
+    ),
+    ('APPAREL', 'ROPA'): (
+        ('POLO ICON', 'ICON', ('ICON',)),
+        ('TRAIL FLOW W PAD', 'TRAIL FLOW', ('TRAIL FLOW',)),
+    ),
+    ('RUNNING', 'ZAPATOS'): (
+        ('KINABALU', 'KINABALU', ('KINABALU',)),
+    ),
+    ('APPAREL', 'ZAPATOS'): (
+        ('CRUS -R FLAT', 'CRUS-R FLAT', ('CRUS-R',)),
+        ('MTB COMP BOA LADY', 'MTB COMP BOA', ('MTB COMP BOA',)),
+        ('MTB COMP LADY', 'MTB COMP', ('MTB COMP',)),
+        ('MTB RC', 'MTB RC', ('MTB RC',)),
+        ('MTB SHR-ALP BOA', 'MTB SHR-ALP BOA', ('SHR-ALP BOA',)),
+        ('MTB SHR-ALP LACE', 'MTB SHR-ALP LACE', ('SHR-ALP LACE',)),
+        ('ROAD COMP BOA LADY', 'ROAD COMP BOA', ('ROAD COMP BOA',)),
+        ('ROAD COMP LADY', 'ROAD COMP', ('ROAD COMP',)),
+    ),
+}
+
+# Líneas comerciales observadas para LLANTAS. Los patrones se evalúan sobre
+# nombre/plantilla normalizado, no sobre medida, terreno ni el último nivel de
+# categoría. Las variantes técnicas (TLR, Graphene, ancho, diámetro, color,
+# compuesto o empaque) nunca forman parte del Modelo.
+_MODELOS_LLANTAS_POR_PATRON = (
+    ('CORSA PRO SPEED', ('CORSAPROSPEED',)),
+    ('CORSA NEXT', ('CORSANEXT', 'CORSANEXT')),
+    ('CORSA PRO', ('CORSAPRO',)),
+    ('ZAFFIRO PRO V', ('ZAFFIROPROV',)),
+    ('ZAFFIRO', ('ZAFFIRO',)),
+    ('TERRENO T50 MIXED', ('TERRENOT50MIXED',)),
+    ('TERRENO T30 FINE LOOSE', ('TERRENOT30FINELOOSE',)),
+    ('TERRENO DRY', ('TERRENODRY', 'TERRENDRY', 'TERRDRY')),
+    ('TERRENO WET', ('TERRENOWET',)),
+    ('TERRENO ZERO', ('TERRENOZERO',)),
+    ('RIDEARMOR II', ('RIDEARMORII', 'RIDEARMORLL')),
+    ('RUBINO PRO IV', ('RUBINOPROIV', 'RUBINPROIV')),
+    ('MEZCAL III', ('MEZCALIII', 'MEZIII')),
+    ('PEYOTE II', ('PEYOTEII',)),
+    ('E-MARTELLO', ('EMARTELLO',)),
+    ('MARTELLO', ('MARTELLO',)),
+    ('E-MAZZA', ('EMAZZA',)),
+    ('MAZZA', ('MAZZA',)),
+    ('AGARRO', ('AGARRO',)),
+    ('BARZO', ('BARZO',)),
+    ('RANDONNEUR', ('RANDONNEUR', 'RANDONEUR')),
+    ('SAGUARO', ('SAGUARO',)),
+    ('SYERRA', ('SYERRA',)),
+)
+
+# Líneas comerciales de COMPONENTES confirmadas en el catálogo auditado. Cada
+# patrón está limitado al tipo B2B correspondiente: una coincidencia textual
+# aislada en otra clase de componente no basta para promover un Modelo.
+# Códigos, medidas y tecnologías (por ejemplo, IC, SL, XC o R100) quedan fuera.
+_MODELOS_COMPONENTES_POR_CATEGORIA = {
+    'ASIENTOS': ('BELCARRA', 'TOFINO'),
+    'MANUBRIOS': ('CRESTON', 'FRASER', 'HIXON'),
+    'PEDALES': ('SQUAMISH',),
+    'POSTE DE ASIENTO': ('DUNCAN',),
+    'RUEDOS': ('CAPITAL', 'REVELSTOKE', 'SILVERTON'),
+}
+
+# Líneas comerciales de ACCESORIOS observadas repetidamente en el catálogo.
+# La categoría B2B limita cada patrón para no convertir tipos, materiales,
+# compatibilidades, posiciones, medidas o códigos internos en Modelos.
+_MODELOS_ACCESORIOS_POR_CATEGORIA = {
+    'BOMBAS': ('BOUNDARY', 'SAVE THE DAY', 'VERNON'),
+    'HERRAMIENTAS': ('GREENSLIDE', 'MATCHBOX'),
+    'LAMPARAS': ('CAMPBELL', 'NANAIMO'),
+    'PORTANFORA INTEGRADA': ('CACHE', 'COUPE'),
+    'PORTANFORAS': ('CACHE', 'COUPE', 'TAILOR'),
+}
+
+# En REFACCIONES/REEMPLAZOS la mayoría de los nombres son piezas o
+# compatibilidades de bicicleta. Sólo SILVERTON aparece como una línea
+# comercial de componente verificable dentro del tipo B2B RINES.
+_MODELOS_REFACCIONES_POR_CATEGORIA = {
+    'RINES': ('SILVERTON',),
+}
+
+# Submodelos dinámicos no bicicleta auditados. Cada regla exige el Modelo ya
+# resuelto, el tipo B2B y una frase comercial completa en la plantilla; SS/LS
+# no se extraen por sí solos ni a partir de talla, color, año o tecnología.
+_SUBMODELOS_DINAMICOS_NO_BICICLETA = {
+    ('APPAREL', 'ROPA', 'DEFINED DRI'): (
+        ('DEFINED DRI LS', ('DEFINED DRI LS',)),
+        ('DEFINED DRI SS', ('DEFINED DRI SS',)),
+    ),
+}
+
+
+def _clave_comercial(valor: str | None) -> str:
+    """Normaliza texto para comparaciones comerciales sin depender de acentos."""
+    texto = unicodedata.normalize('NFD', str(valor or ''))
+    texto = ''.join(caracter for caracter in texto if unicodedata.category(caracter) != 'Mn')
+    return re.sub(r'\s+', ' ', texto).strip().upper()
+
+
+def _coincide_en_nombre_comercial(candidato: str, nombre_template: str | None) -> bool:
+    """Exige una coincidencia por palabras completas; no infiere desde SKU."""
+    clave_candidato = _clave_comercial(candidato)
+    clave_template = _clave_comercial(nombre_template)
+    if not clave_candidato or not clave_template:
+        return False
+    return bool(re.search(rf'(?<!\w){re.escape(clave_candidato)}(?!\w)', clave_template))
+
+
+_MODELOS_B2B_VALIDADOS = frozenset(
+    _clave_comercial(valor.get('m'))
+    for valor in CLASIFICACION_COMERCIAL_POR_PRODUCT_ID.values()
+    if valor.get('c') == 'MODELO_CONFIRMADO' and valor.get('m')
+)
+
+
+def _modelo_llanta_desde_nombre(nombre_template: str | None) -> str | None:
+    """Devuelve una línea comercial de llanta sólo ante un patrón validado."""
+    compacto = re.sub(r'[^A-Z0-9]', '', _clave_comercial(nombre_template))
+    if not compacto:
+        return None
+    for modelo, patrones in _MODELOS_LLANTAS_POR_PATRON:
+        if any(patron in compacto for patron in patrones):
+            return modelo
+    return None
+
+
+def _modelo_componente_desde_nombre(
+    categoria: str | None, nombre_template: str | None,
+) -> str | None:
+    """Devuelve un Modelo de COMPONENTES sólo ante tipo y línea confirmados."""
+    for modelo in _MODELOS_COMPONENTES_POR_CATEGORIA.get(_clave_comercial(categoria), ()):
+        if _coincide_en_nombre_comercial(modelo, nombre_template):
+            return modelo
+    return None
+
+
+def _modelo_accesorio_desde_nombre(
+    categoria: str | None, nombre_template: str | None,
+) -> str | None:
+    """Devuelve un Modelo de ACCESORIOS sólo ante tipo y línea confirmados."""
+    for modelo in _MODELOS_ACCESORIOS_POR_CATEGORIA.get(_clave_comercial(categoria), ()):
+        if _coincide_en_nombre_comercial(modelo, nombre_template):
+            return modelo
+    return None
+
+
+def _modelo_refaccion_desde_nombre(
+    categoria: str | None, nombre_template: str | None,
+) -> str | None:
+    """Devuelve un Modelo de refacción sólo ante tipo y línea confirmados."""
+    for modelo in _MODELOS_REFACCIONES_POR_CATEGORIA.get(_clave_comercial(categoria), ()):
+        if _coincide_en_nombre_comercial(modelo, nombre_template):
+            return modelo
+    return None
+
+
+def _modelo_b2b_adicional_desde_ruta(
+    familia_producto: str | None,
+    categoria: str | None,
+    candidato_ruta: str | None,
+    nombre_template: str | None,
+) -> str | None:
+    """Promueve sólo líneas adicionales auditadas por ruta, tipo y plantilla."""
+    clave_tipo = (_clave_comercial(familia_producto), _clave_comercial(categoria))
+    clave_candidato = _clave_comercial(candidato_ruta)
+    for nodo_ruta, modelo, aliases in _MODELOS_B2B_ADICIONALES_POR_TIPO.get(clave_tipo, ()):
+        if clave_candidato != _clave_comercial(nodo_ruta):
+            continue
+        if any(_coincide_en_nombre_comercial(alias, nombre_template) for alias in aliases):
+            return modelo
+    return None
+
+
+def obtener_submodelo_dinamico_no_bicicleta(
+    producto: str | None,
+    categoria: str | None,
+    modelo: str | None,
+    nombre_template: str | None,
+) -> str | None:
+    """Devuelve sólo Submodelos no bicicleta validados por nombre completo."""
+    clave = (
+        _clave_comercial(producto),
+        _clave_comercial(categoria),
+        _clave_comercial(modelo),
+    )
+    for submodelo, aliases in _SUBMODELOS_DINAMICOS_NO_BICICLETA.get(clave, ()):
+        if any(_coincide_en_nombre_comercial(alias, nombre_template) for alias in aliases):
+            return submodelo
+    return None
+
+
+def obtener_modelo_fallback_nombre_producto(nombre_producto: str | None) -> str | None:
+    """Conserva el nombre Odoo como último identificador de Modelo."""
+    nombre = str(nombre_producto or '').strip()
+    return nombre or None
+
+
+def clasificar_jerarquia_b2b_no_bicicleta(
+    niveles: list[str], nombre_template: str | None, familia_producto: str | None = None,
+) -> dict[str, str | None]:
+    """Mapea una rama B2B no bicicleta a las dimensiones ya existentes.
+
+    ``niveles`` inicia después de la familia principal (por ejemplo,
+    ``ROPA / SHORT / SPLIT RC RUN``). El último nodo sólo se promueve a
+    Modelo cuando es comercialmente específico y aparece completo en la
+    plantilla. Submodelo no se deduce de la ruta: sólo se conserva mediante
+    la aprobación explícita por product_id.
+    """
+    limpios = [str(nivel).strip() for nivel in niveles if str(nivel).strip()]
+    resultado = {'categoria': None, 'subcategoria': None, 'modelo': None, 'submodelo': None}
+    if _clave_comercial(familia_producto) == 'LLANTAS':
+        if limpios:
+            resultado['categoria'] = limpios[0]
+            resultado['subcategoria'] = limpios[1] if len(limpios) > 1 else None
+        resultado['modelo'] = _modelo_llanta_desde_nombre(nombre_template)
+        return resultado
+    if _clave_comercial(familia_producto) == 'COMPONENTES':
+        if limpios:
+            resultado['categoria'] = limpios[0]
+            resultado['subcategoria'] = limpios[1] if len(limpios) > 1 else None
+            resultado['modelo'] = _modelo_componente_desde_nombre(
+                resultado['categoria'], nombre_template,
+            )
+        return resultado
+    if _clave_comercial(familia_producto) == 'ACCESORIOS':
+        if limpios:
+            resultado['categoria'] = limpios[0]
+            resultado['subcategoria'] = limpios[1] if len(limpios) > 1 else None
+            resultado['modelo'] = _modelo_accesorio_desde_nombre(
+                resultado['categoria'], nombre_template,
+            )
+        return resultado
+    if _clave_comercial(familia_producto) in {'REFACCIONES', 'REEMPLAZOS'}:
+        if limpios:
+            resultado['categoria'] = limpios[0]
+            resultado['subcategoria'] = limpios[1] if len(limpios) > 1 else None
+            resultado['modelo'] = _modelo_refaccion_desde_nombre(
+                resultado['categoria'], nombre_template,
+            )
+        return resultado
+    if not limpios:
+        return resultado
+
+    resultado['categoria'] = limpios[0]
+    if _clave_comercial(familia_producto) not in _FAMILIAS_B2B_MODELO_DINAMICO:
+        resultado['subcategoria'] = limpios[1] if len(limpios) > 1 else None
+        return resultado
+    if len(limpios) == 1:
+        return resultado
+
+    candidato_modelo = limpios[-1]
+    clave_candidato = _clave_comercial(candidato_modelo)
+    modelo_adicional = _modelo_b2b_adicional_desde_ruta(
+        familia_producto, resultado['categoria'], candidato_modelo, nombre_template,
+    )
+    es_modelo_seguro = (
+        clave_candidato in _MODELOS_B2B_VALIDADOS
+        and clave_candidato not in _NIVELES_B2B_GENERICOS
+        and _coincide_en_nombre_comercial(candidato_modelo, nombre_template)
+    )
+
+    if es_modelo_seguro or modelo_adicional:
+        # Con dos nodos, el segundo es directamente el modelo (GOGLES / FURY).
+        # Con más, el primer nivel entre categoría y modelo conserva el tipo.
+        if len(limpios) > 2:
+            resultado['subcategoria'] = limpios[1]
+        resultado['modelo'] = modelo_adicional or candidato_modelo
+        return resultado
+
+    # Si el último nodo no es un modelo seguro, sigue siendo taxonomía B2B y
+    # se conserva como subcategoría en lugar de inventar un modelo.
+    resultado['subcategoria'] = limpios[1]
+    return resultado
 
 
 def obtener_clasificacion_comercial(product_id: int | None) -> dict | None:

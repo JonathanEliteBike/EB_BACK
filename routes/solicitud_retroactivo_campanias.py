@@ -17,6 +17,7 @@ from flask import Blueprint, jsonify, request
 
 from db_conexion import obtener_conexion
 from services import solicitud_retroactivo_campanias_service as data
+from utils.auth_decorators import requiere_autenticacion, requiere_permiso_interno
 
 
 # ============================================================
@@ -170,6 +171,8 @@ def _normalizar_activa(activa, valor_default=1):
 # ============================================================
 
 @solicitud_retroactivo_campanias_bp.route('/api/solicitud-retroactivo-campanias/msi', methods=['GET'])
+@requiere_autenticacion
+@requiere_permiso_interno('solicitud_retroactivo_campanias', 'ver')
 def listar_msi():
     """
     GET - Obtiene la lista de MSI.
@@ -201,6 +204,8 @@ def listar_msi():
 # ============================================================
 
 @solicitud_retroactivo_campanias_bp.route('/api/solicitud-retroactivo-campanias/msi', methods=['POST'])
+@requiere_autenticacion
+@requiere_permiso_interno('solicitud_retroactivo_campanias', 'crear')
 def crear_msi():
     """
     POST - Agrega un plazo nuevo al catálogo global de MSI. El % que se
@@ -265,6 +270,8 @@ def crear_msi():
 # ============================================================
 
 @solicitud_retroactivo_campanias_bp.route('/api/solicitud-retroactivo-campanias', methods=['GET'])
+@requiere_autenticacion
+@requiere_permiso_interno('solicitud_retroactivo_campanias', 'ver')
 def listar_campanias():
     """
     GET - Lista todas las campañas.
@@ -298,6 +305,8 @@ def listar_campanias():
 # ============================================================
 
 @solicitud_retroactivo_campanias_bp.route('/api/solicitud-retroactivo-campanias/<int:id_campania>', methods=['GET'])
+@requiere_autenticacion
+@requiere_permiso_interno('solicitud_retroactivo_campanias', 'ver')
 def obtener_campania(id_campania):
     """
     GET - Obtiene una campaña específica.
@@ -333,6 +342,8 @@ def obtener_campania(id_campania):
 # ============================================================
 
 @solicitud_retroactivo_campanias_bp.route('/api/solicitud-retroactivo-campanias', methods=['POST'])
+@requiere_autenticacion
+@requiere_permiso_interno('solicitud_retroactivo_campanias', 'crear')
 def crear_campania():
     """
     POST - Crea una campaña.
@@ -441,6 +452,8 @@ def crear_campania():
 # ============================================================
 
 @solicitud_retroactivo_campanias_bp.route('/api/solicitud-retroactivo-campanias/<int:id_campania>', methods=['PUT'])
+@requiere_autenticacion
+@requiere_permiso_interno('solicitud_retroactivo_campanias', 'editar')
 def editar_campania(id_campania):
     """
     PUT - Edita una campaña.
@@ -556,6 +569,8 @@ def editar_campania(id_campania):
 # ============================================================
 
 @solicitud_retroactivo_campanias_bp.route('/api/solicitud-retroactivo-campanias/<int:id_campania>', methods=['DELETE'])
+@requiere_autenticacion
+@requiere_permiso_interno('solicitud_retroactivo_campanias', 'eliminar')
 def eliminar_campania(id_campania):
     """
     DELETE - Elimina una campaña.
@@ -598,6 +613,8 @@ def eliminar_campania(id_campania):
 # ============================================================
 
 @solicitud_retroactivo_campanias_bp.route('/api/solicitud-retroactivo-campanias/marcas', methods=['GET'])
+@requiere_autenticacion
+@requiere_permiso_interno('solicitud_retroactivo_campanias', 'ver')
 def listar_marcas():
     """
     GET - Obtiene la lista de marcas para el filtro del catálogo.
@@ -629,6 +646,8 @@ def listar_marcas():
 # ============================================================
 
 @solicitud_retroactivo_campanias_bp.route('/api/solicitud-retroactivo-campanias/productos/buscar-por-sku', methods=['POST'])
+@requiere_autenticacion
+@requiere_permiso_interno('solicitud_retroactivo_campanias', 'ver')
 def buscar_productos_por_sku():
     """
     POST - Resuelve una lista de SKUs a sus productos detalle, para que MKT
@@ -690,6 +709,8 @@ def buscar_productos_por_sku():
 # ============================================================
 
 @solicitud_retroactivo_campanias_bp.route('/api/solicitud-retroactivo-campanias/catalogo-productos', methods=['GET'])
+@requiere_autenticacion
+@requiere_permiso_interno('solicitud_retroactivo_campanias', 'ver')
 def catalogo_productos():
     """
     GET - Obtiene variantes de producto (SKU) con paginación y filtros.

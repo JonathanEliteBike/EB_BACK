@@ -4,13 +4,19 @@ from utils.odoo_utils import get_odoo_models, ODOO_DB, ODOO_PASSWORD, ODOO_COMPA
 from db_conexion import obtener_conexion
 from utils.auth_decorators import requiere_autenticacion, requiere_permiso_interno
 from utils.dashboard_clasificacion_comercial import (
+    clasificar_jerarquia_b2b_no_bicicleta,
     obtener_clasificacion_comercial,
+    obtener_modelo_fallback_nombre_producto,
+    obtener_submodelo_dinamico_no_bicicleta,
     obtener_submodelo_aprobado,
 )
 from services.politica_montos_service import PoliticaMontosService
 from datetime import date as _date, timedelta as _timedelta
 import logging
 import time
+import json
+import hashlib
+import os
 import re
 import unicodedata
 import threading
@@ -315,7 +321,7 @@ _DASHBOARD_TODAS_DIMENSIONES = (
     *_DASHBOARD_DIMENSIONES_SOPORTADAS,
     *_DASHBOARD_DIMENSIONES_PENDIENTES,
 )
-_DASHBOARD_ORDENES = ('pzas', 'venta', 'participacion')
+_DASHBOARD_ORDENES = ('pzas', 'existencia', 'venta', 'participacion')
 _DASHBOARD_LABELS = {
     'marca': 'Marca', 'producto': 'Producto', 'categoria': 'Categoría',
     'subcategoria': 'Subcategoría', 'modelo': 'Modelo', 'submodelo': 'Submodelo',
@@ -326,7 +332,7 @@ _DASHBOARD_LABELS = {
 # universo temporal. Las dimensiones comerciales detalladas conservan un
 # contexto acotado para que sus listas sigan siendo útiles y manejables.
 _DASHBOARD_CONTEXTO_FILTROS = {
-    'marca': (), 'producto': (), 'categoria': ('producto',),
+    'marca': (), 'producto': ('marca',), 'categoria': ('producto',),
     'subcategoria': ('producto', 'categoria'),
     'estado': (), 'cliente': (), 'integral': (),
     'modelo': ('marca', 'producto', 'categoria', 'subcategoria'),
@@ -339,7 +345,7 @@ _DASHBOARD_CONTEXTO_FILTROS = {
 # sólo para comparar; el valor es la etiqueta que se expone al dashboard.
 _DASHBOARD_FAMILIAS_PRODUCTO = {
     'BICICLETA': 'BICICLETA',
-    'APPAREL': 'ROPA',
+    'APPAREL': 'APPAREL',
     'ACCESORIOS': 'ACCESORIOS',
     'ACCESORIOS VARIOS': 'ACCESORIOS',
     'COMPONENTES': 'COMPONENTES',
@@ -361,10 +367,83 @@ _DASHBOARD_SUBCATEGORIAS_JUNIOR_POR_MODELO = {
     'SCALE 24': 'MONTAÑA',
 }
 _DASHBOARD_UNIVERSO_TTL = 180
-_DASHBOARD_CLASIFICACION_COMERCIAL_VERSION = 2
+_DASHBOARD_CLASIFICACION_COMERCIAL_VERSION = 14
+_DASHBOARD_REDIS_TTL_CONSULTA = 300
+_DASHBOARD_REDIS_TTL_FILTROS = 300
+_DASHBOARD_REDIS_TTL_SIN_VENTA = 180
+_DASHBOARD_REDIS_URL = os.getenv('REDIS_URL') or os.getenv('CELERY_BROKER_URL')
+_dashboard_redis = None
+_dashboard_redis_inicializado = False
+_dashboard_redis_reintento_en = 0.0
 _dashboard_universo_cache: dict[tuple, tuple[float, list[dict]]] = {}
 _dashboard_universo_lock = threading.RLock()
+_dashboard_sin_venta_cache: dict[tuple, tuple[float, dict]] = {}
+_dashboard_sin_venta_lock = threading.RLock()
 _DASHBOARD_MESES_CORTOS = ('Ene', 'Feb', 'Mar', 'Abr', 'May', 'Jun', 'Jul', 'Ago', 'Sep', 'Oct', 'Nov', 'Dic')
+
+
+def _dashboard_redis_cliente():
+    """Crea el cliente Redis bajo demanda para no bloquear el arranque."""
+    global _dashboard_redis, _dashboard_redis_inicializado
+    if time.time() < _dashboard_redis_reintento_en:
+        return None
+    if _dashboard_redis_inicializado:
+        return _dashboard_redis
+    _dashboard_redis_inicializado = True
+    if not _DASHBOARD_REDIS_URL:
+        return None
+    try:
+        import redis
+        _dashboard_redis = redis.from_url(
+            _DASHBOARD_REDIS_URL,
+            decode_responses=True,
+            socket_connect_timeout=0.3,
+            socket_timeout=0.3,
+        )
+    except Exception as exc:
+        logging.warning('[ventas-cache] Redis unavailable during initialization: %s', type(exc).__name__)
+        _dashboard_redis = None
+    return _dashboard_redis
+
+
+def _dashboard_redis_no_disponible(etiqueta: str, exc: Exception) -> None:
+    """Evita que Redis caído agregue timeout y warnings en cada request."""
+    global _dashboard_redis_reintento_en
+    _dashboard_redis_reintento_en = time.time() + 30
+    logging.warning('[ventas-cache] Redis unavailable during %s: %s', etiqueta, type(exc).__name__)
+
+
+def _dashboard_redis_key(tipo: str, contenido: dict) -> str:
+    """Genera una clave corta y determinista sin exponer el payload."""
+    serializado = json.dumps(contenido, sort_keys=True, ensure_ascii=False, separators=(',', ':'), default=str)
+    digest = hashlib.sha256(serializado.encode('utf-8')).hexdigest()
+    return f'ventas:dashboard:{tipo}:v{_DASHBOARD_CLASIFICACION_COMERCIAL_VERSION}:{digest}'
+
+
+def _dashboard_redis_get(clave: str, etiqueta: str):
+    cliente = _dashboard_redis_cliente()
+    if not cliente:
+        return None
+    try:
+        crudo = cliente.get(clave)
+        if not crudo:
+            logging.info('[ventas-cache] MISS %s', etiqueta)
+            return None
+        logging.info('[ventas-cache] HIT %s', etiqueta)
+        return json.loads(crudo)
+    except Exception as exc:
+        _dashboard_redis_no_disponible(f'GET {etiqueta}', exc)
+        return None
+
+
+def _dashboard_redis_set(clave: str, valor, ttl: int, etiqueta: str) -> None:
+    cliente = _dashboard_redis_cliente()
+    if not cliente:
+        return
+    try:
+        cliente.setex(clave, ttl, json.dumps(valor, ensure_ascii=False, separators=(',', ':'), default=str))
+    except Exception as exc:
+        _dashboard_redis_no_disponible(f'SET {etiqueta}', exc)
 
 
 def _dashboard_lotes(items: list, tamanio: int = 500):
@@ -469,12 +548,6 @@ def _dashboard_dimensiones_producto(
         if _dashboard_clave_texto(candidato) in _DASHBOARD_SUBCATEGORIAS_BICICLETA:
             subcategoria = candidato
             indice_modelo = 2
-    elif producto != 'BICICLETA' and len(niveles) > 1:
-        # En las familias no-bicicleta el segundo nivel del catálogo es una
-        # subdivisión comercial (p. ej. LLANTAS → DE MONTAÑA → TRAIL). No se
-        # usa como Modelo, porque esa dimensión sólo es confiable en bicicletas.
-        subcategoria = niveles[1]
-
     modelo = None
     submodelo = None
     if producto == 'BICICLETA' and len(niveles) > indice_modelo:
@@ -486,6 +559,13 @@ def _dashboard_dimensiones_producto(
 
     if producto == 'BICICLETA' and _dashboard_clave_texto(categoria) == 'JUNIOR' and not subcategoria:
         subcategoria = _dashboard_subcategoria_junior_por_modelo(modelo, nombre_template)
+
+    if producto != 'BICICLETA':
+        jerarquia_b2b = clasificar_jerarquia_b2b_no_bicicleta(niveles, nombre_template, producto)
+        categoria = jerarquia_b2b['categoria']
+        subcategoria = jerarquia_b2b['subcategoria']
+        modelo = jerarquia_b2b['modelo']
+        submodelo = jerarquia_b2b['submodelo']
 
     talla = None
     color = None
@@ -504,6 +584,48 @@ def _dashboard_dimensiones_producto(
         'subcategoria': subcategoria, 'modelo': modelo, 'submodelo': submodelo,
         'talla': talla, 'color': color,
     }
+
+
+def _dashboard_dimensiones_comerciales_producto(
+    product_id, ruta: list[str], atributos: list[dict], nombre_template=None, marcas_por_ruta=None,
+    nombre_producto=None,
+) -> tuple[dict, str | None]:
+    """Combina la jerarquía B2B y los respaldos comerciales sin tocar ventas."""
+    dimensiones = _dashboard_dimensiones_producto(ruta, atributos, nombre_template, marcas_por_ruta)
+    referencia_comercial = None
+    clasificacion_manual = obtener_clasificacion_comercial(product_id)
+
+    # Las bicicletas conservan exactamente su clasificación actual: no pasan
+    # por ninguna regla nueva de jerarquía B2B ni de modelo/submodelo dinámico.
+    if dimensiones.get('producto') == 'BICICLETA':
+        referencia_comercial = _dashboard_aplicar_clasificacion_comercial(product_id, dimensiones)
+        return dimensiones, referencia_comercial
+
+    # Una decisión comercial explícita de no promover una línea a Modelo no se
+    # contradice con una regla dinámica posterior. Esto preserva los mapeos
+    # históricos; la segunda pasada sólo cubre productos sin decisión manual.
+    if clasificacion_manual and clasificacion_manual.get('c') in {
+        'LINEA_CONFIRMADA', 'POR_VALIDAR', 'NO_ESPECIFICADO', 'RECHAZADO',
+    }:
+        referencia_comercial = _dashboard_aplicar_clasificacion_comercial(product_id, dimensiones)
+    else:
+        # La regla por familia/ruta tiene prioridad para productos nuevos. El
+        # mapeo comercial validado sigue siendo respaldo cuando no hay evidencia
+        # dinámica suficiente; nunca se elimina ni se usa para inferir submodelo.
+        if not dimensiones.get('modelo'):
+            referencia_comercial = _dashboard_aplicar_clasificacion_comercial(product_id, dimensiones)
+
+        submodelo_aprobado = obtener_submodelo_aprobado(product_id)
+        if submodelo_aprobado and dimensiones.get('modelo'):
+            dimensiones['submodelo'] = submodelo_aprobado
+        elif dimensiones.get('modelo'):
+            dimensiones['submodelo'] = obtener_submodelo_dinamico_no_bicicleta(
+                dimensiones.get('producto'), dimensiones.get('categoria'), dimensiones.get('modelo'), nombre_template,
+            )
+
+    if not dimensiones.get('modelo'):
+        dimensiones['modelo'] = obtener_modelo_fallback_nombre_producto(nombre_producto)
+    return dimensiones, referencia_comercial
 
 
 def _dashboard_aplicar_clasificacion_comercial(product_id, dimensiones: dict) -> str | None:
@@ -598,6 +720,18 @@ def _dashboard_universo_enriquecido(consulta: dict) -> list[dict]:
         consulta['fecha_inicio'], consulta['fecha_fin'], consulta['vista'], ODOO_COMPANY_ID,
         _DASHBOARD_CLASIFICACION_COMERCIAL_VERSION,
     )
+    clave_redis = _dashboard_redis_key('universo', {
+        'fecha_inicio': consulta['fecha_inicio'],
+        'fecha_fin': consulta['fecha_fin'],
+        'vista': consulta['vista'],
+        'company_id': ODOO_COMPANY_ID,
+    })
+    universo_redis = _dashboard_redis_get(clave_redis, 'universo')
+    if isinstance(universo_redis, list):
+        with _dashboard_universo_lock:
+            _dashboard_universo_cache[clave_cache] = (time.time(), universo_redis)
+        return universo_redis
+
     ahora = time.time()
     with _dashboard_universo_lock:
         vigente = _dashboard_universo_cache.get(clave_cache)
@@ -605,6 +739,7 @@ def _dashboard_universo_enriquecido(consulta: dict) -> list[dict]:
             # Las entradas previas a la tendencia no incluían fecha; se
             # reconstruyen una vez para que la serie mensual sea consistente.
             if all('fecha' in fila for fila in vigente[1]):
+                _dashboard_redis_set(clave_redis, vigente[1], _DASHBOARD_REDIS_TTL_CONSULTA, 'universo')
                 return vigente[1]
             _dashboard_universo_cache.pop(clave_cache, None)
 
@@ -631,22 +766,25 @@ def _dashboard_universo_enriquecido(consulta: dict) -> list[dict]:
         move_ids = sorted({linea['move_id'][0] for linea in lineas if linea.get('move_id')})
 
         productos = []
-        for ids in _dashboard_lotes(product_ids):
+        for ids in _dashboard_lotes(product_ids, 1000):
             productos.extend(models.execute_kw(
                 ODOO_DB, uid, ODOO_PASSWORD, 'product.product', 'read', [ids],
-                {'fields': ['id', 'categ_id', 'product_tmpl_id', 'product_template_attribute_value_ids']}
+                {'fields': [
+                    'id', 'display_name', 'categ_id', 'product_tmpl_id',
+                    'product_template_attribute_value_ids', 'virtual_available',
+                ]}
             ))
         productos_por_id = {producto['id']: producto for producto in productos}
         template_ids = sorted({p['product_tmpl_id'][0] for p in productos if p.get('product_tmpl_id')})
         templates = []
-        for ids in _dashboard_lotes(template_ids):
+        for ids in _dashboard_lotes(template_ids, 1000):
             templates.extend(models.execute_kw(
                 ODOO_DB, uid, ODOO_PASSWORD, 'product.template', 'read', [ids], {'fields': ['id', 'name']}
             ))
         templates_por_id = {template['id']: template for template in templates}
         categ_ids = sorted({p['categ_id'][0] for p in productos if p.get('categ_id')})
         categorias = []
-        for ids in _dashboard_lotes(categ_ids):
+        for ids in _dashboard_lotes(categ_ids, 1000):
             categorias.extend(models.execute_kw(
                 ODOO_DB, uid, ODOO_PASSWORD, 'product.category', 'read', [ids],
                 {'fields': ['id', 'complete_name']}
@@ -661,7 +799,7 @@ def _dashboard_universo_enriquecido(consulta: dict) -> list[dict]:
             for atributo_id in (producto.get('product_template_attribute_value_ids') or [])
         })
         atributos = []
-        for ids in _dashboard_lotes(attr_ids):
+        for ids in _dashboard_lotes(attr_ids, 1000):
             atributos.extend(models.execute_kw(
                 ODOO_DB, uid, ODOO_PASSWORD, 'product.template.attribute.value', 'read', [ids],
                 {'fields': ['id', 'attribute_id', 'name']}
@@ -675,7 +813,7 @@ def _dashboard_universo_enriquecido(consulta: dict) -> list[dict]:
         }
 
         moves = []
-        for ids in _dashboard_lotes(move_ids):
+        for ids in _dashboard_lotes(move_ids, 1000):
             moves.extend(models.execute_kw(
                 ODOO_DB, uid, ODOO_PASSWORD, 'account.move', 'read', [ids],
                 {'fields': ['id', 'partner_id', 'commercial_partner_id', 'invoice_date']}
@@ -687,7 +825,7 @@ def _dashboard_universo_enriquecido(consulta: dict) -> list[dict]:
         move_fechas = {move['id']: move.get('invoice_date') for move in moves}
         partner_ids = sorted({partner_id for partner_id in move_partner.values() if partner_id})
         partners = []
-        for ids in _dashboard_lotes(partner_ids):
+        for ids in _dashboard_lotes(partner_ids, 1000):
             partners.extend(models.execute_kw(
                 ODOO_DB, uid, ODOO_PASSWORD, 'res.partner', 'read', [ids],
                 {'fields': ['id', 'name', 'ref', 'parent_id', 'state_id']}
@@ -697,7 +835,7 @@ def _dashboard_universo_enriquecido(consulta: dict) -> list[dict]:
             (partner.get('parent_id') or [None])[0] for partner in partners
             if partner.get('parent_id') and (partner.get('parent_id') or [None])[0] not in partners_por_id
         })
-        for ids in _dashboard_lotes(parent_ids):
+        for ids in _dashboard_lotes(parent_ids, 1000):
             for partner in models.execute_kw(
                 ODOO_DB, uid, ODOO_PASSWORD, 'res.partner', 'read', [ids],
                 {'fields': ['id', 'name', 'ref', 'parent_id', 'state_id']}
@@ -712,53 +850,89 @@ def _dashboard_universo_enriquecido(consulta: dict) -> list[dict]:
                 claves.add(ref)
         integrales_por_clave = _dashboard_integrales_por_clave(claves)
 
-        universo = []
-        for linea in lineas:
-            producto = productos_por_id.get((linea.get('product_id') or [None])[0])
-            if not producto:
-                continue
+        # La clasificación comercial y los datos del cliente sólo cambian por
+        # producto y partner, respectivamente. Las líneas de factura pueden
+        # repetir ambos miles de veces; prepararlos una sola vez evita volver a
+        # ejecutar clasificación, normalización de atributos y búsquedas de
+        # padres para cada línea del universo.
+        dimensiones_producto_por_id = {}
+        for producto_id, producto in productos_por_id.items():
             atributos_producto = [
                 atributos_por_id[atributo_id]
                 for atributo_id in (producto.get('product_template_attribute_value_ids') or [])
                 if atributo_id in atributos_por_id
             ]
-            dimensiones_producto = _dashboard_dimensiones_producto(
-                rutas_categoria.get((producto.get('categ_id') or [None])[0], []), atributos_producto,
+            dimensiones_producto, referencia_comercial = _dashboard_dimensiones_comerciales_producto(
+                producto_id,
+                rutas_categoria.get((producto.get('categ_id') or [None])[0], []),
+                atributos_producto,
                 templates_por_id.get((producto.get('product_tmpl_id') or [None])[0], {}).get('name'),
                 marcas_por_ruta,
+                producto.get('display_name'),
             )
-            referencia_comercial = _dashboard_aplicar_clasificacion_comercial(
-                producto.get('id'), dimensiones_producto,
+            dimensiones_producto_por_id[producto_id] = (
+                {
+                    nombre: _dashboard_dimension(valor, f'Sin {_DASHBOARD_LABELS[nombre].lower()}')
+                    for nombre, valor in dimensiones_producto.items()
+                },
+                referencia_comercial,
             )
-            dimensiones = {
-                nombre: _dashboard_dimension(valor, f'Sin {_DASHBOARD_LABELS[nombre].lower()}')
-                for nombre, valor in dimensiones_producto.items()
-            }
-            partner = partners_por_id.get(move_partner.get((linea.get('move_id') or [None])[0]), {})
-            parent = partners_por_id.get((partner.get('parent_id') or [None])[0], {}) if partner.get('parent_id') else {}
+
+        dimensiones_cliente_por_id = {}
+        for partner_id, partner in partners_por_id.items():
+            parent = (
+                partners_por_id.get((partner.get('parent_id') or [None])[0], {})
+                if partner.get('parent_id') else {}
+            )
             clave_cliente = (partner.get('ref') or parent.get('ref') or '').strip().upper()
-            dimensiones['cliente'] = {
-                'id': clave_cliente or (f"odoo:{partner['id']}" if partner.get('id') else None),
-                'label': (partner.get('name') or parent.get('name') or '').strip() or 'Sin cliente',
-                'extra': {'clave': clave_cliente} if clave_cliente else {},
-            }
             estado = partner.get('state_id')
-            dimensiones['estado'] = _dashboard_dimension(
-                estado[1] if isinstance(estado, (list, tuple)) and len(estado) > 1 else None, 'Sin estado'
-            )
             integral = integrales_por_clave.get(clave_cliente)
-            dimensiones['integral'] = {
-                'id': str(integral['id']) if integral else None,
-                'label': integral['label'] if integral else 'Sin integral',
+            dimensiones_cliente_por_id[partner_id] = {
+                'cliente': {
+                    'id': clave_cliente or (f"odoo:{partner['id']}" if partner.get('id') else None),
+                    'label': (partner.get('name') or parent.get('name') or '').strip() or 'Sin cliente',
+                    'extra': {'clave': clave_cliente} if clave_cliente else {},
+                },
+                'estado': _dashboard_dimension(
+                    estado[1] if isinstance(estado, (list, tuple)) and len(estado) > 1 else None,
+                    'Sin estado',
+                ),
+                'integral': {
+                    'id': str(integral['id']) if integral else None,
+                    'label': integral['label'] if integral else 'Sin integral',
+                },
             }
+
+        universo = []
+        for linea in lineas:
+            producto_id = (linea.get('product_id') or [None])[0]
+            contexto_producto = dimensiones_producto_por_id.get(producto_id)
+            if not contexto_producto:
+                continue
+            dimensiones_producto, referencia_comercial = contexto_producto
+            partner_id = move_partner.get((linea.get('move_id') or [None])[0])
+            dimensiones_cliente = dimensiones_cliente_por_id.get(partner_id)
+            if dimensiones_cliente is None:
+                dimensiones_cliente = {
+                    'cliente': {'id': None, 'label': 'Sin cliente', 'extra': {}},
+                    'estado': _dashboard_dimension(None, 'Sin estado'),
+                    'integral': {'id': None, 'label': 'Sin integral'},
+                }
+            dimensiones = {**dimensiones_producto, **dimensiones_cliente}
             universo.append({
+                'product_id': producto_id,
+                'producto_nombre': productos_por_id[producto_id].get('display_name') or '',
                 'dimensiones': dimensiones,
                 'pzas': float(linea.get('quantity') or 0),
                 'venta': float(linea.get('price_total') or 0),
+                # virtual_available es la Cantidad pronosticada de Odoo. Se
+                # lee una vez por product_id y se deduplica al agrupar.
+                'existencia': float(productos_por_id[producto_id].get('virtual_available') or 0),
                 'fecha': move_fechas.get((linea.get('move_id') or [None])[0]),
                 'referencia_comercial': referencia_comercial,
             })
         _dashboard_universo_cache[clave_cache] = (time.time(), universo)
+        _dashboard_redis_set(clave_redis, universo, _DASHBOARD_REDIS_TTL_CONSULTA, 'universo')
         return universo
 
 
@@ -885,6 +1059,17 @@ def dashboard_consulta():
     if error:
         return error
 
+    ocultar_montos = _debe_ocultar_montos_ventas()
+    clave_redis = _dashboard_redis_key('consulta', {
+        'consulta': consulta,
+        # La respuesta final se separa por esta política para no compartir
+        # importes con usuarios que no tienen ver_montos.
+        'ocultar_montos': ocultar_montos,
+    })
+    respuesta_redis = _dashboard_redis_get(clave_redis, 'consulta')
+    if isinstance(respuesta_redis, dict):
+        return jsonify(respuesta_redis), 200
+
     try:
         universo = _dashboard_universo_enriquecido(consulta)
         filtradas = _dashboard_filtrar_universo(universo, consulta['filtros'])
@@ -894,15 +1079,23 @@ def dashboard_consulta():
         for desglose in consulta['desgloses']:
             if desglose not in columnas_dimensiones:
                 columnas_dimensiones.append(desglose)
+        # La cantidad pronosticada es global por producto, no por cliente ni
+        # integral. En esos desgloses se omite para no repetir el mismo stock
+        # en varias filas y sugerir una suma que no existe.
+        existencia_aplicable = not any(
+            dimension in columnas_dimensiones for dimension in ('cliente', 'integral')
+        )
         agrupado = {}
         for fila in filtradas:
             llave = tuple(fila['dimensiones'][clave].get('id') for clave in columnas_dimensiones)
             acumulado = agrupado.setdefault(llave, {
                 'dimensiones': {clave: fila['dimensiones'][clave] for clave in columnas_dimensiones},
                 'pzas': 0.0, 'venta': 0.0, 'referencias_comerciales': set(),
+                'productos_existencia': {},
             })
             acumulado['pzas'] += fila['pzas']
             acumulado['venta'] += fila['venta']
+            acumulado['productos_existencia'][fila['product_id']] = fila['existencia']
             if fila.get('referencia_comercial'):
                 acumulado['referencias_comerciales'].add(fila['referencia_comercial'])
         total_pzas = sum(fila['pzas'] for fila in agrupado.values())
@@ -910,15 +1103,21 @@ def dashboard_consulta():
         filas = [{
             'dimensiones': fila['dimensiones'], 'pzas': round(fila['pzas'], 2),
             'venta': round(fila['venta'], 2),
+            'existencia': round(sum(fila['productos_existencia'].values()), 2)
+            if existencia_aplicable else None,
             'participacion': round((fila['venta'] / total_venta * 100) if total_venta else 0, 2),
             'referencia_comercial': _dashboard_referencia_comercial_agregada(fila['referencias_comerciales']),
         } for fila in agrupado.values()]
-        filas.sort(key=lambda fila: fila[consulta['orden']['campo']], reverse=consulta['orden']['direccion'] == 'desc')
-        ocultar_montos = _debe_ocultar_montos_ventas()
+        filas.sort(
+            key=lambda fila: fila[consulta['orden']['campo']]
+            if fila[consulta['orden']['campo']] is not None else float('-inf'),
+            reverse=consulta['orden']['direccion'] == 'desc',
+        )
         columnas = [{'key': clave, 'label': _DASHBOARD_LABELS[clave], 'tipo': 'dimension'} for clave in columnas_dimensiones]
         if any(fila['referencia_comercial'] for fila in filas):
             columnas.append({'key': 'referencia_comercial', 'label': 'Referencia comercial', 'tipo': 'informativa'})
         columnas.append({'key': 'pzas', 'label': 'Pzas', 'tipo': 'metrica'})
+        columnas.append({'key': 'existencia', 'label': 'Existencia', 'tipo': 'metrica'})
         if not ocultar_montos:
             columnas.append({'key': 'venta', 'label': 'Venta', 'tipo': 'metrica'})
         columnas.append({'key': 'participacion', 'label': 'Participación', 'tipo': 'metrica'})
@@ -933,6 +1132,7 @@ def dashboard_consulta():
             respuesta['totales'].pop('venta', None)
             for fila in respuesta['filas']:
                 fila.pop('venta', None)
+        _dashboard_redis_set(clave_redis, respuesta, _DASHBOARD_REDIS_TTL_CONSULTA, 'consulta')
         return jsonify(respuesta), 200
 
         uid, models, err = get_odoo_models()
@@ -1069,11 +1269,11 @@ def dashboard_consulta():
             categ_id = (producto.get('categ_id') or [None])[0]
             dimensiones = {
                 clave: _dashboard_dimension(valor, f'Sin {_DASHBOARD_LABELS[clave].lower()}')
-                for clave, valor in _dashboard_dimensiones_producto(
-                    rutas_categoria.get(categ_id, []), atributos_producto,
+                for clave, valor in _dashboard_dimensiones_comerciales_producto(
+                    producto.get('id'), rutas_categoria.get(categ_id, []), atributos_producto,
                     templates_por_id.get((producto.get('product_tmpl_id') or [None])[0], {}).get('name'),
                     marcas_por_ruta,
-                ).items()
+                )[0].items()
             }
 
             move_id = (linea.get('move_id') or [None])[0]
@@ -1214,6 +1414,136 @@ def dashboard_tendencia():
         return jsonify({'error': 'No se pudo cargar la tendencia de ventas'}), 500
 
 
+@ventas_bp.route('/dashboard/sin-venta', methods=['POST'])
+@requiere_autenticacion
+@requiere_permiso_interno('ventas_monitor', 'ver')
+def dashboard_sin_venta():
+    """Productos del universo filtrado con más de 60 días sin facturación.
+
+    La consulta principal sigue ligera: este cálculo histórico sólo se ejecuta
+    al abrir la visualización y reutiliza su universo enriquecido en caché.
+    ``invoice_date`` es un related almacenado en account.move.line, por lo que
+    read_group resuelve la última factura por producto en lotes, sin N+1.
+    """
+    consulta, error = _validar_consulta_dashboard(request.get_json(silent=True))
+    if error:
+        return error
+
+    clave_cache = (
+        consulta['fecha_inicio'], consulta['fecha_fin'], consulta['vista'], ODOO_COMPANY_ID,
+        json.dumps(consulta['filtros'], sort_keys=True, ensure_ascii=False),
+        _DASHBOARD_CLASIFICACION_COMERCIAL_VERSION,
+    )
+    clave_redis = _dashboard_redis_key('sin-venta', {
+        'fecha_inicio': consulta['fecha_inicio'],
+        'fecha_fin': consulta['fecha_fin'],
+        'vista': consulta['vista'],
+        'filtros': consulta['filtros'],
+        'company_id': ODOO_COMPANY_ID,
+    })
+    respuesta_redis = _dashboard_redis_get(clave_redis, 'sin-venta')
+    if isinstance(respuesta_redis, dict):
+        with _dashboard_sin_venta_lock:
+            _dashboard_sin_venta_cache[clave_cache] = (time.time(), respuesta_redis)
+        return jsonify(respuesta_redis), 200
+
+    ahora = time.time()
+    with _dashboard_sin_venta_lock:
+        vigente = _dashboard_sin_venta_cache.get(clave_cache)
+        if vigente and ahora - vigente[0] < _DASHBOARD_UNIVERSO_TTL:
+            _dashboard_redis_set(clave_redis, vigente[1], _DASHBOARD_REDIS_TTL_SIN_VENTA, 'sin-venta')
+            return jsonify(vigente[1]), 200
+
+    try:
+        universo = _dashboard_universo_enriquecido(consulta)
+        productos = {}
+        for fila in _dashboard_filtrar_universo(universo, consulta['filtros']):
+            product_id = fila.get('product_id')
+            if not product_id:
+                continue
+            productos.setdefault(product_id, {
+                'product_id': product_id,
+                'etiqueta': fila.get('producto_nombre') or f'Producto {product_id}',
+                'existencia': float(fila.get('existencia') or 0),
+            })
+
+        if not productos:
+            respuesta = {
+                'fecha_corte': consulta['fecha_fin'], 'productos': [], 'top': [],
+                'total': 0, 'nunca_vendidos': 0,
+            }
+            with _dashboard_sin_venta_lock:
+                _dashboard_sin_venta_cache[clave_cache] = (time.time(), respuesta)
+            _dashboard_redis_set(clave_redis, respuesta, _DASHBOARD_REDIS_TTL_SIN_VENTA, 'sin-venta')
+            return jsonify(respuesta), 200
+
+        uid, models, err = get_odoo_models()
+        if not uid:
+            raise RuntimeError(err or 'No se pudo conectar a Odoo')
+
+        fechas_ultima_venta = {}
+        # La actividad histórica siempre se define por factura publicada, aun
+        # cuando el universo actual provenga de la vista Cobranza.
+        for ids in _dashboard_lotes(sorted(productos), 500):
+            domain = [
+                ['move_id.move_type', '=', 'out_invoice'],
+                ['move_id.state', '=', 'posted'],
+                ['invoice_date', '<=', consulta['fecha_fin']],
+                ['move_id.company_id', '=', ODOO_COMPANY_ID],
+                ['display_type', '=', 'product'],
+                ['product_id', 'in', ids],
+            ]
+            grupos = models.execute_kw(
+                ODOO_DB, uid, ODOO_PASSWORD, 'account.move.line', 'read_group',
+                [domain, ['product_id', 'invoice_date:max'], ['product_id']], {'lazy': False},
+            )
+            for grupo in grupos:
+                product_id = (grupo.get('product_id') or [None])[0]
+                fecha = grupo.get('invoice_date')
+                if product_id and fecha:
+                    fechas_ultima_venta[product_id] = str(fecha)
+
+        fecha_corte = _date.fromisoformat(consulta['fecha_fin'])
+        resultados = []
+        for producto in productos.values():
+            fecha_ultima_venta = fechas_ultima_venta.get(producto['product_id'])
+            dias_sin_venta = None
+            if fecha_ultima_venta:
+                dias_sin_venta = (fecha_corte - _date.fromisoformat(fecha_ultima_venta)).days
+                if dias_sin_venta <= 60:
+                    continue
+            resultados.append({
+                **producto,
+                'ultima_venta': fecha_ultima_venta,
+                'dias_sin_venta': dias_sin_venta,
+                'con_existencia': producto['existencia'] > 0,
+            })
+
+        # Primero inventario disponible; dentro de cada bloque, mayor tiempo
+        # sin vender. Los nunca vendidos quedan sólo en la tabla completa.
+        resultados.sort(key=lambda fila: (
+            not fila['con_existencia'],
+            fila['dias_sin_venta'] is None,
+            -(fila['dias_sin_venta'] or 0),
+            str(fila['etiqueta']).casefold(),
+        ))
+        top = [fila for fila in resultados if fila['dias_sin_venta'] is not None][:10]
+        respuesta = {
+            'fecha_corte': consulta['fecha_fin'],
+            'productos': resultados,
+            'top': top,
+            'total': len(resultados),
+            'nunca_vendidos': sum(fila['dias_sin_venta'] is None for fila in resultados),
+        }
+        with _dashboard_sin_venta_lock:
+            _dashboard_sin_venta_cache[clave_cache] = (time.time(), respuesta)
+        _dashboard_redis_set(clave_redis, respuesta, _DASHBOARD_REDIS_TTL_SIN_VENTA, 'sin-venta')
+        return jsonify(respuesta), 200
+    except Exception:
+        logging.exception('ventas.dashboard_sin_venta error')
+        return jsonify({'error': 'No se pudo cargar el análisis sin venta'}), 500
+
+
 @ventas_bp.route('/dashboard/filtros', methods=['POST'])
 @requiere_autenticacion
 @requiere_permiso_interno('ventas_monitor', 'ver')
@@ -1253,16 +1583,29 @@ def dashboard_filtros():
         for clave in _DASHBOARD_CONTEXTO_FILTROS[dimension]
         if consulta['filtros'][clave]
     }
+    clave_redis = _dashboard_redis_key('filtros', {
+        'consulta': consulta,
+        'dimension': dimension,
+        'buscar': buscar,
+        'limite': limite,
+        'filtros_contexto': filtros_contexto,
+    })
+    respuesta_redis = _dashboard_redis_get(clave_redis, 'filtros')
+    if isinstance(respuesta_redis, dict):
+        return jsonify(respuesta_redis), 200
 
     try:
         universo = _dashboard_universo_enriquecido(consulta)
         opciones_por_llave = {}
+        identificadores_validos = set()
         for fila in _dashboard_filtrar_universo(universo, filtros_contexto):
             opcion = fila['dimensiones'].get(dimension)
             if not opcion or opcion.get('id') is None or not str(opcion.get('label') or '').strip():
                 continue
             etiqueta = str(opcion['label']).strip()
             identificador = str(opcion['id']).strip()
+            if dimension == 'producto':
+                identificadores_validos.add(identificador)
             if buscar_normalizado and buscar_normalizado not in etiqueta.casefold() and buscar_normalizado not in identificador.casefold():
                 continue
             llave = (identificador, etiqueta.casefold())
@@ -1271,10 +1614,16 @@ def dashboard_filtros():
                 **({'extra': opcion['extra']} if opcion.get('extra') else {}),
             })
         opciones = sorted(opciones_por_llave.values(), key=lambda opcion: (opcion['label'].casefold(), opcion['id'].casefold()))
-        return jsonify({
+        respuesta = {
             'dimension': dimension, 'buscar': buscar, 'opciones': opciones[:limite],
             'total': len(opciones), 'limit': limite,
-        }), 200
+            # Permite al cliente retirar sólo selecciones de Producto que ya
+            # no existen al cambiar Marca, aun si no caben en el límite o no
+            # coinciden con el texto de búsqueda actual.
+            **({'selecciones_validas': sorted(identificadores_validos)} if dimension == 'producto' else {}),
+        }
+        _dashboard_redis_set(clave_redis, respuesta, _DASHBOARD_REDIS_TTL_FILTROS, 'filtros')
+        return jsonify(respuesta), 200
 
         uid, models, err = get_odoo_models()
         if not uid:
@@ -1423,11 +1772,11 @@ def dashboard_filtros():
                 categ_id = (producto.get('categ_id') or [None])[0]
                 dimensiones.update({
                     clave: _dashboard_dimension(valor, f'Sin {_DASHBOARD_LABELS[clave].lower()}')
-                    for clave, valor in _dashboard_dimensiones_producto(
-                        rutas_categoria.get(categ_id, []), atributos_producto,
+                    for clave, valor in _dashboard_dimensiones_comerciales_producto(
+                        producto.get('id'), rutas_categoria.get(categ_id, []), atributos_producto,
                         templates_por_id.get((producto.get('product_tmpl_id') or [None])[0], {}).get('name'),
                         marcas_por_ruta,
-                    ).items()
+                    )[0].items()
                 })
 
             if requiere_partner:
