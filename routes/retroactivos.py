@@ -18,6 +18,7 @@ from utils.auth_decorators import (
     requiere_autenticacion,
     requiere_modulo,
     requiere_modulos,
+    requiere_permiso_interno,
     requiere_rol,
 )
 from services.politica_montos_service import PoliticaMontosService
@@ -3152,7 +3153,8 @@ def obtener_claves_retroactivos():
 # ==============================================================================
 @retroactivos_bp.route('/retroactivos', methods=['GET'])
 @requiere_autenticacion
-@requiere_rol(1)
+@requiere_rol(1, 4)
+@requiere_permiso_interno('dashboard_retroactivos', 'ver')
 def obtener_retroactivos():
 
     conexion = obtener_conexion()
@@ -3442,6 +3444,9 @@ def retroactivos_historico():
 # 4. ENDPOINT POST MANUAL
 # ==============================================================================
 @retroactivos_bp.route('/sincronizar_notas', methods=['POST'])
+@requiere_autenticacion
+@requiere_rol(1, 4)
+@requiere_permiso_interno('dashboard_retroactivos', 'editar')
 def sincronizar_notas_odoo():
     try:
         ejecutar_sincronizacion_y_calculos()

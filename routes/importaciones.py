@@ -7,7 +7,7 @@ from flask import Blueprint, jsonify, request, make_response
 from datetime import datetime, date, timedelta, timezone
 from decimal import Decimal
 from db_conexion import obtener_conexion
-from utils.auth_decorators import requiere_autenticacion, requiere_permiso_interno
+from utils.auth_decorators import requiere_autenticacion, requiere_permiso_interno, requiere_rol
 
 importaciones_bp = Blueprint("importaciones", __name__, url_prefix="/importaciones")
 
@@ -986,6 +986,9 @@ def _validar_payload_tiempo(data: dict) -> str | None:
 
 
 @importaciones_bp.route("/tiempos-estimados", methods=["GET"])
+@requiere_autenticacion
+@requiere_rol(1, 4)
+@requiere_permiso_interno('importaciones', 'ver')
 def listar_tiempos_estimados():
     conn = obtener_conexion()
     if not conn:
@@ -1004,6 +1007,9 @@ def listar_tiempos_estimados():
 
 
 @importaciones_bp.route("/tiempos-estimados", methods=["POST"])
+@requiere_autenticacion
+@requiere_rol(1, 4)
+@requiere_permiso_interno('importaciones', 'crear')
 def crear_tiempo_estimado():
     data = request.get_json() or {}
     error = _validar_payload_tiempo(data)
@@ -1037,6 +1043,9 @@ def crear_tiempo_estimado():
 
 
 @importaciones_bp.route("/tiempos-estimados/<int:id_regla>", methods=["PUT"])
+@requiere_autenticacion
+@requiere_rol(1, 4)
+@requiere_permiso_interno('importaciones', 'editar')
 def actualizar_tiempo_estimado(id_regla):
     data = request.get_json() or {}
     error = _validar_payload_tiempo(data)
@@ -1074,6 +1083,9 @@ def actualizar_tiempo_estimado(id_regla):
 
 
 @importaciones_bp.route("/tiempos-estimados/<int:id_regla>", methods=["DELETE"])
+@requiere_autenticacion
+@requiere_rol(1, 4)
+@requiere_permiso_interno('importaciones', 'eliminar')
 def eliminar_tiempo_estimado(id_regla):
     conn = obtener_conexion()
     if not conn:

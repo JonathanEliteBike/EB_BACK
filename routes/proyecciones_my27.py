@@ -20,6 +20,7 @@ from routes.forecast import (SKU_CATALOG, FORECAST_SKU_WHITELIST,
 from utils.odoo_utils import get_odoo_models, ODOO_DB, ODOO_PASSWORD, ODOO_COMPANY_ID
 from utils.auth_decorators import requiere_autenticacion, requiere_permiso_interno
 from services.politica_montos_service import PoliticaMontosService
+from services.contexto_permisos_internos import redactar_montos
 
 try:
     import openpyxl
@@ -82,6 +83,11 @@ def _debe_ocultar_montos_my27() -> bool:
     return bool(usuario_id and PoliticaMontosService.debe_ocultar_montos(
         usuario_id, 'proyecciones_my27'
     ))
+
+
+def _respuesta_my27(data: dict) -> dict:
+    """Redacta montos por respuesta sin alterar el universo cacheado."""
+    return redactar_montos(data, 'proyecciones_my27') if _debe_ocultar_montos_my27() else data
 
 
 def _get_stock_disponible_odoo() -> dict:
@@ -587,11 +593,11 @@ def listar():
         else:
             cached = _redis_get(_rkey_my27(periodo))
             if cached is not None:
-                return jsonify(cached), 200
+                return jsonify(_respuesta_my27(cached)), 200
 
         data = _get_datos_consolidados(periodo)
         _redis_set(_rkey_my27(periodo), data, _MY27_R_TTL)
-        return jsonify(data), 200
+        return jsonify(_respuesta_my27(data)), 200
     except Exception as e:
         logging.exception('[proyecciones_my27] listar error: %s', e)
         return jsonify({'error': str(e)}), 500
@@ -825,10 +831,10 @@ def _generar_excel(data: dict, ocultar_montos: bool = False) -> bytes:
         costo_u = art.get('costo_unitario', 0)
         c_cu = ws.cell(
             row=ri, column=20,
-            value='-' if ocultar_montos else (costo_u if costo_u > 0 else ''),
+            value='-' if ocultar_montos else costo_u,
         )
         cell_style(c_cu, bg=bg_fila, center=True, size=9)
-        if not ocultar_montos and costo_u > 0:
+        if not ocultar_montos:
             c_cu.number_format = '"$"#,##0.00'
         c_cu.border = thin_bdr
 
@@ -836,9 +842,9 @@ def _generar_excel(data: dict, ocultar_montos: bool = False) -> bytes:
         costo_t = art.get('costo_total', 0)
         c_ct = ws.cell(
             row=ri, column=21,
-            value='-' if ocultar_montos else (costo_t if costo_t > 0 else ''),
+            value='-' if ocultar_montos else costo_t,
         )
-        if not ocultar_montos and costo_t > 0:
+        if not ocultar_montos:
             cell_style(c_ct, bold=True, bg='FFFEF3E2', center=True, size=9)
             c_ct.number_format = '"$"#,##0.00'
         else:
