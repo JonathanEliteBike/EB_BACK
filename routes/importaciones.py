@@ -1008,7 +1008,7 @@ def listar_tiempos_estimados():
 
 @importaciones_bp.route("/tiempos-estimados", methods=["POST"])
 @requiere_autenticacion
-@requiere_rol(1, 4)
+@requiere_rol(1, 4, 99)
 @requiere_permiso_interno('importaciones', 'crear')
 def crear_tiempo_estimado():
     data = request.get_json() or {}
