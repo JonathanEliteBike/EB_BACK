@@ -987,7 +987,7 @@ def _validar_payload_tiempo(data: dict) -> str | None:
 
 @importaciones_bp.route("/tiempos-estimados", methods=["GET"])
 @requiere_autenticacion
-@requiere_rol(1, 4)
+@requiere_rol(1, 4, 99)
 @requiere_permiso_interno('importaciones', 'ver')
 def listar_tiempos_estimados():
     conn = obtener_conexion()
@@ -1008,7 +1008,7 @@ def listar_tiempos_estimados():
 
 @importaciones_bp.route("/tiempos-estimados", methods=["POST"])
 @requiere_autenticacion
-@requiere_rol(1, 4)
+@requiere_rol(1, 4, 99)
 @requiere_permiso_interno('importaciones', 'crear')
 def crear_tiempo_estimado():
     data = request.get_json() or {}
@@ -1044,7 +1044,7 @@ def crear_tiempo_estimado():
 
 @importaciones_bp.route("/tiempos-estimados/<int:id_regla>", methods=["PUT"])
 @requiere_autenticacion
-@requiere_rol(1, 4)
+@requiere_rol(1, 4, 99)
 @requiere_permiso_interno('importaciones', 'editar')
 def actualizar_tiempo_estimado(id_regla):
     data = request.get_json() or {}
@@ -1084,7 +1084,7 @@ def actualizar_tiempo_estimado(id_regla):
 
 @importaciones_bp.route("/tiempos-estimados/<int:id_regla>", methods=["DELETE"])
 @requiere_autenticacion
-@requiere_rol(1, 4)
+@requiere_rol(1, 4, 99)
 @requiere_permiso_interno('importaciones', 'eliminar')
 def eliminar_tiempo_estimado(id_regla):
     conn = obtener_conexion()
