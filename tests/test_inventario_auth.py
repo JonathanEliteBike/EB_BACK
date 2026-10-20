@@ -89,8 +89,8 @@ class SeguridadInventarioTests(unittest.TestCase):
         self.assertEqual(respuesta.status_code, 200)
         self.assertEqual(respuesta.json["usuario"], "Administración")
         consulta = obtener_conexion.return_value.cursor_falso
-        self.assertIn("rol_id = 1 AND activo = 1", consulta.query)
-        self.assertEqual(consulta.params, (3,))
+        self.assertIn("u.rol_id = %s AND u.activo = 1", consulta.query)
+        self.assertEqual(consulta.params, (3, 1))
 
 
 if __name__ == "__main__":
