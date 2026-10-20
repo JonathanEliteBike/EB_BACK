@@ -6,6 +6,7 @@ from io import BytesIO, StringIO
 from flask import Blueprint, jsonify, request, send_file
 
 from db_conexion import obtener_conexion
+from utils.inventario_auth import validar_acceso_inventario
 
 
 historial_bp = Blueprint(
@@ -13,6 +14,9 @@ historial_bp = Blueprint(
     __name__,
     url_prefix="/api/inventario/historial"
 )
+
+# Aplica a todos los endpoints del blueprint (lectura y escritura).
+historial_bp.before_request(validar_acceso_inventario)
 
 
 # ============================================================

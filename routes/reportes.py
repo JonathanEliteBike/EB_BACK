@@ -7,6 +7,7 @@ from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
 
 from db_conexion import obtener_conexion
+from utils.inventario_auth import validar_acceso_inventario
 
 
 reportes_bp = Blueprint(
@@ -14,6 +15,9 @@ reportes_bp = Blueprint(
     __name__,
     url_prefix="/api/inventario/reportes",
 )
+
+# Aplica a todos los endpoints del blueprint (lectura y escritura).
+reportes_bp.before_request(validar_acceso_inventario)
 
 
 # ============================================================

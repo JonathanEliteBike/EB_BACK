@@ -20,6 +20,8 @@ from reportlab.platypus import (
 )
 
 from db_conexion import obtener_conexion
+from utils.inventario_actividad import registrar_evento, capturar_estado
+from utils.inventario_auth import validar_acceso_inventario
 
 
 responsivas_bp = Blueprint(
@@ -27,6 +29,9 @@ responsivas_bp = Blueprint(
     __name__,
     url_prefix="/api/inventario/responsivas",
 )
+
+# Aplica a todos los endpoints del blueprint (lectura y escritura).
+responsivas_bp.before_request(validar_acceso_inventario)
 
 
 # ============================================================
@@ -693,6 +698,7 @@ def crear_responsiva():
                 (asignacion["equipo_id"],),
             )
 
+        registrar_evento(cursor, 'crear', 'Responsiva', responsiva_id)
         conexion.commit()
 
         return jsonify(
@@ -783,6 +789,7 @@ def actualizar_responsiva(responsiva_id):
                 }
             ), 409
 
+        estado_anterior_bitacora = capturar_estado(cursor, 'Responsiva', responsiva_id)
         cursor.execute(
             """
             UPDATE inventario_responsivas
@@ -798,6 +805,7 @@ def actualizar_responsiva(responsiva_id):
             ),
         )
 
+        registrar_evento(cursor, 'editar', 'Responsiva', responsiva_id, anterior=estado_anterior_bitacora)
         conexion.commit()
 
         return jsonify(
@@ -901,6 +909,7 @@ def firmar_responsiva(responsiva_id):
                 }
             ), 409
 
+        estado_anterior_bitacora = capturar_estado(cursor, 'Responsiva', responsiva_id)
         cursor.execute(
             """
             UPDATE inventario_responsivas
@@ -933,6 +942,7 @@ def firmar_responsiva(responsiva_id):
                 (responsiva["equipo_id"],),
             )
 
+        registrar_evento(cursor, 'firmar', 'Responsiva', responsiva_id, anterior=estado_anterior_bitacora)
         conexion.commit()
 
         return jsonify(
@@ -1033,6 +1043,7 @@ def anular_responsiva(responsiva_id):
                 }
             ), 409
 
+        estado_anterior_bitacora = capturar_estado(cursor, 'Responsiva', responsiva_id)
         cursor.execute(
             """
             UPDATE inventario_responsivas
@@ -1061,6 +1072,7 @@ def anular_responsiva(responsiva_id):
                 (responsiva["equipo_id"],),
             )
 
+        registrar_evento(cursor, 'anular', 'Responsiva', responsiva_id, anterior=estado_anterior_bitacora)
         conexion.commit()
 
         return jsonify(

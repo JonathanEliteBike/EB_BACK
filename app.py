@@ -31,12 +31,14 @@ from routes.garantias import garantias_bp
 from routes.proyecciones_my27 import proyecciones_my27_bp
 from routes.importaciones import importaciones_bp
 from routes.inventario import inventario_bp
+from routes.inventario_acceso import inventario_acceso_bp
 from routes.colaboradores import colaboradores_bp
 from routes.asignaciones import asignaciones_bp
 from routes.responsivas import responsivas_bp
 from routes.historial import historial_bp
 from routes.auditorias import auditorias_bp
 from routes.reportes import reportes_bp
+from routes.control_cambios import control_cambios_bp
 # Importamos la instancia de Celery desde celery_worker
 from celery_worker import celery_app as celery
 
@@ -153,12 +155,14 @@ def create_app():
     app.register_blueprint(proyecciones_my27_bp)
     app.register_blueprint(importaciones_bp)
     app.register_blueprint(inventario_bp)
+    app.register_blueprint(inventario_acceso_bp)
     app.register_blueprint(colaboradores_bp)
     app.register_blueprint(asignaciones_bp)
     app.register_blueprint(responsivas_bp)
     app.register_blueprint(historial_bp)
     app.register_blueprint(auditorias_bp)
     app.register_blueprint(reportes_bp)
+    app.register_blueprint(control_cambios_bp)
     return app
 
 app = create_app()

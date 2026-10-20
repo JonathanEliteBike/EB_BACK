@@ -3,7 +3,7 @@ import jwt
 import datetime
 import bcrypt
 
-SECRET_KEY = "121221"  
+from utils.jwt_utils import SECRET_KEY  
 
 def hash_password(contrasena):
     hashed = bcrypt.hashpw(contrasena.encode('utf-8'), bcrypt.gensalt())

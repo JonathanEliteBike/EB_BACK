@@ -1,6 +1,9 @@
 from flask import Blueprint, jsonify, request
+from uuid import uuid4
 
 from db_conexion import obtener_conexion
+from utils.inventario_actividad import registrar_evento, capturar_estado
+from utils.inventario_auth import validar_acceso_inventario
 
 
 inventario_bp = Blueprint(
@@ -8,6 +11,9 @@ inventario_bp = Blueprint(
     __name__,
     url_prefix="/api/inventario"
 )
+
+# Aplica a todos los endpoints del blueprint (lectura y escritura).
+inventario_bp.before_request(validar_acceso_inventario)
 
 
 # ============================================================
@@ -478,9 +484,8 @@ def crear_equipo():
             "error": "No se recibieron datos"
         }), 400
 
-    numero_inventario = str(
-        data.get("inventario") or ""
-    ).strip()
+    # El folio se asigna exclusivamente en el servidor.
+    # Se ignora cualquier código enviado por el navegador.
 
     categoria = normalizar_texto_titulo(
         data.get("categoria")
@@ -526,16 +531,9 @@ def crear_equipo():
             "error": str(error)
         }), 400
 
-    if (
-        not numero_inventario
-        or not categoria
-        or not descripcion
-    ):
+    if not categoria or not descripcion:
         return jsonify({
-            "error": (
-                "Los campos inventario, categoría "
-                "y nombre son obligatorios"
-            )
+            "error": "La categoría y el nombre del equipo son obligatorios."
         }), 400
 
     if estado_solicitado == "Asignado":
@@ -558,9 +556,13 @@ def crear_equipo():
     try:
         conexion.start_transaction()
 
+        # Primer INSERT con folio temporal único. El ID autoincremental
+        # de MySQL permite asignar un consecutivo sin consultar MAX()+1,
+        # evitando colisiones entre registros simultáneos.
+        numero_temporal = f"TEMP-IT-{uuid4().hex}"
         conflicto = obtener_conflicto_duplicado(
             cursor,
-            numero_inventario,
+            numero_temporal,
             numero_serie
         )
 
@@ -613,7 +615,7 @@ def crear_equipo():
                 'No aplica'
             )
         """, (
-            numero_inventario,
+            numero_temporal,
 
             limpiar_valor(
                 data.get("fechaRegistro")
@@ -661,6 +663,34 @@ def crear_equipo():
 
         nuevo_id = cursor.lastrowid
 
+        empresa_equipo = str(data.get("empresa") or "ELITE BIKE").strip().upper()
+        prefijo = "GS" if empresa_equipo == "GARNIER SPORTS" else "EB"
+        numero_inventario = f"{prefijo}-IT-{nuevo_id:06d}"
+
+        # Se respeta el inventario histórico: si ya existe un código
+        # idéntico por carga manual antigua, se cancela sin dejar
+        # registros parciales ni un folio temporal.
+        cursor.execute(
+            "SELECT id FROM inventario_equipos "
+            "WHERE numero_inventario = %s AND id <> %s LIMIT 1",
+            (numero_inventario, nuevo_id),
+        )
+        if cursor.fetchone():
+            conexion.rollback()
+            return jsonify({
+                "error": (
+                    "El folio automático coincide con un equipo antiguo. "
+                    "Contacta a Sistemas para revisar la numeración."
+                )
+            }), 409
+
+        cursor.execute(
+            "UPDATE inventario_equipos SET numero_inventario = %s WHERE id = %s",
+            (numero_inventario, nuevo_id),
+        )
+
+        # La bitácora captura el folio definitivo, no el temporal.
+        registrar_evento(cursor, 'crear', 'Equipo', nuevo_id)
         conexion.commit()
 
         return jsonify({
@@ -668,6 +698,7 @@ def crear_equipo():
                 "Equipo registrado correctamente"
             ),
             "id": nuevo_id,
+            "inventario": numero_inventario,
             "estado": estado_solicitado,
             "ubicacion": ubicacion or "",
             "responsiva": "No aplica"
@@ -966,6 +997,7 @@ def actualizar_equipo(equipo_id):
         # 5. ACTUALIZAR EQUIPO
         # ----------------------------------------------------
 
+        estado_anterior_bitacora = capturar_estado(cursor, 'Equipo', equipo_id)
         cursor.execute("""
             UPDATE inventario_equipos
 
@@ -1047,6 +1079,7 @@ def actualizar_equipo(equipo_id):
             equipo_id
         ))
 
+        registrar_evento(cursor, 'editar', 'Equipo', equipo_id, anterior=estado_anterior_bitacora)
         conexion.commit()
 
         return jsonify({
@@ -1277,6 +1310,7 @@ def eliminar_equipo(equipo_id):
         # 7. ELIMINAR EQUIPO SIN HISTORIAL
         # ----------------------------------------------------
 
+        estado_anterior_bitacora = capturar_estado(cursor, 'Equipo', equipo_id)
         cursor.execute("""
             DELETE FROM inventario_equipos
 
@@ -1290,6 +1324,7 @@ def eliminar_equipo(equipo_id):
                 "No fue posible eliminar el equipo."
             )
 
+        registrar_evento(cursor, 'eliminar', 'Equipo', equipo_id, anterior=estado_anterior_bitacora)
         conexion.commit()
 
         return jsonify({

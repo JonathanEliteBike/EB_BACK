@@ -3,6 +3,8 @@ from datetime import datetime
 from flask import Blueprint, jsonify, request
 
 from db_conexion import obtener_conexion
+from utils.inventario_actividad import registrar_evento, capturar_estado
+from utils.inventario_auth import validar_acceso_inventario
 
 
 colaboradores_bp = Blueprint(
@@ -10,6 +12,9 @@ colaboradores_bp = Blueprint(
     __name__,
     url_prefix="/api/inventario/colaboradores"
 )
+
+# Aplica a todos los endpoints del blueprint (lectura y escritura).
+colaboradores_bp.before_request(validar_acceso_inventario)
 
 
 # ============================================================
@@ -787,9 +792,9 @@ def crear_colaborador():
             )
         ))
 
-        conexion.commit()
-
         nuevo_id = cursor.lastrowid
+        registrar_evento(cursor, 'crear', 'Colaborador', nuevo_id)
+        conexion.commit()
 
         return jsonify({
             "message": (
@@ -890,6 +895,7 @@ def actualizar_colaborador(colaborador_id):
                     )
                 }), 409
 
+        estado_anterior_bitacora = capturar_estado(cursor, 'Colaborador', colaborador_id)
         cursor.execute("""
             UPDATE inventario_colaboradores
             SET
@@ -950,6 +956,7 @@ def actualizar_colaborador(colaborador_id):
             colaborador_id
         ))
 
+        registrar_evento(cursor, 'editar', 'Colaborador', colaborador_id, anterior=estado_anterior_bitacora)
         conexion.commit()
 
         return jsonify({
@@ -1032,6 +1039,7 @@ def cambiar_estado_colaborador(colaborador_id):
                     )
                 }), 409
 
+        estado_anterior_bitacora = capturar_estado(cursor, 'Colaborador', colaborador_id)
         cursor.execute("""
             UPDATE inventario_colaboradores
             SET estado = %s
@@ -1041,6 +1049,7 @@ def cambiar_estado_colaborador(colaborador_id):
             colaborador_id
         ))
 
+        registrar_evento(cursor, 'estado', 'Colaborador', colaborador_id, anterior=estado_anterior_bitacora)
         conexion.commit()
 
         return jsonify({
@@ -1115,12 +1124,14 @@ def desactivar_colaborador(colaborador_id):
                 )
             }), 409
 
+        estado_anterior_bitacora = capturar_estado(cursor, 'Colaborador', colaborador_id)
         cursor.execute("""
             UPDATE inventario_colaboradores
             SET estado = 'Inactivo'
             WHERE id = %s
         """, (colaborador_id,))
 
+        registrar_evento(cursor, 'baja', 'Colaborador', colaborador_id, anterior=estado_anterior_bitacora)
         conexion.commit()
 
         return jsonify({

@@ -2,9 +2,11 @@ import csv
 from datetime import date, datetime
 from io import BytesIO, StringIO
 
-from flask import Blueprint, jsonify, request, send_file
+from flask import Blueprint, g, jsonify, request, send_file
 
 from db_conexion import obtener_conexion
+from utils.inventario_actividad import registrar_evento, calcular_participacion, capturar_estado, leer_detalle_evento
+from utils.inventario_auth import validar_acceso_inventario
 
 
 auditorias_bp = Blueprint(
@@ -12,6 +14,164 @@ auditorias_bp = Blueprint(
     __name__,
     url_prefix="/api/inventario/auditorias",
 )
+
+# Aplica a todos los endpoints del blueprint (lectura y escritura).
+auditorias_bp.before_request(validar_acceso_inventario)
+
+
+@auditorias_bp.route('/mi-usuario', methods=['GET'])
+def obtener_auditor_autenticado():
+    """Solo exponer la identidad verificada por el guard del backend."""
+    cuenta = g.inventario_usuario
+    return jsonify({'id': cuenta['id'], 'nombre': cuenta['nombre']})
+
+@auditorias_bp.route('/actividad', methods=['GET'])
+def obtener_actividad_usuarios():
+    """Comparativo por usuario. Un evento exitoso = una operación.
+
+    modo=ediciones considera 'editar' únicamente; modo=todas incluye
+    operaciones de alta, asignación, baja, revisión y cambios de estado.
+    """
+    modo = request.args.get('modo', 'todas')
+    if modo not in ('ediciones', 'todas'):
+        return jsonify({'error': 'Modo de consulta inválido.'}), 400
+
+    desde = (request.args.get('desde') or '').strip()
+    hasta = (request.args.get('hasta') or '').strip()
+    try:
+        desde_fecha = datetime.strptime(desde, '%Y-%m-%d').date() if desde else None
+        hasta_fecha = datetime.strptime(hasta, '%Y-%m-%d').date() if hasta else None
+    except ValueError:
+        return jsonify({'error': 'Utiliza fechas AAAA-MM-DD.'}), 400
+    if desde_fecha and hasta_fecha and desde_fecha > hasta_fecha:
+        return jsonify({'error': 'La fecha inicial debe ser anterior a la final.'}), 400
+
+    filtros = []
+    parametros = []
+    if modo == 'ediciones':
+        filtros.append('accion = %s')
+        parametros.append('editar')
+    if desde_fecha:
+        filtros.append('fecha >= %s')
+        parametros.append(desde_fecha)
+    if hasta_fecha:
+        filtros.append('fecha < DATE_ADD(%s, INTERVAL 1 DAY)')
+        parametros.append(hasta_fecha)
+    where = ' WHERE ' + ' AND '.join(filtros) if filtros else ''
+
+    conexion = obtener_conexion()
+    if conexion is None:
+        return jsonify({'error': 'No se pudo conectar a la base de datos.'}), 503
+    cursor = None
+    try:
+        cursor = conexion.cursor(dictionary=True)
+        cursor.execute(
+            'SELECT usuario_id, MAX(usuario_nombre) AS usuario_nombre, '
+            'COUNT(*) AS total FROM inventario_bitacora' + where +
+            ' GROUP BY usuario_id', tuple(parametros),
+        )
+        conteos = cursor.fetchall()
+        total, participantes = calcular_participacion(conteos)
+        cursor.execute(
+            'SELECT id, usuario_id, usuario_nombre, accion, entidad, entidad_id, '
+            'DATE_FORMAT(fecha, %s) AS fecha FROM inventario_bitacora' + where +
+            ' ORDER BY fecha DESC, id DESC LIMIT 50',
+            tuple(['%Y-%m-%d %H:%i:%s'] + parametros),
+        )
+        eventos = [
+            {'id': r['id'], 'usuarioId': r['usuario_id'],
+             'usuario': r['usuario_nombre'], 'accion': r['accion'],
+             'entidad': r['entidad'], 'entidadId': r['entidad_id'],
+             'fecha': r['fecha']}
+            for r in cursor.fetchall()
+        ]
+        return jsonify({'total': total, 'usuarios': participantes, 'eventos': eventos,
+                        'modo': modo, 'desde': desde, 'hasta': hasta})
+    except Exception:
+        # Evitar exponer detalles de tablas o SQL a clientes web.
+        return jsonify({'error': 'No se pudo consultar la bitácora. Verifica que '
+                                 'la migración SQL esté aplicada.'}), 503
+    finally:
+        if cursor: cursor.close()
+        conexion.close()
+
+
+
+@auditorias_bp.route('/actividad/usuarios/<int:usuario_id>', methods=['GET'])
+def historial_actividad_usuario(usuario_id):
+    """Detalle paginado; mismos filtros que las métricas de participación.
+
+    El acceso lo controla before_request(validar_acceso_inventario).
+    La identidad del historial proviene siempre de la base de datos.
+    """
+    if usuario_id <= 0:
+        return jsonify({'error': 'Usuario inválido.'}), 400
+    modo = request.args.get('modo', 'todas')
+    if modo not in ('ediciones', 'todas'):
+        return jsonify({'error': 'Modo inválido.'}), 400
+    desde = (request.args.get('desde') or '').strip()
+    hasta = (request.args.get('hasta') or '').strip()
+    try:
+        desde_fecha = datetime.strptime(desde, '%Y-%m-%d').date() if desde else None
+        hasta_fecha = datetime.strptime(hasta, '%Y-%m-%d').date() if hasta else None
+        limite = int(request.args.get('limite', '25'))
+        desplazamiento = int(request.args.get('offset', '0'))
+    except (ValueError, TypeError):
+        return jsonify({'error': 'Filtros de historial inválidos.'}), 400
+    if (desde_fecha and hasta_fecha and desde_fecha > hasta_fecha
+            or limite < 1 or limite > 100 or desplazamiento < 0
+            or desplazamiento > 100000):
+        return jsonify({'error': 'Rango de consulta inválido.'}), 400
+
+    condiciones = ['usuario_id = %s']
+    argumentos = [usuario_id]
+    if modo == 'ediciones':
+        condiciones.append('accion = %s')
+        argumentos.append('editar')
+    if desde_fecha:
+        condiciones.append('fecha >= %s')
+        argumentos.append(desde_fecha)
+    if hasta_fecha:
+        condiciones.append('fecha < DATE_ADD(%s, INTERVAL 1 DAY)')
+        argumentos.append(hasta_fecha)
+    where = ' WHERE ' + ' AND '.join(condiciones)
+
+    conexion = obtener_conexion()
+    if conexion is None:
+        return jsonify({'error': 'No se pudo conectar a la base de datos.'}), 503
+    cursor = None
+    try:
+        cursor = conexion.cursor(dictionary=True)
+        cursor.execute('SELECT COUNT(*) AS total FROM inventario_bitacora' + where,
+                       tuple(argumentos))
+        total = int((cursor.fetchone() or {}).get('total') or 0)
+        cursor.execute(
+            'SELECT id, usuario_id, usuario_nombre, accion, entidad, entidad_id, detalle_json, '
+            'DATE_FORMAT(fecha, %s) AS fecha FROM inventario_bitacora' + where +
+            ' ORDER BY fecha DESC, id DESC LIMIT %s OFFSET %s',
+            tuple(['%Y-%m-%d %H:%i:%s'] + argumentos + [limite, desplazamiento]),
+        )
+        eventos = []
+        nombre = ''
+        for fila in cursor.fetchall():
+            if not nombre:
+                nombre = fila['usuario_nombre']
+            detalle = leer_detalle_evento(fila.get('detalle_json'))
+            eventos.append({
+                'id': fila['id'], 'usuarioId': fila['usuario_id'],
+                'usuario': fila['usuario_nombre'], 'accion': fila['accion'],
+                'entidad': fila['entidad'], 'entidadId': fila['entidad_id'],
+                'fecha': fila['fecha'], **detalle,
+            })
+        return jsonify({'usuarioId': usuario_id, 'usuario': nombre,
+                        'total': total, 'eventos': eventos,
+                        'offset': desplazamiento, 'limite': limite})
+    except Exception:
+        return jsonify({'error': 'No se pudo consultar el historial.'}), 503
+    finally:
+        if cursor:
+            cursor.close()
+        conexion.close()
 
 
 TIPOS_AUDITORIA = {
@@ -43,6 +203,61 @@ ESTADOS_CORRECCION = {
     "En proceso",
     "Corregida",
 }
+
+# Campos que deben verificarse de manera individual. El codigo de barras NO es
+# obligatorio: los activos fisicos no utilizan etiquetas actualmente.
+CAMPOS_COMPROBACION = (
+    ("serie", "numeroSerieEncontrado", "numero_serie_snapshot", "Número de serie"),
+    ("empresa", "empresaEncontrada", "empresa_esperada", "Empresa"),
+    ("departamento", "departamentoEncontrado", "departamento_esperado", "Departamento"),
+    ("responsable", "responsableEncontrado", "responsable_esperado", "Responsable"),
+    ("estado", "estadoEncontrado", "estado_esperado", "Estado"),
+    ("ubicacion", "ubicacionEncontrada", "ubicacion_esperada", "Ubicación"),
+    ("funcionamiento", "funcionamientoEncontrado", "funcionamiento_esperado", "Funcionamiento"),
+    ("extras", "extrasEncontrados", "extras_esperados", "Accesorios / extras"),
+)
+
+
+def validar_comprobaciones_fisicas(data, detalle):
+    """Nunca completar campos sin verificar con el valor esperado.
+
+    Debe llegar una decision explicita por cada campo:
+      Coincide: el operador afirma haber contrastado el dato.
+      Diferente: el operador capturo el valor real, no vacio.
+      No verificable: no pudo validar el dato; queda como discrepancia.
+      Sin dato: disponible solo si la base carece de valor esperado.
+    """
+    verificaciones = data.get("verificaciones")
+    if not isinstance(verificaciones, dict):
+        raise ValueError("Selecciona el resultado de cada dato físico antes de guardar.")
+
+    encontrados = {"codigoBarras": limpiar_texto(data.get("codigoBarrasEncontrado"))}
+    diferencias = []
+    for clave, campo_data, campo_bd, etiqueta in CAMPOS_COMPROBACION:
+        esperado = limpiar_texto(detalle.get(campo_bd))
+        decision = verificaciones.get(clave)
+        if decision == "Coincide":
+            if not esperado:
+                raise ValueError(f"{etiqueta}: no existe un valor registrado que se pueda confirmar.")
+            encontrados[clave] = esperado
+        elif decision == "Diferente":
+            real = limpiar_texto(data.get(campo_data))
+            if not isinstance(real, str):
+                raise ValueError(f"{etiqueta}: captura el valor físico encontrado.")
+            encontrados[clave] = real
+            if normalizar_comparacion(esperado) == normalizar_comparacion(real):
+                raise ValueError(f"{etiqueta}: si coincide con el registro, selecciónalo como Coincide.")
+            diferencias.append(etiqueta)
+        elif decision == "No verificable":
+            encontrados[clave] = None
+            diferencias.append(f"{etiqueta} no verificable")
+        elif decision == "Sin dato" and not esperado:
+            encontrados[clave] = None
+        else:
+            raise ValueError(f"Debes verificar {etiqueta} o indicar que no fue verificable.")
+    # Un código de barras escrito opcionalmente no valida el equipo: no
+    # convertir su ausencia en discrepancia ni exigir su captura.
+    return encontrados, diferencias
 
 
 # ============================================================
@@ -360,17 +575,6 @@ def construir_filtros_auditoria():
     return clausula, parametros
 
 
-def obtener_valor_encontrado(data, clave, esperado):
-    if clave not in data:
-        return esperado
-
-    valor = data.get(clave)
-    if isinstance(valor, str):
-        return valor.strip()
-
-    return valor
-
-
 # ============================================================
 # GET: LISTAR AUDITORÍAS
 # ============================================================
@@ -675,7 +879,9 @@ def crear_auditoria():
         fecha_programada = normalizar_fecha(
             data.get("fechaProgramada"), "fecha programada", requerida=True
         )
-        auditor_responsable = limpiar_texto(data.get("auditorResponsable"))
+        # Nunca aceptar el auditor ni el autor desde el navegador.
+        # La cuenta está validada por validar_acceso_inventario().
+        auditor_responsable = limpiar_texto(g.inventario_usuario['nombre'])
 
         if not nombre:
             raise ValueError("El nombre de la auditoría es obligatorio.")
@@ -691,7 +897,7 @@ def crear_auditoria():
         ubicacion = limpiar_texto(data.get("ubicacion"))
         incluir_bajas = convertir_booleano(data.get("incluirBajas"), False)
         observaciones = limpiar_texto(data.get("observaciones"))
-        usuario_registro = limpiar_texto(data.get("usuarioRegistro")) or "Sistema"
+        usuario_registro = auditor_responsable
 
         if tipo == "Empresa" and not empresa:
             raise ValueError("Selecciona la empresa que se auditará.")
@@ -867,6 +1073,7 @@ def crear_auditoria():
             filas_detalle,
         )
 
+        registrar_evento(cursor, 'crear', 'Auditoría', auditoria_id)
         conexion.commit()
 
         return jsonify(
@@ -911,14 +1118,10 @@ def actualizar_auditoria(auditoria_id):
         fecha_programada = normalizar_fecha(
             data.get("fechaProgramada"), "fecha programada", requerida=True
         )
-        auditor_responsable = limpiar_texto(data.get("auditorResponsable"))
         observaciones = limpiar_texto(data.get("observaciones"))
 
         if not nombre:
             raise ValueError("El nombre de la auditoría es obligatorio.")
-
-        if not auditor_responsable:
-            raise ValueError("El auditor responsable es obligatorio.")
 
     except ValueError as error:
         return jsonify({"error": str(error)}), 400
@@ -930,7 +1133,7 @@ def actualizar_auditoria(auditoria_id):
         conexion.start_transaction()
         cursor.execute(
             """
-            SELECT id, estado
+            SELECT id, estado, auditor_responsable
             FROM inventario_auditorias
             WHERE id = %s
             FOR UPDATE
@@ -951,6 +1154,7 @@ def actualizar_auditoria(auditoria_id):
                 }
             ), 409
 
+        estado_anterior_bitacora = capturar_estado(cursor, 'Auditoría', auditoria_id)
         cursor.execute(
             """
             UPDATE inventario_auditorias
@@ -964,12 +1168,13 @@ def actualizar_auditoria(auditoria_id):
             (
                 nombre,
                 fecha_programada,
-                auditor_responsable,
+                auditoria["auditor_responsable"],
                 observaciones,
                 auditoria_id,
             ),
         )
 
+        registrar_evento(cursor, 'editar', 'Auditoría', auditoria_id, anterior=estado_anterior_bitacora)
         conexion.commit()
         return jsonify(
             {
@@ -1046,6 +1251,7 @@ def iniciar_auditoria(auditoria_id):
                 }
             ), 409
 
+        estado_anterior_bitacora = capturar_estado(cursor, 'Auditoría', auditoria_id)
         cursor.execute(
             """
             UPDATE inventario_auditorias
@@ -1055,6 +1261,7 @@ def iniciar_auditoria(auditoria_id):
             (auditoria_id,),
         )
 
+        registrar_evento(cursor, 'iniciar', 'Auditoría', auditoria_id, anterior=estado_anterior_bitacora)
         conexion.commit()
         return jsonify(
             {
@@ -1094,16 +1301,13 @@ def revisar_equipo(auditoria_id, detalle_id):
     if not data:
         return jsonify({"error": "No se recibieron datos."}), 400
 
-    if "encontrado" not in data and data.get("resultado") != "No aplica":
-        return jsonify(
-            {
-                "error": "Indica si el equipo fue encontrado durante la revisión."
-            }
-        ), 400
+    if data.get("resultado") != "No aplica" and not isinstance(data.get("encontrado"), bool):
+        return jsonify({"error": "Indica expresamente si localizaste el dispositivo."}), 400
 
-    encontrado = convertir_booleano(data.get("encontrado"), False)
+    encontrado = data.get("encontrado") is True
     resultado_solicitado = limpiar_texto(data.get("resultado"))
-    revisado_por = limpiar_texto(data.get("revisadoPor")) or "Sistema"
+    # El responsable de cada revisión se toma de la cuenta verificada.
+    revisado_por = limpiar_texto(g.inventario_usuario['nombre'])
     observaciones = limpiar_texto(data.get("observaciones"))
     evidencia_url = limpiar_texto(data.get("evidenciaUrl"))
     accion_requerida = limpiar_texto(data.get("accionRequerida"))
@@ -1153,29 +1357,23 @@ def revisar_equipo(auditoria_id, detalle_id):
             return jsonify({"error": "Detalle de auditoría no encontrado."}), 404
 
         if resultado_solicitado == "No aplica":
+            if not observaciones:
+                conexion.rollback()
+                return jsonify({"error": "Explica por qué este equipo no aplica a la auditoría."}), 400
+            encontrado = False
             resultado = "No aplica"
-            tipo_diferencia = limpiar_texto(data.get("tipoDiferencia"))
+            tipo_diferencia = None
             estado_correccion = "No aplica"
-
-            encontrados = {
-                "codigoBarras": detalle.get("codigo_barras_snapshot"),
-                "serie": detalle.get("numero_serie_snapshot"),
-                "empresa": detalle.get("empresa_esperada"),
-                "departamento": detalle.get("departamento_esperado"),
-                "responsable": detalle.get("responsable_esperado"),
-                "estado": detalle.get("estado_esperado"),
-                "ubicacion": detalle.get("ubicacion_esperada"),
-                "funcionamiento": detalle.get("funcionamiento_esperado"),
-                "extras": detalle.get("extras_esperados"),
-            }
+            # No copiar como encontrados valores que nunca se comprobaron.
+            encontrados = {"codigoBarras": None, **{clave: None for clave, _, _, _ in CAMPOS_COMPROBACION}}
 
         elif not encontrado:
+            if not observaciones:
+                conexion.rollback()
+                return jsonify({"error": "Describe la búsqueda del equipo no localizado."}), 400
             resultado = "No localizado"
-            tipo_diferencia = limpiar_texto(data.get("tipoDiferencia")) or "Equipo no localizado"
-            estado_correccion = limpiar_texto(data.get("estadoCorreccion")) or "Pendiente"
-
-            if estado_correccion not in ESTADOS_CORRECCION:
-                estado_correccion = "Pendiente"
+            tipo_diferencia = "Equipo no localizado"
+            estado_correccion = "Pendiente"
 
             encontrados = {
                 "codigoBarras": None,
@@ -1190,67 +1388,26 @@ def revisar_equipo(auditoria_id, detalle_id):
             }
 
         else:
-            encontrados = {
-                "codigoBarras": obtener_valor_encontrado(
-                    data, "codigoBarrasEncontrado", detalle.get("codigo_barras_snapshot")
-                ),
-                "serie": obtener_valor_encontrado(
-                    data, "numeroSerieEncontrado", detalle.get("numero_serie_snapshot")
-                ),
-                "empresa": obtener_valor_encontrado(
-                    data, "empresaEncontrada", detalle.get("empresa_esperada")
-                ),
-                "departamento": obtener_valor_encontrado(
-                    data, "departamentoEncontrado", detalle.get("departamento_esperado")
-                ),
-                "responsable": obtener_valor_encontrado(
-                    data, "responsableEncontrado", detalle.get("responsable_esperado")
-                ),
-                "estado": obtener_valor_encontrado(
-                    data, "estadoEncontrado", detalle.get("estado_esperado")
-                ),
-                "ubicacion": obtener_valor_encontrado(
-                    data, "ubicacionEncontrada", detalle.get("ubicacion_esperada")
-                ),
-                "funcionamiento": obtener_valor_encontrado(
-                    data, "funcionamientoEncontrado", detalle.get("funcionamiento_esperado")
-                ),
-                "extras": obtener_valor_encontrado(
-                    data, "extrasEncontrados", detalle.get("extras_esperados")
-                ),
-            }
-
-            comparaciones = [
-                ("Código de barras", detalle.get("codigo_barras_snapshot"), encontrados["codigoBarras"]),
-                ("Número de serie", detalle.get("numero_serie_snapshot"), encontrados["serie"]),
-                ("Empresa", detalle.get("empresa_esperada"), encontrados["empresa"]),
-                ("Departamento", detalle.get("departamento_esperado"), encontrados["departamento"]),
-                ("Responsable", detalle.get("responsable_esperado"), encontrados["responsable"]),
-                ("Estado", detalle.get("estado_esperado"), encontrados["estado"]),
-                ("Ubicación", detalle.get("ubicacion_esperada"), encontrados["ubicacion"]),
-                ("Funcionamiento", detalle.get("funcionamiento_esperado"), encontrados["funcionamiento"]),
-                ("Extras", detalle.get("extras_esperados"), encontrados["extras"]),
-            ]
-
-            diferencias = [
-                etiqueta
-                for etiqueta, esperado, actual in comparaciones
-                if normalizar_comparacion(esperado) != normalizar_comparacion(actual)
-            ]
+            # El backend exige confirmación explícita. No utilizar valores
+            # esperados como respaldo de campos sin comprobar.
+            try:
+                encontrados, diferencias = validar_comprobaciones_fisicas(data, detalle)
+            except ValueError as error:
+                conexion.rollback()
+                return jsonify({"error": str(error)}), 400
 
             if diferencias:
                 resultado = "Con diferencia"
-                tipo_diferencia = limpiar_texto(data.get("tipoDiferencia")) or ", ".join(diferencias)
-                estado_correccion = limpiar_texto(data.get("estadoCorreccion")) or "Pendiente"
-
-                if estado_correccion not in ESTADOS_CORRECCION:
-                    estado_correccion = "Pendiente"
+                # Etiquetas calculadas por servidor: no se pueden ocultar con texto manual.
+                tipo_diferencia = ", ".join(diferencias)
+                estado_correccion = "Pendiente"
             else:
                 resultado = "Conforme"
                 tipo_diferencia = None
                 accion_requerida = None
                 estado_correccion = "No aplica"
 
+        estado_anterior_bitacora = capturar_estado(cursor, 'Detalle de auditoría', detalle_id)
         cursor.execute(
             """
             UPDATE inventario_auditoria_detalles
@@ -1308,6 +1465,7 @@ def revisar_equipo(auditoria_id, detalle_id):
         )
         detalle_actualizado = cursor.fetchone()
 
+        registrar_evento(cursor, 'revisar', 'Detalle de auditoría', detalle_id, anterior=estado_anterior_bitacora)
         conexion.commit()
 
         return jsonify(
@@ -1374,6 +1532,7 @@ def actualizar_correccion(auditoria_id, detalle_id):
                 }
             ), 409
 
+        estado_anterior_bitacora = capturar_estado(cursor, 'Corrección de auditoría', detalle_id)
         cursor.execute(
             """
             UPDATE inventario_auditoria_detalles
@@ -1383,6 +1542,7 @@ def actualizar_correccion(auditoria_id, detalle_id):
             (accion_requerida, estado_correccion, detalle_id, auditoria_id),
         )
 
+        registrar_evento(cursor, 'editar', 'Corrección de auditoría', detalle_id, anterior=estado_anterior_bitacora)
         conexion.commit()
         return jsonify(
             {
@@ -1467,6 +1627,7 @@ def finalizar_auditoria(auditoria_id):
                 }
             ), 409
 
+        estado_anterior_bitacora = capturar_estado(cursor, 'Auditoría', auditoria_id)
         cursor.execute(
             """
             UPDATE inventario_auditorias
@@ -1479,6 +1640,7 @@ def finalizar_auditoria(auditoria_id):
             (conclusiones, auditoria_id),
         )
 
+        registrar_evento(cursor, 'finalizar', 'Auditoría', auditoria_id, anterior=estado_anterior_bitacora)
         conexion.commit()
         return jsonify(
             {
@@ -1554,6 +1716,7 @@ def cancelar_auditoria(auditoria_id):
             else texto_cancelacion
         )
 
+        estado_anterior_bitacora = capturar_estado(cursor, 'Auditoría', auditoria_id)
         cursor.execute(
             """
             UPDATE inventario_auditorias
@@ -1563,6 +1726,7 @@ def cancelar_auditoria(auditoria_id):
             (observaciones, auditoria_id),
         )
 
+        registrar_evento(cursor, 'cancelar', 'Auditoría', auditoria_id, anterior=estado_anterior_bitacora)
         conexion.commit()
         return jsonify(
             {
@@ -1594,60 +1758,10 @@ def cancelar_auditoria(auditoria_id):
 
 @auditorias_bp.route("/<int:auditoria_id>", methods=["DELETE"])
 def eliminar_auditoria(auditoria_id):
-    conexion = obtener_conexion()
-    cursor = conexion.cursor(dictionary=True)
-
-    try:
-        conexion.start_transaction()
-        cursor.execute(
-            """
-            SELECT id, estado
-            FROM inventario_auditorias
-            WHERE id = %s
-            FOR UPDATE
-            """,
-            (auditoria_id,),
-        )
-        auditoria = cursor.fetchone()
-
-        if not auditoria:
-            conexion.rollback()
-            return jsonify({"error": "Auditoría no encontrada."}), 404
-
-        if auditoria["estado"] != "Planeada":
-            conexion.rollback()
-            return jsonify(
-                {
-                    "error": "Solamente una auditoría planeada puede eliminarse."
-                }
-            ), 409
-
-        cursor.execute(
-            "DELETE FROM inventario_auditorias WHERE id = %s",
-            (auditoria_id,),
-        )
-        conexion.commit()
-
-        return jsonify(
-            {
-                "message": "Auditoría eliminada correctamente.",
-                "id": auditoria_id,
-            }
-        )
-
-    except Exception as error:
-        conexion.rollback()
-        print("Error al eliminar auditoría:", error)
-        return jsonify(
-            {
-                "error": "No se pudo eliminar la auditoría.",
-                "detalle": str(error),
-            }
-        ), 500
-
-    finally:
-        cursor.close()
-        conexion.close()
+    """Las auditorías son registros históricos. Nunca borrarlas físicamente."""
+    return jsonify({
+        "error": "No se permite eliminar auditorías. Utiliza Cancelar con un motivo."
+    }), 405
 
 
 # ============================================================

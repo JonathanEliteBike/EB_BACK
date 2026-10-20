@@ -1,8 +1,10 @@
-from datetime import datetime
+from datetime import date, datetime
 
-from flask import Blueprint, jsonify, request
+from flask import Blueprint, g, jsonify, request
 
 from db_conexion import obtener_conexion
+from utils.inventario_actividad import registrar_evento, capturar_estado
+from utils.inventario_auth import validar_acceso_inventario
 
 
 asignaciones_bp = Blueprint(
@@ -10,6 +12,9 @@ asignaciones_bp = Blueprint(
     __name__,
     url_prefix="/api/inventario/asignaciones"
 )
+
+# Aplica a todos los endpoints del blueprint (lectura y escritura).
+asignaciones_bp.before_request(validar_acceso_inventario)
 
 
 # ============================================================
@@ -83,6 +88,27 @@ def normalizar_fecha_hora(valor, usar_fecha_actual=True):
     raise ValueError(
         "La fecha debe tener formato YYYY-MM-DD "
         "o YYYY-MM-DDTHH:MM."
+    )
+
+
+def fecha_devolucion_anterior_a_asignacion(fecha_devolucion, fecha_asignacion):
+    """Valida el orden cronológico sin mezclar `date` con `datetime`.
+
+    MySQL devuelve `date` para columnas DATE y `datetime` para DATETIME.
+    Si la asignación solo almacena fecha, no inventamos una hora: comparamos
+    fechas. Si la columna conserva hora, comparamos ambos instantes completos.
+    """
+    if fecha_asignacion is None:
+        return False
+
+    if isinstance(fecha_asignacion, datetime):
+        return fecha_devolucion < fecha_asignacion
+
+    if isinstance(fecha_asignacion, date):
+        return fecha_devolucion.date() < fecha_asignacion
+
+    raise TypeError(
+        "El formato de la fecha de asignación almacenada no es válido."
     )
 
 
@@ -753,9 +779,7 @@ def crear_asignacion():
         data.get("observacionesEntrega")
     )
 
-    usuario_registro = limpiar_texto(
-        data.get("usuarioRegistro")
-    ) or "Sistema"
+    usuario_registro = g.inventario_usuario["nombre"]
 
     conexion = obtener_conexion()
     cursor = conexion.cursor(dictionary=True)
@@ -1053,6 +1077,7 @@ def crear_asignacion():
         # 8. CONFIRMAR TODA LA OPERACIÓN
         # ----------------------------------------------------
 
+        registrar_evento(cursor, 'asignar', 'Asignación', asignacion_id)
         conexion.commit()
 
         return jsonify({
@@ -1123,9 +1148,7 @@ def finalizar_asignacion(asignacion_id):
         data.get("observacionesDevolucion")
     )
 
-    usuario_registro = limpiar_texto(
-        data.get("usuarioRegistro")
-    ) or "Sistema"
+    usuario_registro = g.inventario_usuario["nombre"]
 
     conexion = obtener_conexion()
     cursor = conexion.cursor(dictionary=True)
@@ -1191,9 +1214,8 @@ def finalizar_asignacion(asignacion_id):
             "fecha_asignacion"
         )
 
-        if (
-            fecha_asignacion
-            and fecha_devolucion < fecha_asignacion
+        if fecha_devolucion_anterior_a_asignacion(
+            fecha_devolucion, fecha_asignacion
         ):
             conexion.rollback()
 
@@ -1214,6 +1236,7 @@ def finalizar_asignacion(asignacion_id):
         # 2. FINALIZAR ASIGNACIÓN
         # ----------------------------------------------------
 
+        estado_anterior_bitacora = capturar_estado(cursor, 'Asignación', asignacion_id)
         cursor.execute(
             """
             UPDATE inventario_asignaciones
@@ -1337,6 +1360,7 @@ def finalizar_asignacion(asignacion_id):
         # 6. CONFIRMAR TODA LA OPERACIÓN
         # ----------------------------------------------------
 
+        registrar_evento(cursor, 'devolver', 'Asignación', asignacion_id, anterior=estado_anterior_bitacora)
         conexion.commit()
 
         return jsonify({
