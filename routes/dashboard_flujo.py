@@ -1,4 +1,5 @@
 from flask import Blueprint, jsonify, request
+from utils.auth_decorators import requiere_autenticacion, requiere_permiso_interno
 from db_conexion import obtener_conexion
 from decimal import Decimal
 from datetime import date, datetime
@@ -29,6 +30,8 @@ dashboard_flujo_bp = Blueprint('dashboard_flujo_bp', __name__, url_prefix='/fluj
 # 1. LECTURA: TABLERO MENSUAL (USANDO TABLAS UNIFICADAS)
 # ==============================================================================
 @dashboard_flujo_bp.route('/tablero-mensual', methods=['GET'])
+@requiere_autenticacion
+@requiere_permiso_interno('flujo_dashboard', 'ver')
 def obtener_tablero_mensual():
     conexion = None
     try:
@@ -92,6 +95,8 @@ def obtener_tablero_mensual():
 # 2. LECTURA: PROYECCIÓN ANUAL (USANDO TABLAS UNIFICADAS)
 # ==============================================================================
 @dashboard_flujo_bp.route('/proyeccion-anual', methods=['GET'])
+@requiere_autenticacion
+@requiere_permiso_interno('flujo_tablero_anual', 'ver')
 def obtener_proyeccion_anual():
     conexion = None
     try:
@@ -171,6 +176,8 @@ def obtener_proyeccion_anual():
 # 3. ESCRITURA: GUARDAR VALOR Y RECALCULAR (LÓGICA CORREGIDA)
 # ==============================================================================
 @dashboard_flujo_bp.route('/guardar-valor', methods=['POST'])
+@requiere_autenticacion
+@requiere_permiso_interno('flujo_tablero', 'editar')
 def guardar_valor():
     auth_header = request.headers.get('Authorization')
     token = auth_header.split(" ")[1] if auth_header and " " in auth_header else None
@@ -201,8 +208,7 @@ def guardar_valor():
         # 3. CORRECCIÓN: Automatización del recálculo propagado
         # Usamos la nueva función recalcular_formulas_flujo definida abajo
         f_obj = datetime.strptime(fecha, "%Y-%m-%d")
-        
-        # Recalcula desde el mes editado hasta diciembre para propagar saldos iniciales
+        # # Recalcula desde el mes editado hasta diciembre para propagar saldos iniciales
         for m in range(f_obj.month, 13):
             recalcular_formulas_flujo(conexion, f_obj.year, m)
 
@@ -219,6 +225,8 @@ def guardar_valor():
 # 4. SINCRONIZACIÓN CON ODOO (ACTUALIZADA CON CÁLCULO DE MES ANTERIOR)
 # ==============================================================================
 @dashboard_flujo_bp.route('/sincronizar-odoo', methods=['POST'])
+@requiere_autenticacion
+@requiere_permiso_interno('flujo_tablero', 'editar')
 def sincronizar_odoo():
     data = request.get_json()
     try:
@@ -347,6 +355,8 @@ def sincronizar_odoo():
 # 5. GENERACIÓN DE REPORTES EN EXCEL
 # ==============================================================================
 @dashboard_flujo_bp.route('/reporte-excel', methods=['GET'])
+@requiere_autenticacion
+@requiere_permiso_interno('flujo_tablero', 'ver')
 def exportar_excel():
     conexion = None
     try:
@@ -404,6 +414,8 @@ def exportar_excel():
         if conexion: conexion.close()
 
 @dashboard_flujo_bp.route('/verificar-permiso/<int:id_usuario>', methods=['GET'])
+@requiere_autenticacion
+@requiere_permiso_interno('flujo_dashboard', 'ver')
 def verificar_permiso_joker(id_usuario):
     conexion = None
     try:
@@ -424,6 +436,133 @@ def verificar_permiso_joker(id_usuario):
     finally:
         if cursor: cursor.close()
         if conexion: conexion.close()
+
+# ==============================================================================
+# 6. AUDITORÍA DEL FLUJO DE EFECTIVO
+# ==============================================================================
+@dashboard_flujo_bp.route('/auditoria', methods=['GET'])
+@requiere_autenticacion
+@requiere_permiso_interno('flujo_auditoria', 'ver')
+def obtener_auditoria_flujo():
+    conexion = None
+    cursor = None
+
+    try:
+        # ==============================================================
+        # 1. VALIDAR TOKEN
+        # ==============================================================
+        auth_header = request.headers.get('Authorization')
+
+        if not auth_header or " " not in auth_header:
+            return jsonify({
+                "error": "Token no proporcionado"
+            }), 401
+
+        token = auth_header.split(" ")[1]
+        datos_usuario = verificar_token(token)
+
+        if not datos_usuario:
+            return jsonify({
+                "error": "Token inválido o expirado"
+            }), 401
+
+        id_usuario = datos_usuario.get("id")
+
+        if not id_usuario:
+            return jsonify({
+                "error": "No fue posible identificar al usuario"
+            }), 401
+
+        # ==============================================================
+        # 2. CONEXIÓN A BD
+        # ==============================================================
+        conexion = obtener_conexion()
+        cursor = conexion.cursor(dictionary=True)
+
+        # ==============================================================
+        # 3. VALIDAR PERMISO ACTUAL DEL USUARIO
+        # ==============================================================
+        # Se consulta directamente la BD para tomar el permiso vigente.
+        cursor.execute("""
+            SELECT flujo
+            FROM usuarios
+            WHERE id = %s
+            LIMIT 1
+        """, (id_usuario,))
+
+        permiso = cursor.fetchone()
+
+        if not permiso:
+            return jsonify({
+                "error": "Usuario no encontrado"
+            }), 404
+
+        if not permiso.get("flujo"):
+            return jsonify({
+                "error": "No tienes permisos para consultar la auditoría del flujo"
+            }), 403
+
+        # ==============================================================
+        # 4. CONSULTAR MOVIMIENTOS DEL FLUJO
+        # ==============================================================
+        cursor.execute("""
+            SELECT
+                id_auditoria,
+                id_usuario,
+                nombre_usuario,
+                accion,
+                tabla_afectada,
+                id_registro_afectado,
+                descripcion,
+                fecha_hora
+            FROM auditoria_movimientos
+            WHERE tabla_afectada IN (
+                'flujo_valores',
+                'flujo_valores_unificados',
+                'gastos_operativos',
+                'ingresos_cobranza',
+                'embarques_logistica',
+                'ordenes_compra'
+            )
+            ORDER BY fecha_hora DESC, id_auditoria DESC
+        """)
+
+        registros = cursor.fetchall()
+
+        # ==============================================================
+        # 5. FORMATEAR FECHA PARA JSON
+        # ==============================================================
+        categorias = {
+            'flujo_valores': 'Tablero Maestro',
+            'flujo_valores_unificados': 'Tablero Maestro',
+            'gastos_operativos': 'Gastos Operativos',
+            'ingresos_cobranza': 'Ingresos y Cobranza',
+            'embarques_logistica': 'Logística y Aduanas',
+            'ordenes_compra': 'Órdenes de Compra',
+        }
+        for registro in registros:
+            if registro.get("fecha_hora"):
+                registro["fecha_hora"] = registro["fecha_hora"].strftime(
+                    "%Y-%m-%d %H:%M:%S"
+                )
+            registro['categoria'] = categorias.get(registro['tabla_afectada'], 'Flujo de Efectivo')
+
+        # ==============================================================
+        # 6. RESPUESTA
+        # ==============================================================
+        return jsonify(registros), 200
+
+    except Exception as e:
+        logging.exception("Error obteniendo auditoría del flujo")
+        return jsonify({
+            "error": str(e)
+        }), 500
+
+    finally:
+        if cursor:
+            cursor.close()
+        if conexion:
+            conexion.close()
 
 # ==============================================================================
 # LÓGICA DE CÁLCULO DE FÓRMULAS

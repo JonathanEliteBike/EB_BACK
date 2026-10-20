@@ -1,5 +1,6 @@
 from flask import Blueprint, jsonify, request
 from db_conexion import obtener_conexion
+from utils.jwt_utils import registrar_auditoria
 
 ingresos_bp = Blueprint('ingresos_bp', __name__, url_prefix='/flujo')
 
@@ -23,6 +24,10 @@ def crear_ingreso():
             data.get('probabilidad', 'ALTA'),
             data.get('cuenta_destino')
         ))
+        registrar_auditoria(
+            cursor, 'INSERT_INGRESO', 'ingresos_cobranza', cursor.lastrowid,
+            f"Cobranza {data.get('folio_factura') or 'sin folio'} registrada para {data.get('cliente') or 'cliente sin especificar'}"
+        )
         conexion.commit()
         return jsonify({"mensaje": "Cobranza proyectada registrada"}), 201
     except Exception as e:

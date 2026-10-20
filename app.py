@@ -1,4 +1,5 @@
-from flask import Flask
+import os
+from flask import Flask, request, make_response
 from flask_cors import CORS
 from socket_instance import socketio
 
@@ -16,46 +17,93 @@ from routes.caratulas import caratulas_bp
 from routes.integrales import integrales_bp
 from routes.email import email_bp
 
-# --- NUEVOS BLUEPRINTS (Traídos de tu local) ---
+# --- NUEVOS BLUEPRINTS ---
 from routes.ordenes_compra import ordenes_compra_bp
 from routes.dashboard_flujo import dashboard_flujo_bp
 from routes.logistica import logistica_bp
 from routes.gastos import gastos_bp
 from routes.ingresos import ingresos_bp
-
 from routes.retroactivos import retroactivos_bp
 from routes.edicion_pedidos import edicion_bp
 from routes.forecast import forecast_bp
 from routes.ventas import ventas_bp
 from routes.garantias import garantias_bp
-from routes.proyecciones_my27 import proyecciones_my27_bp
 from routes.importaciones import importaciones_bp
+
+# --- INVENTARIO IT ---
 from routes.inventario import inventario_bp
 from routes.inventario_acceso import inventario_acceso_bp
 from routes.colaboradores import colaboradores_bp
-from routes.asignaciones import asignaciones_bp
+from routes.asignaciones import asignaciones_bp as inventario_asignaciones_bp
 from routes.responsivas import responsivas_bp
 from routes.historial import historial_bp
 from routes.auditorias import auditorias_bp
 from routes.reportes import reportes_bp
 from routes.control_cambios import control_cambios_bp
-# Importamos la instancia de Celery desde celery_worker
+
+# --- FUNCIONALIDADES DE MAIN ---
+from routes.proyecciones_my27 import proyecciones_my27_bp
+from routes.asignaciones_importaciones import asignaciones_bp as importaciones_asignaciones_bp
+from routes.solicitud_retroactivo import solicitud_retroactivo_bp
+from routes.solicitud_retroactivo_campanias import solicitud_retroactivo_campanias_bp
+
+# --- BLUEPRINTS DE PERMISOS ---
+from routes.usuarios_hijos_bp import usuarios_hijos_bp
+from routes.permisos_bp import permisos_bp
+from routes.modulos_bp import modulos_bp
+from routes.acciones_bp import acciones_bp
+from routes.admin_sistema_bp import admin_sistema_bp
+from routes.permisos_internos_bp import permisos_internos_bp
+
+# --- CELERY ---
 from celery_worker import celery_app as celery
+
+# --- SCHEDULER ---
+from services.sync_scheduler import init_scheduler
+
 
 def create_app():
     app = Flask(__name__)
 
-    # Límite de tamaño para uploads (500 MB — necesario para videos)
-    app.config['MAX_CONTENT_LENGTH'] = 500 * 1024 * 1024
-
-    # Vinculamos y configuramos Celery después de crear la app
-    celery.conf.update(
-        broker_url=app.config.get('CELERY_BROKER_URL', 'redis://localhost:6379/0'),
-        result_backend=app.config.get('CELERY_RESULT_BACKEND', 'redis://localhost:6379/0')
+    # Diagnóstico de decisiones 403 del rol interno
+    app.config['PERMISOS_INTERNOS_LOG_403'] = (
+        os.getenv('PERMISOS_INTERNOS_LOG_403', '').strip().lower()
+        in {'1', 'true', 'yes'}
     )
-    celery.Task = type('Task', (celery.Task,), {'__call__': lambda self, *args, **kwargs: self.run(*args, **kwargs)})
 
-    # Configuración CORS
+    app.config['ODOO_TRACE_VENTAS'] = (
+        os.getenv('ODOO_TRACE_VENTAS', '').strip().lower()
+        in {'1', 'true', 'yes'}
+    )
+
+    from services.contexto_permisos_internos import registrar_capa_interna
+    registrar_capa_interna(app)
+
+    # Límite de archivos
+    app.config['MAX_CONTENT_LENGTH'] = 1000 * 1024 * 1024
+
+    # --- CONFIGURACIÓN CELERY ---
+    celery.conf.update(
+        broker_url=app.config.get(
+            'CELERY_BROKER_URL',
+            'redis://localhost:6379/0'
+        ),
+        result_backend=app.config.get(
+            'CELERY_RESULT_BACKEND',
+            'redis://localhost:6379/0'
+        )
+    )
+
+    celery.Task = type(
+        'Task',
+        (celery.Task,),
+        {
+            '__call__': lambda self, *args, **kwargs:
+                self.run(*args, **kwargs)
+        }
+    )
+
+    # --- CONFIGURACIÓN CORS ---
     allowed_origins = [
         "http://localhost:4200",
         "http://127.0.0.1:4200",
@@ -69,64 +117,130 @@ def create_app():
         "https://api.elite-bike.com"
     ]
 
-    # Inicialmente registramos Flask-CORS para los orígenes conocidos.
     CORS(app, resources={
         r"/*": {
             "origins": allowed_origins,
             "supports_credentials": True,
-            "expose_headers": ["Content-Disposition", "Content-Type"],
-            "allow_headers": ["Authorization", "Content-Type"]
+            "expose_headers": [
+                "Content-Disposition",
+                "Content-Type"
+            ],
+            "allow_headers": [
+                "Authorization",
+                "Content-Type",
+                "X-Ruta-Interna"
+            ],
+            "methods": [
+                "GET",
+                "POST",
+                "PUT",
+                "PATCH",
+                "DELETE",
+                "OPTIONS"
+            ]
         }
     })
 
-    # Además, añadimos un handler que refleja dinámicamente orígenes localhost/127.0.0.1 con cualquier puerto.
-    # Esto permite desarrollar con el servidor Angular en puertos aleatorios sin romper CORS.
-    from flask import request
-
-    from flask import make_response
-
+    # --- SOLICITUDES PREFLIGHT ---
     @app.before_request
     def _handle_preflight():
         if request.method == 'OPTIONS':
             origin = request.headers.get('Origin', '')
-            if origin in allowed_origins or origin.startswith('http://localhost:') or origin.startswith('http://127.0.0.1:'):
-                response = make_response('', 200)
-                response.headers['Access-Control-Allow-Origin'] = origin
-                response.headers['Access-Control-Allow-Methods'] = 'GET,POST,PUT,PATCH,DELETE,OPTIONS'
-                response.headers['Access-Control-Allow-Headers'] = 'Authorization, Content-Type'
-                response.headers['Access-Control-Allow-Credentials'] = 'true'
+
+            if (
+                origin in allowed_origins
+                or origin.startswith('http://localhost:')
+                or origin.startswith('http://127.0.0.1:')
+            ):
+                response = make_response('', 204)
+
+                response.headers[
+                    'Access-Control-Allow-Origin'
+                ] = origin
+
+                response.headers[
+                    'Access-Control-Allow-Methods'
+                ] = 'GET,POST,PUT,PATCH,DELETE,OPTIONS'
+
+                response.headers[
+                    'Access-Control-Allow-Headers'
+                ] = 'Authorization, Content-Type, X-Ruta-Interna'
+
+                response.headers[
+                    'Access-Control-Allow-Credentials'
+                ] = 'true'
+
+                response.headers[
+                    'Access-Control-Expose-Headers'
+                ] = 'Content-Disposition, Content-Type'
+
+                response.headers['Vary'] = 'Origin'
+
+                # Chrome Private Network Access
+                if request.headers.get(
+                    'Access-Control-Request-Private-Network'
+                ):
+                    response.headers[
+                        'Access-Control-Allow-Private-Network'
+                    ] = 'true'
+
                 return response
 
+    # --- CABECERAS CORS DE RESPUESTA ---
     @app.after_request
     def _apply_cors_headers(response):
         origin = request.headers.get('Origin')
+
         if not origin:
             return response
 
-        # Allow explicit allowed_origins or localhosts with any port
-        if origin in allowed_origins or origin.startswith('http://localhost:') or origin.startswith('http://127.0.0.1:'):
-            response.headers['Access-Control-Allow-Origin'] = origin
+        if (
+            origin in allowed_origins
+            or origin.startswith('http://localhost:')
+            or origin.startswith('http://127.0.0.1:')
+        ):
+            response.headers[
+                'Access-Control-Allow-Origin'
+            ] = origin
+
             response.headers['Vary'] = 'Origin'
-            response.headers['Access-Control-Allow-Credentials'] = 'true'
-            response.headers['Access-Control-Expose-Headers'] = 'Content-Disposition, Content-Type'
-            response.headers['Access-Control-Allow-Headers'] = 'Authorization, Content-Type'
-            response.headers['Access-Control-Allow-Methods'] = 'GET,POST,PUT,PATCH,DELETE,OPTIONS'
+
+            response.headers[
+                'Access-Control-Allow-Credentials'
+            ] = 'true'
+
+            response.headers[
+                'Access-Control-Expose-Headers'
+            ] = 'Content-Disposition, Content-Type'
+
+            response.headers[
+                'Access-Control-Allow-Headers'
+            ] = 'Authorization, Content-Type, X-Ruta-Interna'
+
+            response.headers[
+                'Access-Control-Allow-Methods'
+            ] = 'GET,POST,PUT,PATCH,DELETE,OPTIONS'
+
+            if request.headers.get(
+                'Access-Control-Request-Private-Network'
+            ):
+                response.headers[
+                    'Access-Control-Allow-Private-Network'
+                ] = 'true'
 
         return response
 
-     # Configuración Socket.IO con async_mode explícito
+    # --- CONFIGURACIÓN SOCKET.IO ---
     socketio.init_app(
         app,
         cors_allowed_origins=allowed_origins,
-        async_mode='threading',  # use threading temporarily for debugging
+        async_mode='threading',
         logger=True,
         engineio_logger=True,
         path='/socket.io/'
     )
 
-    # --- REGISTRO DE BLUEPRINTS ---
-    
-    # Viejos
+    # --- REGISTRO DE BLUEPRINTS EXISTENTES ---
     app.register_blueprint(monitor_odoo_bp)
     app.register_blueprint(auth)
     app.register_blueprint(usuarios_bp)
@@ -137,44 +251,107 @@ def create_app():
     app.register_blueprint(disponibilidad_bp)
     app.register_blueprint(multimarcas_bp)
     app.register_blueprint(caratulas_bp)
+
+    from routes.temporadas import temporadas_bp
+    app.register_blueprint(temporadas_bp)
+
     app.register_blueprint(integrales_bp)
     app.register_blueprint(email_bp)
 
-    # Nuevos (Agregados aquí)
+    # --- BLUEPRINTS GENERALES ---
     app.register_blueprint(ordenes_compra_bp)
     app.register_blueprint(dashboard_flujo_bp)
     app.register_blueprint(logistica_bp)
     app.register_blueprint(gastos_bp)
     app.register_blueprint(ingresos_bp)
-
     app.register_blueprint(retroactivos_bp)
     app.register_blueprint(edicion_bp)
     app.register_blueprint(forecast_bp)
     app.register_blueprint(ventas_bp)
     app.register_blueprint(garantias_bp)
-    app.register_blueprint(proyecciones_my27_bp)
     app.register_blueprint(importaciones_bp)
+
+    # --- INVENTARIO IT ---
     app.register_blueprint(inventario_bp)
     app.register_blueprint(inventario_acceso_bp)
     app.register_blueprint(colaboradores_bp)
-    app.register_blueprint(asignaciones_bp)
+    app.register_blueprint(inventario_asignaciones_bp)
     app.register_blueprint(responsivas_bp)
     app.register_blueprint(historial_bp)
     app.register_blueprint(auditorias_bp)
     app.register_blueprint(reportes_bp)
     app.register_blueprint(control_cambios_bp)
+
+    # --- FUNCIONALIDADES DE MAIN ---
+    app.register_blueprint(proyecciones_my27_bp)
+    app.register_blueprint(importaciones_asignaciones_bp)
+    app.register_blueprint(solicitud_retroactivo_bp)
+    app.register_blueprint(solicitud_retroactivo_campanias_bp)
+
+    # --- PERMISOS ---
+    app.register_blueprint(usuarios_hijos_bp)
+    app.register_blueprint(permisos_bp)
+    app.register_blueprint(modulos_bp)
+    app.register_blueprint(acciones_bp)
+    app.register_blueprint(admin_sistema_bp)
+    app.register_blueprint(permisos_internos_bp)
+
+    # --- SINCRONIZACIÓN AUTOMÁTICA ---
+    init_scheduler()
+
     return app
+
 
 app = create_app()
 
+
+# --- PRECALENTAMIENTO EN STARTUP ---
+# Usa Redis para evitar tareas duplicadas en varios workers.
+try:
+    import redis as _redis_startup
+
+    _r_startup = _redis_startup.from_url(
+        os.getenv(
+            'CELERY_BROKER_URL',
+            'redis://localhost:6379/0'
+        ),
+        decode_responses=True,
+        socket_connect_timeout=2
+    )
+
+    if _r_startup.set(
+        'startup_warm_lock',
+        '1',
+        nx=True,
+        ex=60
+    ):
+        from celery_worker import celery_app as _celery
+
+        _celery.send_task(
+            'tasks.precalentar_monitor_async',
+            args=('http://localhost:5000',)
+        )
+
+        import logging as _log_s
+        _log_s.info(
+            'Startup: tarea precalentar_monitor_async enviada a Celery'
+        )
+
+except Exception as _e_warm:
+    import logging as _log_s
+    _log_s.warning(
+        'Startup warm skipped: %s',
+        _e_warm
+    )
+
+
 if __name__ == '__main__':
-    # Usamos socketio.run para mantener compatibilidad con eventlet en el servidor
     socketio.run(
         app,
         host='0.0.0.0',
         port=5000,
         debug=True,
-        use_reloader=False,  # Importante para eventlet
+        use_reloader=False,
         log_output=True,
         allow_unsafe_werkzeug=True
     )

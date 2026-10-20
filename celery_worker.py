@@ -35,6 +35,19 @@ celery_app.conf.update(
     timezone='America/Mexico_City',
     enable_utc=True,
     worker_hijack_root_logger=False,
+    beat_schedule={
+        # Recalienta el caché de detalle-compras-odoo cada 25 min
+        # (TTL del caché es 30 min → siempre llega antes de que expire)
+        'precalentar-monitor-periodico': {
+            'task': 'tasks.precalentar_monitor_async',
+            'schedule': 1500,  # 25 minutos en segundos
+            'args': ('http://localhost:5000',),
+        },
+        'precalentar-series-retroactivos-periodico': {
+            'task': 'tasks.precalentar_series_retroactivos_async',
+            'schedule': 1500,  # 25 min; el TTL de series es de 30 min
+        },
+    },
 )
 
 # ----------------- POOL DE CONEXIONES SMTP -----------------
@@ -141,13 +154,37 @@ def enviar_caratula_pdf_async(data, usuario, historial_id):
         actualizar_estado_historial(historial_id, 'Fallido')
         return {"status": "error", "mensaje": f"Error al enviar email: {str(e)}"}
     
+@celery_app.task(name='tasks.enviar_notificacion_garantia_async')
+def enviar_notificacion_garantia_async(destinatario, folio, asunto, cuerpo_html, cc=None):
+    """Avisa por correo al distribuidor de una novedad en su ticket de garantía
+    (comentario nuevo o cambio de estatus). Via API de Gmail (OAuth2 + Domain-Wide
+    Delegation) -- el login SMTP usuario/contraseña ya no funciona para el
+    Workspace de elitebike-mx.com."""
+    try:
+        from utils.gmail_api import enviar_correo_gmail_api
+        enviar_correo_gmail_api(destinatario, asunto, cuerpo_html, cc=cc)
+        logging.info(f"[{datetime.now()}] Notificación de garantía {folio} enviada a {destinatario}" + (f" (cc: {cc})" if cc else "") + ".")
+        return {"status": "success"}
+    except Exception as e:
+        logging.error(f"[{datetime.now()}] Error notificando garantía {folio} a {destinatario}: {str(e)}")
+        return {"status": "error", "mensaje": str(e)}
+
+
 @celery_app.task(name='tasks.recalcular_previo_async')
 def recalcular_previo_async():
     """
     Tarea asíncrona para recalcular la tabla previo.
     """
     try:
-        logging.info(f"BASE_DIR Celery: {BASE_DIR}")
+        import os
+        import sys
+
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+
+        if base_dir not in sys.path:
+            sys.path.insert(0, base_dir)
+
+        logging.info(f"BASE_DIR Celery: {base_dir}")
         logging.info(f"sys.path Celery: {sys.path}")
 
         from tasks_previo import recalcular_previo
@@ -160,3 +197,122 @@ def recalcular_previo_async():
             "status": "error",
             "mensaje": str(e)
         }
+
+
+@celery_app.task(name='tasks.precalentar_monitor_async')
+def precalentar_monitor_async(host='http://localhost:5000'):
+    """
+    Pre-calienta el caché Redis de detalle-compras-odoo para todos los clientes activos.
+    Se ejecuta periódicamente vía Celery Beat (cada 25 min) para que el TTL de 30 min
+    nunca expire antes de ser renovado — el modal carga al instante desde caché.
+    """
+    import requests as _req
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    import sys as _sys
+    _sys.path.insert(0, BASE_DIR)
+    from db_conexion import obtener_conexion
+    from utils.jwt_utils import generar_token_prewarm_interno
+
+    try:
+        conn = obtener_conexion()
+        cur = conn.cursor(dictionary=True)
+        cur.execute(
+            "SELECT clave FROM clientes "
+            "WHERE clave IS NOT NULL AND clave != '' AND f_inicio IS NOT NULL"
+        )
+        claves = [r['clave'] for r in cur.fetchall()]
+        cur.close()
+        conn.close()
+    except Exception as e:
+        logging.error('precalentar_monitor_async: no se pudo leer clientes: %s', e)
+        return {'status': 'error', 'mensaje': str(e)}
+
+    token = generar_token_prewarm_interno()
+    if not token:
+        logging.warning('precalentar_monitor_async: omitido; no hay administrador activo para autenticarlo')
+        return {'status': 'error', 'mensaje': 'No hay administrador activo para autenticar el precalentamiento'}
+    headers = {'Authorization': f'Bearer {token}'}
+
+    def _cargar(clave):
+        try:
+            _req.get(
+                f'{host}/detalle-compras-odoo',
+                params={'cliente': clave, 'ref_exacta': '1'},
+                headers=headers,
+                timeout=120,
+            )
+            return 'ok'
+        except Exception as _e:
+            logging.warning('precalentar_monitor_async: error clave %s: %s', clave, _e)
+            return 'err'
+
+    ok = err = 0
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        futuros = [pool.submit(_cargar, c) for c in claves]
+        for fut in as_completed(futuros):
+            if fut.result() == 'ok':
+                ok += 1
+            else:
+                err += 1
+
+    logging.info('precalentar_monitor_async: %d OK, %d errores de %d clientes', ok, err, len(claves))
+    return {'status': 'ok', 'clientes': len(claves), 'ok': ok, 'errores': err}
+
+
+@celery_app.task(name='tasks.precalentar_series_retroactivos_async')
+def precalentar_series_retroactivos_async():
+    """Refresca en Redis las series Odoo de clientes de portal activos.
+
+    La tarea usa la misma función de consulta por lotes que la API. Si Redis
+    no está disponible, termina sin tocar Odoo: las peticiones web conservan
+    su fallback directo a Odoo.
+    """
+    from db_conexion import obtener_conexion
+    from services import solicitud_retroactivo_service as retroactivos
+
+    if not retroactivos.cache_series_disponible():
+        return {'status': 'sin_redis', 'clientes': 0, 'ok': 0, 'errores': 0}
+
+    conexion = obtener_conexion()
+    if not conexion:
+        return {'status': 'error', 'mensaje': 'No se pudo conectar a la base de datos.'}
+
+    cursor = conexion.cursor(dictionary=True)
+    try:
+        cursor.execute("""
+            SELECT DISTINCT c.id, c.clave, c.nombre_cliente
+            FROM clientes c
+            INNER JOIN usuarios u ON u.cliente_id = c.id
+            WHERE u.activo = 1
+              AND u.rol_id IN (2, 3)
+              AND c.clave IS NOT NULL AND c.clave != ''
+        """)
+        clientes = cursor.fetchall()
+    except Exception as exc:
+        logging.exception('precalentar_series_retroactivos_async: error al leer clientes')
+        return {'status': 'error', 'mensaje': str(exc)}
+    finally:
+        cursor.close()
+        conexion.close()
+
+    ok = err = 0
+    for cliente in clientes:
+        try:
+            if retroactivos.refrescar_cache_series_entregadas_odoo(
+                cliente['id'], str(cliente['clave']).strip(), cliente.get('nombre_cliente')
+            ):
+                ok += 1
+            else:
+                err += 1
+        except Exception as exc:
+            err += 1
+            logging.warning(
+                'precalentar_series_retroactivos_async: error para cliente_id=%s: %s',
+                cliente['id'], exc,
+            )
+
+    logging.info(
+        'precalentar_series_retroactivos_async: %d OK, %d errores de %d clientes',
+        ok, err, len(clientes),
+    )
+    return {'status': 'ok', 'clientes': len(clientes), 'ok': ok, 'errores': err}

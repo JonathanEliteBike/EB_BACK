@@ -1,12 +1,12 @@
-from flask import Blueprint, jsonify, request
+from flask import Blueprint, jsonify, request, g
 from db_conexion import obtener_conexion
 import jwt
 from datetime import date, datetime
 
-from utils.jwt_utils import verificar_token
+from utils.jwt_utils import verificar_token, SECRET_KEY
+from utils.auth_decorators import requiere_autenticacion, requiere_modulo
 from functools import wraps
-
-SECRET_KEY = "123456"
+from services.proyecciones_service import obtener_prioridad_clientes
 
 clientes_bp = Blueprint('clientes', __name__, url_prefix='')
 
@@ -119,10 +119,10 @@ def buscar_cliente():
         query = """
             SELECT id, clave, evac, nombre_cliente, nivel, f_inicio, f_fin
             FROM clientes
-            WHERE clave = %s OR nombre_cliente = %s
+            WHERE clave = %s OR nombre_cliente LIKE %s
             LIMIT 1
         """
-        cursor.execute(query, (valor, valor))
+        cursor.execute(query, (valor, f'%{valor}%'))
         cliente = cursor.fetchone()
 
         if cliente:
@@ -184,45 +184,115 @@ def agregar_cliente():
 
 @clientes_bp.route('/clientes/editar/<int:id_cliente>', methods=['PUT'])
 def editar_cliente(id_cliente):
-    data = request.get_json()
+    data = request.get_json() or {}
 
     clave = data.get('clave')
-    evac = data.get('evac')  # Changed from zona to evac
+    evac = data.get('evac')
     nombre_cliente = data.get('nombre_cliente')
     nivel = data.get('nivel')
     f_inicio = data.get('f_inicio')
     f_fin = data.get('f_fin')
 
-    if not all([clave, evac, nombre_cliente, nivel, f_inicio, f_fin]):
-        return jsonify({"error": "Todos los campos son obligatorios"}), 400
+    # f_fin puede venir vacío o ser NULL
+    if isinstance(f_fin, str):
+        f_fin = f_fin.strip()
+
+        if f_fin.lower() in ('', 'none', 'null'):
+            f_fin = None
+
+    # f_fin NO es obligatorio
+    if not all([clave, evac, nombre_cliente, nivel, f_inicio]):
+        return jsonify({
+            "error": "Clave, EVAC, nombre, nivel y fecha de inicio son obligatorios"
+        }), 400
 
     conexion = obtener_conexion()
-    cursor = conexion.cursor()
+    cursor = conexion.cursor(dictionary=True)
 
     try:
-        # Verificar que el cliente exista
-        cursor.execute("SELECT id FROM clientes WHERE id = %s", (id_cliente,))
-        if cursor.fetchone() is None:
+        # Leer el estado anterior para mantener `previo` alineado aunque cambie
+        # la clave/nombre y para saber qué Integral puede estar afectada.
+        cursor.execute(
+            """
+            SELECT id, clave, nombre_cliente, nivel, id_grupo
+            FROM clientes
+            WHERE id = %s
+            """,
+            (id_cliente,),
+        )
+        anterior = cursor.fetchone()
+        if anterior is None:
             return jsonify({"error": "Cliente no encontrado"}), 404
 
-        # Actualizar
-        query = """
+        cursor.execute(
+            """
             UPDATE clientes
             SET clave = %s,
-                evac = %s,  # Changed zona to evac
+                evac = %s,
                 nombre_cliente = %s,
                 nivel = %s,
                 f_inicio = %s,
                 f_fin = %s
             WHERE id = %s
-        """
-        cursor.execute(query, (clave, evac, nombre_cliente, nivel, f_inicio, f_fin, id_cliente))
-        conexion.commit()
+            """,
+            (clave, evac, nombre_cliente, nivel, f_inicio, f_fin, id_cliente),
+        )
 
-        return jsonify({"mensaje": "Cliente actualizado exitosamente"}), 200
+        # Mantener la identidad de la fila individual de previo. Las metas no se
+        # toman del request: las determina el servicio MY27 con `clientes.nivel`.
+        cursor.execute(
+            """
+            UPDATE previo
+            SET clave = %s,
+                evac = %s,
+                nombre_cliente = %s
+            WHERE UPPER(TRIM(clave)) = UPPER(TRIM(%s))
+              AND COALESCE(es_integral, 0) = 0
+            """,
+            (clave, evac, nombre_cliente, anterior['clave']),
+        )
+
+        from services.metas_previo_my27_service import (
+            sincronizar_grupos_afectados_my27,
+            sincronizar_metas_cliente_my27,
+        )
+
+        sync_cliente = sincronizar_metas_cliente_my27(
+            conexion,
+            id_cliente,
+            aplicar=True,
+        )
+
+        # Editar el nivel de un miembro puede cambiar la validez/meta de su
+        # Integral dinámica. El miembro conserva SIEMPRE su meta individual de
+        # 1 sucursal; la fila Integral usa la cantidad total de miembros.
+        cursor.execute("SELECT id_grupo FROM clientes WHERE id = %s", (id_cliente,))
+        actual = cursor.fetchone() or {}
+        grupos_afectados = sincronizar_grupos_afectados_my27(
+            conexion,
+            [anterior.get('id_grupo'), actual.get('id_grupo')],
+            aplicar=True,
+        )
+
+        # Recalcular avances y porcentajes usando monitor. También confirma la
+        # transacción completa al terminar correctamente.
+        from routes.monitor_odoo import _recalcular_acumulados_previo
+
+        filas_avances = _recalcular_acumulados_previo(conexion, cursor)
+
+        return jsonify({
+            "mensaje": "Cliente actualizado exitosamente",
+            "sincronizacion_my27": sync_cliente,
+            "integrales_afectadas": grupos_afectados,
+            "filas_avances_actualizadas": filas_avances,
+        }), 200
+
     except Exception as e:
+        if conexion:
+            conexion.rollback()
         print("Error al editar cliente:", str(e))
-        return jsonify({"error": "Error al editar cliente"}), 500
+        return jsonify({"error": "Error al editar cliente", "detalle": str(e)}), 500
+
     finally:
         if cursor:
             cursor.close()
@@ -578,13 +648,31 @@ def obtener_facturas_cliente():
             conexion.close()
 
 @clientes_bp.route('/facturas-grupo/<int:id_grupo>', methods=['GET'])
-@token_required
+@requiere_autenticacion
+@requiere_modulo('usuarios_caratula')
 def obtener_facturas_grupo(id_grupo):
     conexion = None
     cursor = None
     try:
         conexion = obtener_conexion()
         cursor = conexion.cursor(dictionary=True)
+
+        # Roles de portal no pueden reemplazar el grupo de su cliente en la URL.
+        cursor.execute(
+            """
+            SELECT u.rol_id, c.id_grupo
+            FROM usuarios u
+            LEFT JOIN clientes c ON c.id = u.cliente_id
+            WHERE u.id = %s AND u.activo = 1
+            """,
+            (g.usuario_actual['id'],),
+        )
+        contexto = cursor.fetchone()
+        if not contexto:
+            return jsonify({'error': 'Usuario no encontrado o inactivo'}), 401
+        if contexto['rol_id'] in (2, 3):
+            if not contexto.get('id_grupo') or contexto['id_grupo'] != id_grupo:
+                return jsonify({'error': 'No puedes consultar facturas de otro grupo.'}), 403
 
         ## NUEVO: Consulta optimizada con JOIN para filtrar por fecha en una sola operación
         query_facturas = """
@@ -620,3 +708,9 @@ def obtener_facturas_grupo(id_grupo):
             cursor.close()
         if conexion and conexion.is_connected():
             conexion.close()
+
+@clientes_bp.route('/clientes/prioridad', methods=['GET'])
+def obtener_prioridad_clientes_endpoint():
+    """Lista de prioridad de clientes centralizada — fuente única para
+    Proyecciones y Asignaciones de Importaciones (evita copias hardcodeadas)."""
+    return jsonify(obtener_prioridad_clientes()), 200

@@ -2,6 +2,7 @@ from flask import Blueprint, jsonify, request
 from datetime import datetime, timedelta, date
 from decimal import Decimal
 from db_conexion import obtener_conexion
+from utils.jwt_utils import registrar_auditoria
 from datetime import datetime, timedelta
 
 logistica_bp = Blueprint('logistica_bp', __name__, url_prefix='/flujo')
@@ -46,6 +47,10 @@ def crear_embarque():
             data.get('gasto_flete_mxn', 0),
             fecha_pago_impuestos.strftime('%Y-%m-%d') # Dato calculado
         ))
+        registrar_auditoria(
+            cursor, 'INSERT_EMBARQUE', 'embarques_logistica', cursor.lastrowid,
+            f"Embarque {data.get('codigo_embarque') or 'sin código'} registrado"
+        )
         conexion.commit()
         return jsonify({"mensaje": "Embarque e Impuestos calculados exitosamente"}), 201
     except Exception as e:
@@ -123,6 +128,10 @@ def actualizar_embarque(id_embarque):
             fecha_pago_impuestos.strftime('%Y-%m-%d'),
             id_embarque
         ))
+        registrar_auditoria(
+            cursor, 'UPDATE_EMBARQUE', 'embarques_logistica', id_embarque,
+            f"Embarque {data.get('codigo_embarque') or id_embarque} actualizado"
+        )
         conexion.commit()
         return jsonify({"mensaje": "Embarque actualizado y recalculado"}), 200
     except Exception as e:
@@ -140,6 +149,10 @@ def eliminar_embarque(id_embarque):
         conexion = obtener_conexion()
         cursor = conexion.cursor()
         cursor.execute("DELETE FROM embarques_logistica WHERE id_embarque = %s", (id_embarque,))
+        registrar_auditoria(
+            cursor, 'DELETE_EMBARQUE', 'embarques_logistica', id_embarque,
+            f"Embarque {id_embarque} eliminado"
+        )
         conexion.commit()
         return jsonify({"mensaje": "Embarque eliminado correctamente"}), 200
     except Exception as e:

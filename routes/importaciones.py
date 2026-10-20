@@ -1,8 +1,13 @@
+from __future__ import annotations
+
 import json as _json
-from flask import Blueprint, jsonify, request
-from datetime import datetime, date
+import logging
+import re
+from flask import Blueprint, jsonify, request, make_response
+from datetime import datetime, date, timedelta, timezone
 from decimal import Decimal
 from db_conexion import obtener_conexion
+from utils.auth_decorators import requiere_autenticacion, requiere_permiso_interno, requiere_rol
 
 importaciones_bp = Blueprint("importaciones", __name__, url_prefix="/importaciones")
 
@@ -15,10 +20,81 @@ def _serialize(row: dict) -> dict:
             row[k] = float(v)
         elif isinstance(v, (datetime, date)):
             row[k] = v.isoformat()
+    # mysql-connector devuelve columnas JSON como string — parsear aquí
+    if isinstance(row.get("borradores"), str):
+        try:
+            row["borradores"] = _json.loads(row["borradores"])
+        except Exception:
+            row["borradores"] = {}
+    if isinstance(row.get("campos_na"), str):
+        try:
+            row["campos_na"] = _json.loads(row["campos_na"])
+        except Exception:
+            row["campos_na"] = []
     return row
 
 
-def _calc_dias(fecha_desde, fecha_hasta) -> int | None:
+def _es_valor_vacio(v) -> bool:
+    return v in (None, "", "__NA__")
+
+
+_TZ_MX = timezone(timedelta(hours=-6))  # offset fijo: Mexico elimino el horario de verano en 2022
+
+# Un embarque dado de alta ANTES de esta fecha arranco su proceso bajo
+# reglas/plazos que no existian todavia -- marcarlo "atrasado" contra un
+# plazo calculado retroactivamente con los hitos de esta auditoria seria
+# injusto. Fecha de corte = el dia real en que esto se desplego a
+# produccion (mismo valor que FECHA_INICIO_PANORAMA en el frontend).
+FECHA_CORTE_AUDITORIA = date(2026, 10, 1)
+
+
+def _a_date(v) -> date:
+    """Normaliza date/datetime/str ISO a un date plano. datetime.datetime es
+    subclase de datetime.date, asi que un isinstance(v, date) por si solo no
+    basta para distinguir un TIMESTAMP de MySQL (que llega como datetime) de
+    un date real -- hay que revisar datetime primero.
+
+    Los TIMESTAMP que regresa mysql-connector vienen naive (sin tzinfo) en
+    la zona horaria de la sesion de MySQL -- en produccion es UTC
+    (confirmado contra la BD real: @@system_time_zone = UTC), asi que una
+    captura nocturna en hora de Mexico (UTC-6) cae en el dia UTC
+    siguiente si no se convierte antes de quedarse solo con la fecha."""
+    if isinstance(v, datetime):
+        return v.replace(tzinfo=timezone.utc).astimezone(_TZ_MX).date()
+    if isinstance(v, date):
+        return v
+    return date.fromisoformat(str(v)[:10])
+
+
+def _registrar_primera_captura(cursor, importacion_id: int, existing: dict, merged: dict,
+                                campos_a_actualizar: list) -> None:
+    """Inserta en importaciones_historial_campos la PRIMERA vez que cada
+    campo rastreado pasa de vacio a tener valor. No se llama dentro de una
+    transaccion propia -- corre en la misma conexion/commit que el UPDATE
+    principal de actualizar().
+
+    Solo registra columnas en _COLS_PERMITIDAS (los campos capturables del
+    formulario); un valor vacio se define como None, cadena vacia o
+    '__NA__'. Si el campo YA tenia un valor real antes de este guardado, es
+    una correccion, no una primera captura -- no se toca el historial."""
+    for campo in campos_a_actualizar:
+        if campo not in _COLS_PERMITIDAS:
+            continue
+        valor_antes = existing.get(campo)
+        if not _es_valor_vacio(valor_antes):
+            continue
+        valor_despues = merged.get(campo)
+        if _es_valor_vacio(valor_despues):
+            continue
+        cursor.execute(
+            "INSERT INTO importaciones_historial_campos "
+            "(importacion_id, campo, valor_anterior, valor_nuevo) VALUES (%s, %s, %s, %s)",
+            (importacion_id, campo, str(valor_antes) if valor_antes is not None else None,
+             str(valor_despues)),
+        )
+
+
+def _calc_dias(fecha_desde, fecha_hasta):
     if fecha_desde and fecha_hasta:
         try:
             if isinstance(fecha_desde, str):
@@ -31,30 +107,207 @@ def _calc_dias(fecha_desde, fecha_hasta) -> int | None:
     return None
 
 
-def _add_days(fecha, dias: int):
-    if fecha:
-        try:
-            if isinstance(fecha, str):
-                fecha = datetime.strptime(fecha, "%Y-%m-%d").date()
-            from datetime import timedelta
-            return (fecha + timedelta(days=dias)).isoformat()
-        except Exception:
+def _calcular_auditoria(importacion_id: int, conn) -> list[dict]:
+    """Resuelve cada hito activo de importaciones_hitos_auditoria contra su
+    ancla y devuelve el resultado de la auditoria de llenado. Ver
+    docs/superpowers/specs/2026-09-30-auditoria-llenado-embarque-design.md
+    §4 para las 3 reglas de resolucion de fecha esperada."""
+    cursor = conn.cursor(dictionary=True)
+    cursor.execute("SELECT * FROM importaciones WHERE id = %s", (importacion_id,))
+    embarque = cursor.fetchone()
+    if not embarque:
+        return []
+
+    # Embarque anterior a la implementacion: ninguno de sus hitos recibe
+    # veredicto de atraso/adelanto (ver FECHA_CORTE_AUDITORIA arriba). Si
+    # created_at falta (dato corrupto, no deberia pasar en produccion) se
+    # trata como posterior al corte -- no hay base para excluirlo.
+    embarque_anterior_al_corte = (
+        embarque.get("created_at") is not None
+        and _a_date(embarque["created_at"]) < FECHA_CORTE_AUDITORIA
+    )
+
+    # ORDER BY id, no por seccion/orden_hito: el usuario llena los hitos en
+    # el orden en que se los dieron (mezclando secciones), y la vista debe
+    # respetar ese orden de captura -- los hitos se sembraron en ese mismo
+    # orden, asi que su id ascendente ES ese orden original.
+    cursor.execute(
+        "SELECT * FROM importaciones_hitos_auditoria WHERE activo = 1 ORDER BY id"
+    )
+    hitos = cursor.fetchall()
+    if not hitos:
+        return []
+
+    cursor.execute(
+        "SELECT campo, capturado_en FROM importaciones_historial_campos WHERE importacion_id = %s",
+        (importacion_id,),
+    )
+    capturado_en = {}
+    for fila in cursor.fetchall():
+        # Si un campo se capturo mas de una vez por error de datos viejos,
+        # se queda con la mas antigua (la primera captura real).
+        actual = capturado_en.get(fila["campo"])
+        if actual is None or fila["capturado_en"] < actual:
+            capturado_en[fila["campo"]] = fila["capturado_en"]
+
+    # Un campo_dato puede repetirse entre hitos activos por error de
+    # configuracion -- se usa el de menor id como el "dueño" de la fecha
+    # esperada para que otros hitos que anclen en el mismo campo_dato
+    # resuelvan de forma deterministica.
+    hito_por_campo_dato: dict = {}
+    for h in sorted(hitos, key=lambda x: x["id"]):
+        hito_por_campo_dato.setdefault(h["campo_dato"], h)
+
+    # OJO: memoizado por ID de hito, NO por campo_dato. Si dos hitos activos
+    # comparten el mismo campo_dato (config invalida), cada uno igual debe
+    # mostrar SU PROPIA fecha esperada (su propio ancla/dias) en la salida;
+    # solo la resolucion de "quien es el ancla de un dependiente" usa el
+    # hito canonico (hito_por_campo_dato, el de menor id). Memoizar por
+    # campo_dato colapsaria ambos usos y el primero en resolverse "ganaria"
+    # para todos los demas que compartan ese campo_dato.
+    fecha_esperada_resuelta: dict = {}
+
+    def resolver_esperada(hito, visitados=None):
+        hito_id = hito["id"]
+        if hito_id in fecha_esperada_resuelta:
+            return fecha_esperada_resuelta[hito_id]
+        visitados = visitados or set()
+        if hito_id in visitados:
+            fecha_esperada_resuelta[hito_id] = None  # referencia circular -- no resoluble
             return None
-    return None
+        visitados = visitados | {hito_id}
+
+        ancla = hito["campo_ancla"]
+        if not ancla:
+            base = _a_date(embarque["created_at"])
+        elif ancla in hito_por_campo_dato:
+            base = resolver_esperada(hito_por_campo_dato[ancla], visitados)
+            if base is None:
+                fecha_esperada_resuelta[hito_id] = None
+                return None
+        else:
+            # Ancla "disparador": no es un hito con fecha esperada propia --
+            # se usa su fecha REAL capturada, si existe.
+            real_ancla = capturado_en.get(ancla)
+            if real_ancla is None:
+                fecha_esperada_resuelta[hito_id] = None
+                return None
+            base = _a_date(real_ancla)
+
+        resultado = base + timedelta(days=int(hito["dias_esperados"]))
+        fecha_esperada_resuelta[hito_id] = resultado
+        return resultado
+
+    salida = []
+    for hito in hitos:
+        esperada = resolver_esperada(hito)
+        real = capturado_en.get(hito["campo_dato"])
+        real_date = _a_date(real) if real is not None else None
+
+        if embarque_anterior_al_corte:
+            # Se conserva fecha_real si el campo se llego a capturar (la
+            # captura en si es un dato real, pase cuando pase) -- pero sin
+            # fecha_esperada ni veredicto, porque ese plazo se calculo con
+            # reglas que no existian cuando este embarque arranco.
+            estado, dias_diferencia, esperada = "no_aplica", None, None
+        elif esperada is None:
+            estado, dias_diferencia = "pendiente", None
+        elif real_date is None:
+            # No hay registro de CUANDO se llenó, pero puede que el campo ya
+            # tenga un valor de antes de que existiera esta auditoría (dato
+            # capturado antes de que el rastreo de historial arrancara) --
+            # no reportarlo como "en_espera" (daría a entender que sigue
+            # vacío) cuando en realidad ya está lleno, solo que no se sabe
+            # la fecha exacta de captura.
+            if not _es_valor_vacio(embarque.get(hito["campo_dato"])):
+                estado, dias_diferencia = "sin_historial", None
+            else:
+                estado, dias_diferencia = "en_espera", None
+        else:
+            dias_diferencia = (esperada - real_date).days
+            if dias_diferencia > 0:
+                estado = "adelantado"
+            elif dias_diferencia < 0:
+                estado = "atrasado"
+            else:
+                estado = "a_tiempo"
+
+        salida.append({
+            "id": hito["id"], "seccion": hito["seccion"], "orden_hito": hito["orden_hito"],
+            "etiqueta": hito["etiqueta"], "campo_dato": hito["campo_dato"],
+            "fecha_esperada": esperada.isoformat() if esperada else None,
+            "fecha_real": real_date.isoformat() if real_date else None,
+            "estado": estado, "dias_diferencia": dias_diferencia,
+        })
+    return salida
+
+
+def _calcular_auditoria_resumen(conn) -> list[dict]:
+    """Auditoria de TODOS los embarques (menos los eliminados) de un
+    vistazo: para cada uno agrega el conteo por estado y el desglose
+    completo de hitos (mismo shape que _calcular_auditoria), reutilizando
+    _calcular_auditoria() por embarque. El desglose completo es lo que usa
+    el frontend para pintar la tarjeta de pipeline por embarque; el conteo
+    queda para badges/orden rapido."""
+    cursor = conn.cursor(dictionary=True)
+    cursor.execute("""
+        SELECT id, referencia, nombre, created_at FROM importaciones
+        WHERE estado != 'eliminado'
+        ORDER BY created_at DESC
+    """)
+    embarques = cursor.fetchall()
+
+    resumen = []
+    for emb in embarques:
+        if emb.get("created_at") is None:
+            # Dato faltante/corrupto -- se omite esta fila en vez de tumbar
+            # el resumen completo con un 500 por un solo embarque malo.
+            logging.warning(
+                "Embarque %s sin created_at -- omitido del resumen de auditoria", emb.get("id")
+            )
+            continue
+        hitos = _calcular_auditoria(emb["id"], conn)
+        conteo = {
+            "atrasados": 0, "adelantados": 0, "a_tiempo": 0, "pendientes": 0,
+            "en_espera": 0, "sin_historial": 0, "no_aplica": 0,
+        }
+        clave_por_estado = {
+            "atrasado": "atrasados", "adelantado": "adelantados", "a_tiempo": "a_tiempo",
+            "pendiente": "pendientes", "en_espera": "en_espera", "sin_historial": "sin_historial",
+            "no_aplica": "no_aplica",
+        }
+        for h in hitos:
+            clave = clave_por_estado.get(h["estado"])
+            if clave:
+                conteo[clave] += 1
+        resumen.append({
+            "id": emb["id"], "referencia": emb["referencia"], "nombre": emb["nombre"],
+            "creado_en": _a_date(emb["created_at"]).isoformat(),
+            **conteo,
+            "hitos": hitos,
+        })
+    return resumen
+
+
 
 
 # ── Porcentajes de avance por sección ────────────────────────────────────────
 # Campos que cuentan para cada sección (valor no nulo = completado)
 
 CAMPOS_LOGISTICA = [
+    "log_numero_contenedores",                   # cantidad de contenedores del embarque
+    "log_volumen_m3",                            # volumen total de la importación (m³)
+    "log_cantidad_producto",                     # cantidad total de producto del embarque
+    "odoo_importador",                           # pos 1 — Importador (RBF / ROY MORAN)
     "log_fecha_notificacion", "log_fecha_entrega", "log_titulo_correo_salida",
-    "log_titulo_correo_2", "log_confirmacion_enterado", "log_origen", "log_tipo_productos",
+    "log_confirmacion_enterado", "log_origen", "log_tipo_productos",
     "log_fecha_solicitud_cotizaciones", "log_confirmacion_cotizacion",
     "log_costo_flete", "log_fecha_shipping_instructions", "log_confirmacion_booking",
-    "log_fecha_booking", "log_eta_puerto", "log_buque", "log_no_viaje",
+    "log_fecha_booking", "log_buque", "log_no_viaje",
     "log_puerto_salida", "log_contenedor", "log_recepcion_bl_co",
     "log_confirmacion_bl_co", "log_certificado_seguro",
-    "log_recepcion_documentos",
+    "log_envio_certificado",
+    # log_recepcion_documentos moved to CAMPOS_ODOO
 ]
 
 CAMPOS_IMPORTACION = [
@@ -71,7 +324,7 @@ CAMPOS_IMPORTACION = [
     "imp_carta_declaracion_marca", "imp_carta_aplicacion_uva",
     "imp_articulos_verificar", "imp_liberacion_folios",
     "imp_fecha_pago_pedimento", "imp_fecha_traduccion",
-    "imp_fecha_numeros_serie", "imp_carta_porte",
+    "imp_fecha_numeros_serie",
     "imp_fecha_limite_cruce",
 ]
 
@@ -81,52 +334,212 @@ CAMPOS_DESPACHO = [
     "des_fecha_entrega_almacen_prog", "des_lugar_destino", "des_llegada_almacen",
     "des_solicitud_carta_vacio", "des_fecha_lavado",
     "des_entrega_contenedor_naviera", "des_dias_sin_demoras", "des_fecha_limite_naviera",
+    "des_recepcion_eir",
 ]
 
 CAMPOS_ODOO = [
+    "log_recepcion_documentos",
     "odoo_codificacion", "odoo_alta_catalogo", "odoo_alta_precios",
-    "odoo_alta_orden_compra", "odoo_folio_orden",
+    "odoo_folio_orden",
 ]
 
 CAMPOS_ALMACEN = [
     "alm_base_datos_etiquetas", "alm_base_datos_verificacion",
-    "alm_liberacion_etiquetado", "alm_envio_info_uva",
-    "alm_liberacion_uva", "alm_fecha_limite_etiquetado",
+    "alm_fecha_limite_etiquetado",           # moved to pos 3
+    "alm_liberacion_etiquetado",             # pos 4 (N/A supported via campos_na)
+    "alm_liberacion_etiquetado_uva",         # pos 5 (new, N/A supported)
+    "alm_envio_info_uva",
+    "alm_liberacion_uva",
+    "alm_proyectado_dias_etiquetado",        # new user input
+    "alm_inicio_etiquetado",                 # new
+    "alm_terminacion_etiquetado",            # new
+    # alm_real_dias_etiquetado is _CAMPOS_CALC — excluded from CAMPOS_ALMACEN
 ]
 
 CAMPOS_RECEPCION = [
     "rec_cedula_costeo", "rec_recepcion_odoo",
     "rec_folio_compra", "rec_liberacion_verificacion",
+    "rec_liberacion_final",
 ]
 
 CAMPOS_CIERRE = [
     "cie_recepcion_cuenta_gastos", "cie_saldo_favor_elite",
     "cie_liquidado_elite", "cie_saldo_favor_aa", "cie_liquidado_aa",
+    "cie_fecha_pago_elite",
+    "cie_fecha_pago_aa",
+]
+
+CAMPOS_COSTOS = [
+    "cos_tipo_cambio_pedimento", "cos_valor_factura", "cos_cantidad_bicicletas",
+    "cos_flete_internacional_usd", "cos_gastos_forwarder_pesos",
+    "cos_seguro_pesos", "cos_custodia_pesos", "cos_maniobras_pesos",
+    "cos_cargos_adicionales_pesos", "cos_honorarios_pesos",
+    "cos_flete_terrestre_usd", "cos_pernoctas_usd", "cos_paquetexpress_usd",
+    "cos_demoras_usd", "cos_verificacion_pesos", "cos_lavado_contenedor_pesos",
+    "cos_monitoreo_pesos", "cos_impuestos_pagados_pesos", "cos_reconocimiento_aduanero",
+    # Piezas por tipo de caja (cantidad; N/A si no aplica para esa importación)
+    "cos_caja_scott_r24", "cos_caja_scott_r20", "cos_caja_scott_adulto",
+    "cos_caja_scott_tw", "cos_caja_scott_tw_electrica", "cos_caja_megamo_track",
+    "cos_caja_megamo_reason", "cos_caja_megamo_vitae",
+    # Proyección de costos
+    "cos_flete_proyectado_usd", "cos_tipo_cambio_proyectado",
+    "cos_maniobras_proyectado_pesos", "cos_honorarios_proyectado_pesos",
 ]
 
 
-_NO_CUENTA = {None, "", "NO"}
+# Campos "proyectado" (fechas plan) — son columnas editables pero no cuentan
+# para el progreso, por eso no están en las listas CAMPOS_*. Deben permitirse
+# explícitamente en INSERT/UPDATE o se filtran silenciosamente al guardar.
+#
+# log_fecha_booking_prog / imp_llegada_contenedor_prog / des_fecha_cruce_prog /
+# des_fecha_entrega_almacen_prog SÍ están aquí (además de en _CAMPOS_CALC):
+# _recalcular_campos() las sobre-escribe con el cálculo automático SOLO
+# cuando existe una regla en importaciones_tiempos_estimados que matchee
+# origen+producto+vía; si no hay regla, las deja tal cual -- lo que permite
+# capturarlas a mano como excepción (embarques con texto libre en origen/tipo
+# de producto que nunca van a matchear una regla exacta). Ver el incidente
+# 2026-09-23 en docs/superpowers/specs: antes de este comentario estos 4
+# campos NO estaban aquí y _recalcular_campos() los forzaba a NULL cada vez
+# que no había regla, borrando en silencio fechas capturadas a mano.
+_CAMPOS_PROG = [
+    "log_fecha_entrega_prog", "rec_recepcion_odoo_prog",
+    "alm_envio_info_uva_prog", "alm_liberacion_uva_prog",
+    "alm_terminacion_etiquetado_prog",
+    "rec_liberacion_verificacion_prog", "rec_liberacion_final_prog",
+    "log_fecha_booking_prog", "imp_llegada_contenedor_prog",
+    "des_fecha_cruce_prog", "des_fecha_entrega_almacen_prog",
+]
+
+_COLS_PERMITIDAS: set = (
+    set(CAMPOS_LOGISTICA)
+    | set(CAMPOS_IMPORTACION)
+    | set(CAMPOS_DESPACHO)
+    | set(CAMPOS_ODOO)
+    | set(CAMPOS_ALMACEN)
+    | set(CAMPOS_RECEPCION)
+    | set(CAMPOS_CIERRE)
+    | set(CAMPOS_COSTOS)
+    | set(_CAMPOS_PROG)
+    | {
+        "referencia", "nombre", "estado", "via_transporte", "notas",
+    }
+)
+
+_SECCIONES_VALIDAS = {
+    "logistica", "importacion", "despacho", "odoo",
+    "almacen", "recepcion", "cierre",
+    "costos",
+}
+
+_ETAPAS_ORDEN = [
+    ("Entrega",      "log_fecha_entrega"),
+    ("Booking",      "log_fecha_booking"),
+    ("Lleg. Puerto", "imp_llegada_contenedor_puerto"),
+    ("Destino",      "des_fecha_cruce_real"),
+    ("Almacén",      "des_llegada_almacen"),
+    ("Verif.",       "alm_liberacion_uva"),
+    ("Etiq.",        "alm_terminacion_etiquetado"),
+    ("Liberado",     "rec_liberacion_final"),
+]
+
+
+def _estado_actual(r: dict) -> str:
+    """Determina la etapa activa (en curso) del embarque.
+
+    Mismo campo y mismo nombre que su columna correspondiente en la fila de
+    fechas del pipeline del dashboard (PIPELINE_STAGES / STAGE_CAMPO en el
+    frontend) -- así el badge de arriba y la fila de abajo siempre cuentan la
+    misma historia, en el mismo orden: Entrega, Booking, Lleg. Puerto,
+    Destino, Almacén, Verif., Etiq., Liberado.
+    "Rec. Odoo" no se toma en cuenta para esto (pedido explícito), aunque sí
+    se sigue mostrando en la fila de fechas del pipeline.
+
+    El badge se queda en la última etapa con fecha real ya registrada (en
+    verde): solo avanza a la siguiente cuando esa siguiente etapa registra
+    su propia fecha real, no antes."""
+    ultimo_completado = -1
+    for i, (_, campo) in enumerate(_ETAPAS_ORDEN):
+        if r.get(campo):
+            ultimo_completado = i
+
+    if ultimo_completado == -1:
+        return "Pendiente"
+    return _ETAPAS_ORDEN[ultimo_completado][0]
+
+
+# Campos derivados que _recalcular_campos() inyecta en data — deben persistirse
+# en INSERT y UPDATE aunque no estén en _COLS_PERMITIDAS (son cálculos, no input usuario).
+_CAMPOS_CALC = [
+    "log_dias_salida_tras_entrega", "log_dias_transito_maritimo",
+    "imp_dias_libres_almacenaje", "imp_dias_despacho_aduanero",
+    "des_dias_transito_terrestre",
+    "des_fecha_limite_naviera",      # calculada: ETA Puerto + días sin demoras
+    "alm_real_dias_etiquetado",      # calculada: terminación - inicio etiquetado
+    # Fechas proyectadas Booking→Almacén: Entrega + regla de
+    # importaciones_tiempos_estimados (origen + tipo_producto + vía)
+    "log_fecha_booking_prog", "imp_llegada_contenedor_prog",
+    "des_fecha_cruce_prog", "des_fecha_entrega_almacen_prog",
+    # Conversiones USD: pesos / tipo_cambio_pedimento
+    "cos_gastos_forwarder_usd", "cos_seguro_usd", "cos_custodia_usd",
+    "cos_maniobras_usd", "cos_cargos_adicionales_usd", "cos_honorarios_usd",
+    "cos_verificacion_usd", "cos_lavado_contenedor_usd", "cos_monitoreo_usd",
+    "cos_impuestos_pagados_usd", "cos_reconocimiento_aduanero_usd",
+    # Precio por bicicleta por tipo de caja (distribución proporcional por volumen)
+    "cos_precio_bici_scott_r24", "cos_precio_bici_scott_r20",
+    "cos_precio_bici_scott_adulto", "cos_precio_bici_scott_tw",
+    "cos_precio_bici_scott_tw_electrica", "cos_precio_bici_megamo_track",
+    "cos_precio_bici_megamo_reason", "cos_precio_bici_megamo_vitae",
+    "cos_precio_bici_total",
+]
+
+_NO_CUENTA = {None, ""}
 
 def _calcular_progreso(row: dict) -> dict:
+    # Collect all N/A fields (officially saved + draft borradores)
+    campos_na_db = set()
+    raw_na = row.get("campos_na")
+    if raw_na:
+        if isinstance(raw_na, str):
+            try: raw_na = _json.loads(raw_na)
+            except: raw_na = []
+        campos_na_db = set(raw_na if isinstance(raw_na, list) else [])
+
+    borradores = row.get("borradores") or {}
+    if isinstance(borradores, str):
+        try: borradores = _json.loads(borradores)
+        except: borradores = {}
+    na_borradores = {
+        campo
+        for sec in borradores.values()
+        for campo, val in (sec.items() if isinstance(sec, dict) else [])
+        if val == "__NA__"
+    }
+    all_na = campos_na_db | na_borradores
+
     def pct(campos):
         total = len(campos)
-        hechos = sum(1 for c in campos if row.get(c) not in _NO_CUENTA)
+        hechos = sum(
+            1 for c in campos
+            if row.get(c) not in _NO_CUENTA or c in all_na
+        )
         return {"total": total, "completados": hechos, "pct": round(hechos / total * 100) if total else 0}
 
     return {
-        "logistica": pct(CAMPOS_LOGISTICA),
+        "logistica":   pct(CAMPOS_LOGISTICA),
         "importacion": pct(CAMPOS_IMPORTACION),
-        "despacho": pct(CAMPOS_DESPACHO),
-        "odoo": pct(CAMPOS_ODOO),
-        "almacen": pct(CAMPOS_ALMACEN),
-        "recepcion": pct(CAMPOS_RECEPCION),
-        "cierre": pct(CAMPOS_CIERRE),
+        "despacho":    pct(CAMPOS_DESPACHO),
+        "odoo":        pct(CAMPOS_ODOO),
+        "almacen":     pct(CAMPOS_ALMACEN),
+        "recepcion":   pct(CAMPOS_RECEPCION),
+        "cierre":      pct(CAMPOS_CIERRE),
+        "costos":      pct(CAMPOS_COSTOS),
     }
 
 
 # ── Inicializar tablas ────────────────────────────────────────────────────────
 
 @importaciones_bp.route("/inicializar-tablas", methods=["POST"])
+@requiere_autenticacion
 def inicializar_tablas():
     conn = obtener_conexion()
     if not conn:
@@ -146,20 +559,23 @@ def inicializar_tablas():
                 updated_at       TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
 
                 -- PROCESO DE LOGISTICA (22 items)
+                log_numero_contenedores          INT,
+                log_volumen_m3                   DECIMAL(10,3),
+                log_cantidad_producto            INT,
                 log_fecha_notificacion          DATE,
+                log_fecha_entrega_prog          DATE,
                 log_fecha_entrega               DATE,
                 log_titulo_correo_salida        TEXT,
-                log_titulo_correo_2             TEXT,
                 log_confirmacion_enterado       DATE,
                 log_origen                      VARCHAR(100),
                 log_tipo_productos              TEXT,
                 log_fecha_solicitud_cotizaciones DATE,
-                log_confirmacion_cotizacion     TEXT,
+                log_confirmacion_cotizacion     DATE,
                 log_costo_flete                 VARCHAR(255),
                 log_fecha_shipping_instructions DATE,
                 log_confirmacion_booking        DATE,
+                log_fecha_booking_prog          DATE,
                 log_fecha_booking               DATE,
-                log_eta_puerto                  DATE,
                 log_buque                       VARCHAR(255),
                 log_no_viaje                    VARCHAR(100),
                 log_puerto_salida               VARCHAR(100),
@@ -181,6 +597,7 @@ def inicializar_tablas():
                 imp_facturas                    TEXT,
                 imp_series                      VARCHAR(10),
                 imp_solicitud_pago_forwarder    DATE,
+                imp_llegada_contenedor_prog     DATE,
                 imp_llegada_contenedor_puerto   DATE,
                 imp_fecha_limite_cruce          DATE,
                 imp_dias_libres_almacenaje      INT DEFAULT 17,
@@ -210,11 +627,12 @@ def inicializar_tablas():
                 imp_carta_aplicacion_uva        VARCHAR(10),
                 imp_articulos_verificar         TEXT,
                 imp_liberacion_folios           DATE,
-                imp_fecha_pago_pedimento        VARCHAR(100),
+                imp_fecha_pago_pedimento        DATE,
 
                 -- PROCESO DESPACHO Y REGRESO (14 items)
                 des_solicitud_cita_cruce        DATE,
                 des_cita_cruce                  DATE,
+                des_fecha_cruce_prog            DATE,
                 des_fecha_cruce_real            DATE,
                 des_solicitud_pase_maniobras    DATE,
                 des_carta_maniobras             DATE,
@@ -230,26 +648,38 @@ def inicializar_tablas():
                 des_fecha_limite_naviera        DATE,
                 des_recepcion_eir               DATE,
 
-                -- PROCESO ALTA ORDEN EN ODOO (5 items)
+                -- PROCESO ALTA ORDEN EN ODOO (7 items)
+                odoo_importador                 VARCHAR(50),
                 odoo_codificacion               VARCHAR(10),
                 odoo_alta_catalogo              VARCHAR(10),
                 odoo_alta_precios               VARCHAR(10),
                 odoo_alta_orden_compra          DATE,
                 odoo_folio_orden                VARCHAR(255),
 
-                -- PROCESO CON ALMACEN (6 items)
+                -- PROCESO CON ALMACEN (11 items)
                 alm_base_datos_etiquetas        DATE,
                 alm_base_datos_verificacion     DATE,
-                alm_liberacion_etiquetado       DATE,
-                alm_envio_info_uva              DATE,
-                alm_liberacion_uva              DATE,
                 alm_fecha_limite_etiquetado     DATE,
+                alm_liberacion_etiquetado       DATE,
+                alm_liberacion_etiquetado_uva   DATE,
+                alm_envio_info_uva_prog         DATE,
+                alm_envio_info_uva              DATE,
+                alm_liberacion_uva_prog         DATE,
+                alm_liberacion_uva              DATE,
+                alm_proyectado_dias_etiquetado  INT,
+                alm_inicio_etiquetado           DATE,
+                alm_terminacion_etiquetado_prog DATE,
+                alm_terminacion_etiquetado      DATE,
+                alm_real_dias_etiquetado        INT,
 
                 -- PROCESO RECEPCION (4 items)
                 rec_cedula_costeo               VARCHAR(10),
+                rec_recepcion_odoo_prog         DATE,
                 rec_recepcion_odoo              DATE,
-                rec_folio_compra                VARCHAR(100),
+                rec_folio_compra                TEXT,
+                rec_liberacion_verificacion_prog DATE,
                 rec_liberacion_verificacion     DATE,
+                rec_liberacion_final_prog       DATE,
                 rec_liberacion_final            DATE,
 
                 -- CIERRE DE CUENTAS (7 items)
@@ -282,14 +712,241 @@ def inicializar_tablas():
                 cos_impuestos_pagados_pesos     DECIMAL(15,2),
                 cos_reconocimiento_aduanero     DECIMAL(15,2),
 
+                -- Piezas por tipo de caja (INT; NULL = no ingresado, __NA__ → campos_na)
+                cos_caja_scott_r24              INT,
+                cos_caja_scott_r20              INT,
+                cos_caja_scott_adulto           INT,
+                cos_caja_scott_tw               INT,
+                cos_caja_scott_tw_electrica     INT,
+                cos_caja_megamo_track           INT,
+                cos_caja_megamo_reason          INT,
+                cos_caja_megamo_vitae           INT,
+
+                -- Conversiones a USD (calculadas: pesos / tipo_cambio_pedimento)
+                cos_gastos_forwarder_usd        DECIMAL(15,4),
+                cos_seguro_usd                  DECIMAL(15,4),
+                cos_custodia_usd                DECIMAL(15,4),
+                cos_maniobras_usd               DECIMAL(15,4),
+                cos_cargos_adicionales_usd      DECIMAL(15,4),
+                cos_honorarios_usd              DECIMAL(15,4),
+                cos_verificacion_usd            DECIMAL(15,4),
+                cos_lavado_contenedor_usd       DECIMAL(15,4),
+                cos_monitoreo_usd               DECIMAL(15,4),
+                cos_impuestos_pagados_usd       DECIMAL(15,4),
+                cos_reconocimiento_aduanero_usd DECIMAL(15,4),
+
+                -- Precio por bicicleta por tipo de caja (distribución proporcional por volumen)
+                cos_precio_bici_scott_r24          DECIMAL(15,4),
+                cos_precio_bici_scott_r20          DECIMAL(15,4),
+                cos_precio_bici_scott_adulto       DECIMAL(15,4),
+                cos_precio_bici_scott_tw           DECIMAL(15,4),
+                cos_precio_bici_scott_tw_electrica DECIMAL(15,4),
+                cos_precio_bici_megamo_track       DECIMAL(15,4),
+                cos_precio_bici_megamo_reason      DECIMAL(15,4),
+                cos_precio_bici_megamo_vitae       DECIMAL(15,4),
+                cos_precio_bici_total              DECIMAL(15,4),
+
                 -- Notas adicionales
                 notas                           TEXT,
 
                 -- Datos en edicion (no cuentan en porcentajes)
-                borradores                      JSON
+                borradores                      JSON,
+
+                -- N/A fields (campos marcados como No Aplica)
+                campos_na                       JSON
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
         """)
         conn.commit()
+
+        # Migraciones para instancias existentes
+        migraciones = [
+            "ALTER TABLE importaciones ADD COLUMN IF NOT EXISTS log_numero_contenedores INT AFTER via_transporte",
+            "ALTER TABLE importaciones ADD COLUMN IF NOT EXISTS log_volumen_m3 DECIMAL(10,3) AFTER log_numero_contenedores",
+            "ALTER TABLE importaciones ADD COLUMN IF NOT EXISTS log_cantidad_producto INT AFTER log_volumen_m3",
+            "ALTER TABLE importaciones ADD COLUMN IF NOT EXISTS campos_na JSON AFTER borradores",
+            "ALTER TABLE importaciones ADD COLUMN IF NOT EXISTS odoo_importador VARCHAR(50) AFTER odoo_folio_orden",
+            "ALTER TABLE importaciones ADD COLUMN IF NOT EXISTS alm_liberacion_etiquetado_uva DATE AFTER alm_fecha_limite_etiquetado",
+            "ALTER TABLE importaciones ADD COLUMN IF NOT EXISTS alm_proyectado_dias_etiquetado INT AFTER alm_liberacion_etiquetado_uva",
+            "ALTER TABLE importaciones ADD COLUMN IF NOT EXISTS alm_inicio_etiquetado DATE AFTER alm_proyectado_dias_etiquetado",
+            "ALTER TABLE importaciones ADD COLUMN IF NOT EXISTS alm_terminacion_etiquetado_prog DATE AFTER alm_inicio_etiquetado",
+            "ALTER TABLE importaciones ADD COLUMN IF NOT EXISTS alm_terminacion_etiquetado DATE AFTER alm_terminacion_etiquetado_prog",
+            "ALTER TABLE importaciones ADD COLUMN IF NOT EXISTS alm_real_dias_etiquetado INT AFTER alm_terminacion_etiquetado",
+            # Conversiones USD de costos en pesos
+            "ALTER TABLE importaciones ADD COLUMN IF NOT EXISTS cos_gastos_forwarder_usd DECIMAL(15,4) AFTER cos_reconocimiento_aduanero",
+            "ALTER TABLE importaciones ADD COLUMN IF NOT EXISTS cos_seguro_usd DECIMAL(15,4) AFTER cos_gastos_forwarder_usd",
+            "ALTER TABLE importaciones ADD COLUMN IF NOT EXISTS cos_custodia_usd DECIMAL(15,4) AFTER cos_seguro_usd",
+            "ALTER TABLE importaciones ADD COLUMN IF NOT EXISTS cos_maniobras_usd DECIMAL(15,4) AFTER cos_custodia_usd",
+            "ALTER TABLE importaciones ADD COLUMN IF NOT EXISTS cos_cargos_adicionales_usd DECIMAL(15,4) AFTER cos_maniobras_usd",
+            "ALTER TABLE importaciones ADD COLUMN IF NOT EXISTS cos_honorarios_usd DECIMAL(15,4) AFTER cos_cargos_adicionales_usd",
+            "ALTER TABLE importaciones ADD COLUMN IF NOT EXISTS cos_verificacion_usd DECIMAL(15,4) AFTER cos_honorarios_usd",
+            "ALTER TABLE importaciones ADD COLUMN IF NOT EXISTS cos_lavado_contenedor_usd DECIMAL(15,4) AFTER cos_verificacion_usd",
+            "ALTER TABLE importaciones ADD COLUMN IF NOT EXISTS cos_monitoreo_usd DECIMAL(15,4) AFTER cos_lavado_contenedor_usd",
+            "ALTER TABLE importaciones ADD COLUMN IF NOT EXISTS cos_impuestos_pagados_usd DECIMAL(15,4) AFTER cos_monitoreo_usd",
+            "ALTER TABLE importaciones ADD COLUMN IF NOT EXISTS cos_reconocimiento_aduanero_usd DECIMAL(15,4) AFTER cos_impuestos_pagados_usd",
+            # Piezas por tipo de caja
+            "ALTER TABLE importaciones ADD COLUMN IF NOT EXISTS cos_caja_scott_r24 INT AFTER cos_reconocimiento_aduanero",
+            "ALTER TABLE importaciones ADD COLUMN IF NOT EXISTS cos_caja_scott_r20 INT AFTER cos_caja_scott_r24",
+            "ALTER TABLE importaciones ADD COLUMN IF NOT EXISTS cos_caja_scott_adulto INT AFTER cos_caja_scott_r20",
+            "ALTER TABLE importaciones ADD COLUMN IF NOT EXISTS cos_caja_scott_tw INT AFTER cos_caja_scott_adulto",
+            "ALTER TABLE importaciones ADD COLUMN IF NOT EXISTS cos_caja_scott_tw_electrica INT AFTER cos_caja_scott_tw",
+            "ALTER TABLE importaciones ADD COLUMN IF NOT EXISTS cos_caja_megamo_track INT AFTER cos_caja_scott_tw_electrica",
+            "ALTER TABLE importaciones ADD COLUMN IF NOT EXISTS cos_caja_megamo_reason INT AFTER cos_caja_megamo_track",
+            "ALTER TABLE importaciones ADD COLUMN IF NOT EXISTS cos_caja_megamo_vitae INT AFTER cos_caja_megamo_reason",
+            "ALTER TABLE importaciones ADD COLUMN IF NOT EXISTS cos_precio_bici_scott_r24          DECIMAL(15,4) AFTER cos_reconocimiento_aduanero_usd",
+            "ALTER TABLE importaciones ADD COLUMN IF NOT EXISTS cos_precio_bici_scott_r20          DECIMAL(15,4) AFTER cos_precio_bici_scott_r24",
+            "ALTER TABLE importaciones ADD COLUMN IF NOT EXISTS cos_precio_bici_scott_adulto       DECIMAL(15,4) AFTER cos_precio_bici_scott_r20",
+            "ALTER TABLE importaciones ADD COLUMN IF NOT EXISTS cos_precio_bici_scott_tw           DECIMAL(15,4) AFTER cos_precio_bici_scott_adulto",
+            "ALTER TABLE importaciones ADD COLUMN IF NOT EXISTS cos_precio_bici_scott_tw_electrica DECIMAL(15,4) AFTER cos_precio_bici_scott_tw",
+            "ALTER TABLE importaciones ADD COLUMN IF NOT EXISTS cos_precio_bici_megamo_track       DECIMAL(15,4) AFTER cos_precio_bici_scott_tw_electrica",
+            "ALTER TABLE importaciones ADD COLUMN IF NOT EXISTS cos_precio_bici_megamo_reason      DECIMAL(15,4) AFTER cos_precio_bici_megamo_track",
+            "ALTER TABLE importaciones ADD COLUMN IF NOT EXISTS cos_precio_bici_megamo_vitae       DECIMAL(15,4) AFTER cos_precio_bici_megamo_reason",
+            "ALTER TABLE importaciones ADD COLUMN IF NOT EXISTS cos_precio_bici_total              DECIMAL(15,4) AFTER cos_precio_bici_megamo_vitae",
+            "ALTER TABLE importaciones ADD COLUMN IF NOT EXISTS cos_flete_proyectado_usd           DECIMAL(15,2) AFTER cos_precio_bici_total",
+            "ALTER TABLE importaciones ADD COLUMN IF NOT EXISTS cos_tipo_cambio_proyectado         DECIMAL(10,4) AFTER cos_flete_proyectado_usd",
+            "ALTER TABLE importaciones ADD COLUMN IF NOT EXISTS cos_maniobras_proyectado_pesos     DECIMAL(15,2) AFTER cos_tipo_cambio_proyectado",
+            "ALTER TABLE importaciones ADD COLUMN IF NOT EXISTS cos_honorarios_proyectado_pesos    DECIMAL(15,2) AFTER cos_maniobras_proyectado_pesos",
+            "ALTER TABLE importaciones MODIFY COLUMN rec_folio_compra TEXT",
+            "ALTER TABLE importaciones ADD COLUMN IF NOT EXISTS log_fecha_booking_prog DATE AFTER log_confirmacion_booking",
+            "ALTER TABLE importaciones ADD COLUMN IF NOT EXISTS log_fecha_entrega_prog DATE AFTER log_fecha_notificacion",
+            "ALTER TABLE importaciones ADD COLUMN IF NOT EXISTS imp_llegada_contenedor_prog DATE AFTER imp_solicitud_pago_forwarder",
+            "ALTER TABLE importaciones ADD COLUMN IF NOT EXISTS des_fecha_cruce_prog DATE AFTER des_cita_cruce",
+            "ALTER TABLE importaciones ADD COLUMN IF NOT EXISTS rec_recepcion_odoo_prog DATE AFTER rec_cedula_costeo",
+            "ALTER TABLE importaciones ADD COLUMN IF NOT EXISTS rec_liberacion_verificacion_prog DATE AFTER rec_folio_compra",
+            "ALTER TABLE importaciones ADD COLUMN IF NOT EXISTS rec_liberacion_final_prog DATE AFTER rec_liberacion_verificacion",
+            "ALTER TABLE importaciones ADD COLUMN IF NOT EXISTS alm_envio_info_uva_prog DATE AFTER alm_liberacion_etiquetado_uva",
+            "ALTER TABLE importaciones ADD COLUMN IF NOT EXISTS alm_liberacion_uva_prog DATE AFTER alm_envio_info_uva",
+        ]
+        # "ADD COLUMN IF NOT EXISTS" no es fiable en esta instalación (falla con
+        # error de sintaxis 1064 en vez de ser un no-op) — se verifica primero
+        # contra information_schema y solo se ejecuta ADD COLUMN plano para las
+        # columnas que realmente faltan. Los errores reales ya NO se silencian.
+        cursor.execute(
+            "SELECT COLUMN_NAME FROM information_schema.COLUMNS "
+            "WHERE TABLE_NAME = 'importaciones' AND TABLE_SCHEMA = DATABASE()"
+        )
+        columnas_existentes = {row[0] for row in cursor.fetchall()}
+        for sql in migraciones:
+            if "MODIFY COLUMN" in sql:
+                try:
+                    cursor.execute(sql)
+                except Exception as e:
+                    logging.warning("Migración (MODIFY) falló: %s | %s", sql, e)
+                continue
+            m = re.search(r"ADD COLUMN(?: IF NOT EXISTS)?\s+(\w+)", sql)
+            if not m:
+                continue
+            columna = m.group(1)
+            if columna in columnas_existentes:
+                continue
+            sql_plano = sql.replace("IF NOT EXISTS ", "")
+            try:
+                cursor.execute(sql_plano)
+                columnas_existentes.add(columna)
+            except Exception as e:
+                logging.warning("Migración falló: %s | %s", sql_plano, e)
+        conn.commit()
+
+        # Tabla de reglas de tiempos estimados (origen + tipo_producto + vía →
+        # días entre etapas). Alimenta el cálculo automático de las fechas
+        # proyectadas Booking→Almacén en _recalcular_campos().
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS importaciones_tiempos_estimados (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                origen                  VARCHAR(100) NOT NULL,
+                tipo_producto            VARCHAR(100) NOT NULL,
+                via_transporte           VARCHAR(10)  NOT NULL,
+                dias_hasta_booking       INT NOT NULL DEFAULT 0,
+                dias_booking_a_puerto    INT NOT NULL DEFAULT 0,
+                dias_puerto_a_destino    INT NOT NULL DEFAULT 0,
+                dias_destino_a_almacen   INT NOT NULL DEFAULT 0,
+                created_at               TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at               TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                UNIQUE KEY uq_tiempo_estimado (origen, tipo_producto, via_transporte)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+        """)
+        conn.commit()
+
+        # Semilla inicial (solo inserta si la combinación no existe todavía --
+        # nunca pisa una regla que ya haya sido editada desde la pantalla de
+        # Tiempos Estimados).
+        cursor.executemany(
+            "INSERT IGNORE INTO importaciones_tiempos_estimados "
+            "(origen, tipo_producto, via_transporte, dias_hasta_booking, "
+            " dias_booking_a_puerto, dias_puerto_a_destino, dias_destino_a_almacen) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s)",
+            [
+                ("BELGICA",         "Bicicleta",               "MARITIMO", 15, 21, 15, 2),
+                ("ESPAÑA",          "Bicicleta",               "MARITIMO", 15, 21, 15, 2),
+                ("TAIWAN",          "Bicicleta",               "MARITIMO", 15, 23, 15, 2),
+                ("CAMBOYA",         "Bicicleta",               "MARITIMO", 15, 41, 15, 2),
+                ("CHINA",           "Bicicleta",               "MARITIMO", 15, 41, 15, 2),
+                ("ESTADOS UNIDOS",  "Accesorios y Bicicletas", "MARITIMO",  4,  3, 15, 2),
+                ("VIETNAM",         "Bicicleta",               "MARITIMO", 15, 46, 10, 2),
+                # Vía aérea
+                ("BELGICA",         "Bicicleta",               "AEREO",     1,  5, 10, 2),
+                ("ESPAÑA",          "Bicicleta",               "AEREO",     1,  5, 10, 2),
+                ("TAIWAN",          "Bicicleta",               "AEREO",     7,  5, 10, 2),
+                ("ESPAÑA",          "Accesorios",              "AEREO",     1,  5, 12, 2),
+                ("BELGICA",         "Accesorios",              "AEREO",     1,  5, 12, 2),
+                ("ESPAÑA",          "Accesorios y Bicicletas", "AEREO",     1,  5, 12, 2),
+                ("BELGICA",         "Accesorios y Bicicletas", "AEREO",     1,  5, 12, 2),
+                # Bicicleta eléctrica: únicamente España + Aéreo (ver _validar_payload_tiempo)
+                ("ESPAÑA",          "Bicicleta eléctrica",     "AEREO",    10,  7, 10, 2),
+            ],
+        )
+        conn.commit()
+
+        # Historial de primera captura por campo -- alimenta la auditoria de
+        # llenado del embarque. Tabla de proposito general: sirve para estos
+        # hitos y para cualquier auditoria futura ("quien capturo que y
+        # cuando"), no se acopla a los hitos configurados.
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS importaciones_historial_campos (
+                id               INT AUTO_INCREMENT PRIMARY KEY,
+                importacion_id   INT NOT NULL,
+                campo            VARCHAR(100) NOT NULL,
+                valor_anterior   TEXT,
+                valor_nuevo      TEXT,
+                capturado_en     TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                usuario_id       INT,
+                INDEX idx_importacion_campo (importacion_id, campo),
+                FOREIGN KEY (importacion_id) REFERENCES importaciones(id) ON DELETE CASCADE
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+        """)
+        conn.commit()
+
+        # Hitos configurables de la auditoria (seccion -> campo esperado en N
+        # dias desde un ancla). Editable desde /importaciones/hitos-auditoria,
+        # mismo patron que importaciones_tiempos_estimados.
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS importaciones_hitos_auditoria (
+                id               INT AUTO_INCREMENT PRIMARY KEY,
+                seccion          VARCHAR(30) NOT NULL,
+                orden_hito       INT NOT NULL,
+                etiqueta         VARCHAR(150) NOT NULL,
+                campo_dato       VARCHAR(100) NOT NULL,
+                campo_ancla      VARCHAR(100),
+                dias_esperados   INT NOT NULL DEFAULT 0,
+                activo           TINYINT(1) NOT NULL DEFAULT 1,
+                created_at       TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at       TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+        """)
+        conn.commit()
+
+        # Semilla inicial de los 20 hitos -- solo si la tabla todavia esta
+        # vacia, para que correr este endpoint varias veces (ej. en cada
+        # despliegue) nunca duplique filas.
+        cursor.execute("SELECT COUNT(*) FROM importaciones_hitos_auditoria")
+        if cursor.fetchone()[0] == 0:
+            cursor.executemany(
+                "INSERT INTO importaciones_hitos_auditoria "
+                "(seccion, orden_hito, etiqueta, campo_dato, campo_ancla, dias_esperados) "
+                "VALUES (%s, %s, %s, %s, %s, %s)",
+                _HITOS_SEED,
+            )
+            conn.commit()
+
         return jsonify({"ok": True, "mensaje": "Tabla importaciones creada/verificada"}), 201
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -297,9 +954,359 @@ def inicializar_tablas():
         conn.close()
 
 
+# ── Reglas de tiempos estimados (origen+producto+vía → días entre etapas) ───
+# Alimentan el cálculo automático de las fechas proyectadas Booking→Almacén.
+# Pantalla de administración en el frontend: /importaciones/tiempos-estimados
+
+_CAMPOS_TIEMPO = [
+    "dias_hasta_booking", "dias_booking_a_puerto",
+    "dias_puerto_a_destino", "dias_destino_a_almacen",
+]
+
+
+def _validar_payload_tiempo(data: dict) -> str | None:
+    for campo in ("origen", "tipo_producto", "via_transporte"):
+        if not str(data.get(campo) or "").strip():
+            return f"Falta el campo '{campo}'"
+    for campo in _CAMPOS_TIEMPO:
+        try:
+            if int(data.get(campo)) < 0:
+                return f"'{campo}' no puede ser negativo"
+        except (TypeError, ValueError):
+            return f"'{campo}' debe ser un número entero de días"
+
+    # "Bicicleta eléctrica" únicamente se trae de España y por vía aérea (pedido explícito).
+    if str(data.get("tipo_producto") or "").strip() == "Bicicleta eléctrica" and (
+        str(data.get("origen") or "").strip() != "ESPAÑA"
+        or str(data.get("via_transporte") or "").strip() != "AEREO"
+    ):
+        return "'Bicicleta eléctrica' solo aplica para origen ESPAÑA y vía AEREO"
+
+    return None
+
+
+@importaciones_bp.route("/tiempos-estimados", methods=["GET"])
+@requiere_autenticacion
+@requiere_rol(1, 4, 99)
+@requiere_permiso_interno('importaciones', 'ver')
+def listar_tiempos_estimados():
+    conn = obtener_conexion()
+    if not conn:
+        return jsonify({"error": "Sin conexion a BD"}), 500
+    try:
+        cursor = conn.cursor(dictionary=True)
+        cursor.execute(
+            "SELECT * FROM importaciones_tiempos_estimados "
+            "ORDER BY origen, tipo_producto, via_transporte"
+        )
+        return jsonify([_serialize(r) for r in cursor.fetchall()]), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    finally:
+        conn.close()
+
+
+@importaciones_bp.route("/tiempos-estimados", methods=["POST"])
+@requiere_autenticacion
+@requiere_rol(1, 4, 99)
+@requiere_permiso_interno('importaciones', 'crear')
+def crear_tiempo_estimado():
+    data = request.get_json() or {}
+    error = _validar_payload_tiempo(data)
+    if error:
+        return jsonify({"error": error}), 400
+
+    conn = obtener_conexion()
+    if not conn:
+        return jsonify({"error": "Sin conexion a BD"}), 500
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            "INSERT INTO importaciones_tiempos_estimados "
+            "(origen, tipo_producto, via_transporte, dias_hasta_booking, "
+            " dias_booking_a_puerto, dias_puerto_a_destino, dias_destino_a_almacen) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s)",
+            (
+                data["origen"].strip(), data["tipo_producto"].strip(), data["via_transporte"].strip(),
+                int(data["dias_hasta_booking"]), int(data["dias_booking_a_puerto"]),
+                int(data["dias_puerto_a_destino"]), int(data["dias_destino_a_almacen"]),
+            ),
+        )
+        conn.commit()
+        return jsonify({"ok": True, "id": cursor.lastrowid}), 201
+    except Exception as e:
+        if "Duplicate entry" in str(e):
+            return jsonify({"error": "Ya existe una regla para esa combinación de origen, producto y vía"}), 409
+        return jsonify({"error": str(e)}), 500
+    finally:
+        conn.close()
+
+
+@importaciones_bp.route("/tiempos-estimados/<int:id_regla>", methods=["PUT"])
+@requiere_autenticacion
+@requiere_rol(1, 4, 99)
+@requiere_permiso_interno('importaciones', 'editar')
+def actualizar_tiempo_estimado(id_regla):
+    data = request.get_json() or {}
+    error = _validar_payload_tiempo(data)
+    if error:
+        return jsonify({"error": error}), 400
+
+    conn = obtener_conexion()
+    if not conn:
+        return jsonify({"error": "Sin conexion a BD"}), 500
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            "UPDATE importaciones_tiempos_estimados SET "
+            "origen = %s, tipo_producto = %s, via_transporte = %s, "
+            "dias_hasta_booking = %s, dias_booking_a_puerto = %s, "
+            "dias_puerto_a_destino = %s, dias_destino_a_almacen = %s "
+            "WHERE id = %s",
+            (
+                data["origen"].strip(), data["tipo_producto"].strip(), data["via_transporte"].strip(),
+                int(data["dias_hasta_booking"]), int(data["dias_booking_a_puerto"]),
+                int(data["dias_puerto_a_destino"]), int(data["dias_destino_a_almacen"]),
+                id_regla,
+            ),
+        )
+        conn.commit()
+        if cursor.rowcount == 0:
+            return jsonify({"error": "No encontrado"}), 404
+        return jsonify({"ok": True}), 200
+    except Exception as e:
+        if "Duplicate entry" in str(e):
+            return jsonify({"error": "Ya existe una regla para esa combinación de origen, producto y vía"}), 409
+        return jsonify({"error": str(e)}), 500
+    finally:
+        conn.close()
+
+
+@importaciones_bp.route("/tiempos-estimados/<int:id_regla>", methods=["DELETE"])
+@requiere_autenticacion
+@requiere_rol(1, 4, 99)
+@requiere_permiso_interno('importaciones', 'eliminar')
+def eliminar_tiempo_estimado(id_regla):
+    conn = obtener_conexion()
+    if not conn:
+        return jsonify({"error": "Sin conexion a BD"}), 500
+    try:
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM importaciones_tiempos_estimados WHERE id = %s", (id_regla,))
+        conn.commit()
+        if cursor.rowcount == 0:
+            return jsonify({"error": "No encontrado"}), 404
+        return jsonify({"ok": True}), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    finally:
+        conn.close()
+
+
+# ── Hitos de auditoría de llenado (sección → días esperados desde un ancla) ──
+# Alimentan _calcular_auditoria(). Pantalla de administración en el frontend:
+# /importaciones/hitos-auditoria
+
+_SECCIONES_HITOS = {
+    "logistica", "importacion", "despacho", "odoo",
+    "almacen", "recepcion", "cierre", "costos",
+}
+
+# Semilla inicial de los 20 hitos (seccion, orden_hito, etiqueta, campo_dato,
+# campo_ancla, dias_esperados), en el mismo orden en que el usuario los dio
+# -- _calcular_auditoria() lista por id ascendente, así que este orden de
+# inserción ES el orden en que se muestran en el pipeline de auditoría.
+# Sembrada de forma idempotente desde inicializar_tablas() (ver ahí).
+_HITOS_SEED = [
+    ("logistica",    1, "1. Importador",                                   "odoo_importador",              None,                              0),
+    ("costos",       1, "Flete proyectado (USD)",                          "cos_flete_proyectado_usd",     None,                              0),
+    ("logistica",    2, "9. Confirmación de cotización y forwarder",       "log_confirmacion_cotizacion",  None,                              7),
+    ("logistica",    3, "18. Contenedores",                                "log_contenedor",               "log_fecha_entrega",              1),
+    ("importacion",  1, "1. Fecha de entrega de traducción al RBF",        "imp_fecha_traduccion",         "log_fecha_entrega",              10),
+    ("odoo",         1, "1. Recepción de documentos",                      "log_recepcion_documentos",     "log_fecha_entrega",              2),
+    ("odoo",         2, "6. Folios de orden de compra",                    "odoo_folio_orden",             "log_recepcion_documentos",       10),
+    ("importacion",  2, "18. Recepción de draft de pedimento",             "imp_recepcion_draft_pedimento","imp_llegada_contenedor_puerto",  5),
+    ("importacion",  3, "34. Fecha de pago de pedimento",                  "imp_fecha_pago_pedimento",     "imp_pedimento_revisado",         4),
+    ("despacho",     1, "1. Solicitud de cita para cruce",                 "des_solicitud_cita_cruce",     "imp_fecha_pago_pedimento",       1),
+    ("almacen",      1, "1. Base de datos para etiquetas",                 "alm_base_datos_etiquetas",     "imp_fecha_pago_pedimento",       2),
+    ("despacho",     2, "9. Llegada de contenedor a almacén",              "des_llegada_almacen",          "des_fecha_cruce_real",           2),
+    ("despacho",     3, "15. Recepción de documento EIR",                  "des_recepcion_eir",            "des_fecha_cruce_real",           3),
+    ("almacen",      2, "6. Envío de información a la UVA (Real)",         "alm_envio_info_uva",           "des_llegada_almacen",            2),
+    ("almacen",      3, "10. Fecha de terminación de etiquetado (Real)",   "alm_terminacion_etiquetado",   "alm_inicio_etiquetado",          3),
+    ("recepcion",    1, "Cédula de costeo de IGI",                         "rec_cedula_costeo",            "des_llegada_almacen",            2),
+    ("recepcion",    2, "Liberación final del producto",                   "rec_liberacion_final",         "rec_liberacion_verificacion",    1),
+    ("costos",       3, "Costos reales",                                   "cos_tipo_cambio_pedimento",    "des_fecha_cruce_real",           10),
+    ("cierre",       1, "1. Recepción de cuentas de gastos",                "cie_recepcion_cuenta_gastos",  "cos_tipo_cambio_pedimento",       2),
+    ("cierre",       2, "Fecha de pago a agente aduanal",                  "cie_fecha_pago_aa",            "cie_recepcion_cuenta_gastos",    4),
+]
+
+
+def _validar_payload_hito(data: dict) -> str | None:
+    if str(data.get("seccion") or "").strip() not in _SECCIONES_HITOS:
+        return "Sección inválida"
+    if not str(data.get("etiqueta") or "").strip():
+        return "Falta la etiqueta"
+    if str(data.get("campo_dato") or "").strip() not in _COLS_PERMITIDAS:
+        return "'campo_dato' debe ser una columna válida del formulario"
+    campo_ancla = data.get("campo_ancla")
+    if campo_ancla and str(campo_ancla).strip() not in _COLS_PERMITIDAS:
+        return "'campo_ancla' debe ser una columna válida del formulario (o vacío = Alta de embarque)"
+    try:
+        if int(data.get("dias_esperados")) < 0:
+            return "'dias_esperados' no puede ser negativo"
+    except (TypeError, ValueError):
+        return "'dias_esperados' debe ser un número entero de días"
+    try:
+        int(data.get("orden_hito"))
+    except (TypeError, ValueError):
+        return "'orden_hito' debe ser un número entero"
+    return None
+
+
+@importaciones_bp.route("/hitos-auditoria", methods=["GET"])
+@requiere_autenticacion
+@requiere_permiso_interno('importaciones', 'ver')
+def listar_hitos_auditoria():
+    conn = obtener_conexion()
+    if not conn:
+        return jsonify({"error": "Sin conexion a BD"}), 500
+    try:
+        cursor = conn.cursor(dictionary=True)
+        cursor.execute(
+            "SELECT * FROM importaciones_hitos_auditoria ORDER BY seccion, orden_hito"
+        )
+        return jsonify([_serialize(r) for r in cursor.fetchall()]), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    finally:
+        conn.close()
+
+
+@importaciones_bp.route("/hitos-auditoria", methods=["POST"])
+@requiere_autenticacion
+@requiere_permiso_interno('importaciones', 'crear')
+def crear_hito_auditoria():
+    data = request.get_json() or {}
+    error = _validar_payload_hito(data)
+    if error:
+        return jsonify({"error": error}), 400
+
+    conn = obtener_conexion()
+    if not conn:
+        return jsonify({"error": "Sin conexion a BD"}), 500
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            "INSERT INTO importaciones_hitos_auditoria "
+            "(seccion, orden_hito, etiqueta, campo_dato, campo_ancla, dias_esperados, activo) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s)",
+            (
+                data["seccion"].strip(), int(data["orden_hito"]), data["etiqueta"].strip(),
+                data["campo_dato"].strip(),
+                (data.get("campo_ancla") or "").strip() or None,
+                int(data["dias_esperados"]), 1 if data.get("activo", True) else 0,
+            ),
+        )
+        conn.commit()
+        return jsonify({"ok": True, "id": cursor.lastrowid}), 201
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    finally:
+        conn.close()
+
+
+@importaciones_bp.route("/hitos-auditoria/<int:id_hito>", methods=["PUT"])
+@requiere_autenticacion
+@requiere_permiso_interno('importaciones', 'editar')
+def actualizar_hito_auditoria(id_hito):
+    data = request.get_json() or {}
+    error = _validar_payload_hito(data)
+    if error:
+        return jsonify({"error": error}), 400
+
+    conn = obtener_conexion()
+    if not conn:
+        return jsonify({"error": "Sin conexion a BD"}), 500
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            "UPDATE importaciones_hitos_auditoria SET "
+            "seccion = %s, orden_hito = %s, etiqueta = %s, campo_dato = %s, "
+            "campo_ancla = %s, dias_esperados = %s, activo = %s WHERE id = %s",
+            (
+                data["seccion"].strip(), int(data["orden_hito"]), data["etiqueta"].strip(),
+                data["campo_dato"].strip(),
+                (data.get("campo_ancla") or "").strip() or None,
+                int(data["dias_esperados"]), 1 if data.get("activo", True) else 0,
+                id_hito,
+            ),
+        )
+        conn.commit()
+        if cursor.rowcount == 0:
+            return jsonify({"error": "No encontrado"}), 404
+        return jsonify({"ok": True}), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    finally:
+        conn.close()
+
+
+@importaciones_bp.route("/hitos-auditoria/<int:id_hito>", methods=["DELETE"])
+@requiere_autenticacion
+@requiere_permiso_interno('importaciones', 'eliminar')
+def eliminar_hito_auditoria(id_hito):
+    conn = obtener_conexion()
+    if not conn:
+        return jsonify({"error": "Sin conexion a BD"}), 500
+    try:
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM importaciones_hitos_auditoria WHERE id = %s", (id_hito,))
+        conn.commit()
+        if cursor.rowcount == 0:
+            return jsonify({"error": "No encontrado"}), 404
+        return jsonify({"ok": True}), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    finally:
+        conn.close()
+
+
+@importaciones_bp.route("/<int:id_imp>/auditoria", methods=["GET"])
+@requiere_autenticacion
+@requiere_permiso_interno('importaciones', 'ver')
+def obtener_auditoria(id_imp):
+    conn = obtener_conexion()
+    if not conn:
+        return jsonify({"error": "Sin conexion a BD"}), 500
+    try:
+        return jsonify(_calcular_auditoria(id_imp, conn)), 200
+    except Exception as e:
+        logging.exception("Error calculando auditoria del embarque %s: %s", id_imp, e)
+        return jsonify({"error": "No se pudo calcular la auditoría"}), 500
+    finally:
+        conn.close()
+
+
+@importaciones_bp.route("/auditoria-resumen", methods=["GET"])
+@requiere_autenticacion
+@requiere_permiso_interno('importaciones', 'ver')
+def obtener_auditoria_resumen():
+    conn = obtener_conexion()
+    if not conn:
+        return jsonify({"error": "Sin conexion a BD"}), 500
+    try:
+        return jsonify(_calcular_auditoria_resumen(conn)), 200
+    except Exception as e:
+        logging.exception("Error calculando el resumen de auditoria: %s", e)
+        return jsonify({"error": "No se pudo calcular el resumen de auditoría"}), 500
+    finally:
+        conn.close()
+
+
 # ── GET /importaciones  →  lista con resumen de progreso ────────────────────
 
 @importaciones_bp.route("", methods=["GET"])
+@requiere_autenticacion
 def listar():
     conn = obtener_conexion()
     if not conn:
@@ -327,6 +1334,7 @@ def listar():
 # ── GET /importaciones/<id>  →  detalle completo ─────────────────────────────
 
 @importaciones_bp.route("/<int:id_imp>", methods=["GET"])
+@requiere_autenticacion
 def obtener(id_imp):
     conn = obtener_conexion()
     if not conn:
@@ -338,6 +1346,7 @@ def obtener(id_imp):
         if not row:
             return jsonify({"error": "No encontrado"}), 404
         row = _serialize(row)
+        row = _recalcular_campos(row, conn)
         row["progreso"] = _calcular_progreso(row)
         return jsonify(row), 200
     except Exception as e:
@@ -349,11 +1358,28 @@ def obtener(id_imp):
 # ── GET /importaciones/dashboard  →  datos analíticos agregados ──────────────
 
 @importaciones_bp.route("/dashboard", methods=["GET"])
+@requiere_autenticacion
 def dashboard():
+    import unicodedata as _ud
+    _ORIGEN_CANON = {
+        "ESPANA": "ESPAÑA", "ESPAA": "ESPAÑA",
+        "BELGICA": "BÉLGICA", "BLGICA": "BÉLGICA",
+    }
+    def _norm_origen(s):
+        if not s:
+            return ""
+        key = "".join(c for c in _ud.normalize("NFD", s.strip().upper()) if _ud.category(c) != "Mn")
+        # Datos historicos con bytes mal codificados guardaron el acento como
+        # U+FFFD (caracter de reemplazo); se descarta para colapsar las variantes.
+        key = key.replace("�", "").strip()
+        return _ORIGEN_CANON.get(key, key)
+
     via    = request.args.get("via",    "").strip()
     estado = request.args.get("estado", "").strip()
     origen = request.args.get("origen", "").strip()
     anio   = request.args.get("anio",   "").strip()
+    fecha_desde = request.args.get("fecha_desde", "").strip()
+    fecha_hasta = request.args.get("fecha_hasta", "").strip()
 
     conn = obtener_conexion()
     if not conn:
@@ -375,6 +1401,15 @@ def dashboard():
         if anio:
             where.append("YEAR(COALESCE(log_fecha_booking, created_at)) = %s")
             params.append(int(anio))
+        # Rango de fechas (temporada o rango manual) -- aplica a TODO el
+        # dashboard (KPIs, latencias, costos, embarques) porque filtra las
+        # mismas `rows` de las que se derivan todos los cálculos.
+        if fecha_desde:
+            where.append("COALESCE(log_fecha_booking, created_at) >= %s")
+            params.append(fecha_desde)
+        if fecha_hasta:
+            where.append("COALESCE(log_fecha_booking, created_at) <= %s")
+            params.append(fecha_hasta)
 
         w = " AND ".join(where)
         cursor.execute(
@@ -382,6 +1417,21 @@ def dashboard():
             params or []
         )
         rows = [_serialize(r) for r in cursor.fetchall()]
+
+        # Conteo de productos capturados por embarque (Asignaciones de
+        # Importaciones) -- una sola consulta para todos los embarques del
+        # dashboard, evita N+1. Alimenta el botón "Ver Productos" (gris si el
+        # embarque todavía no tiene productos, azul si ya tiene).
+        _productos_count: dict = {}
+        _ids_embarque = [r["id"] for r in rows]
+        if _ids_embarque:
+            placeholders = ",".join(["%s"] * len(_ids_embarque))
+            cursor.execute(
+                f"SELECT importacion_id, COUNT(*) AS n FROM importacion_productos "
+                f"WHERE importacion_id IN ({placeholders}) GROUP BY importacion_id",
+                _ids_embarque,
+            )
+            _productos_count = {row["importacion_id"]: row["n"] for row in cursor.fetchall()}
 
         # ── KPIs ──────────────────────────────────────────────────────────────
         total      = len(rows)
@@ -391,14 +1441,34 @@ def dashboard():
 
         fletes = [float(r["cos_flete_internacional_usd"]) for r in rows if r.get("cos_flete_internacional_usd")]
         flete_total = round(sum(fletes), 2)
-        flete_prom  = round(flete_total / len(fletes), 2) if fletes else 0
 
-        transitos    = [r["log_dias_transito_maritimo"] for r in rows if r.get("log_dias_transito_maritimo")]
-        transito_prom = round(sum(transitos) / len(transitos), 1) if transitos else 0
+        # Flete total separado por vía -- mezclar marítimo y aéreo en un solo
+        # número esconde que son escalas de costo muy distintas.
+        flete_total_maritimo = round(sum(
+            float(r["cos_flete_internacional_usd"]) for r in rows
+            if r.get("cos_flete_internacional_usd") and (r.get("via_transporte") or "MARITIMO") == "MARITIMO"
+        ), 2)
+        flete_total_aereo = round(sum(
+            float(r["cos_flete_internacional_usd"]) for r in rows
+            if r.get("cos_flete_internacional_usd") and r.get("via_transporte") == "AEREO"
+        ), 2)
+
+        # Promedio POR CONTENEDOR, no por embarque -- un embarque de 4 contenedores
+        # no debe pesar igual que uno de 1 al promediar el flete.
+        _fletes_cont = [
+            (float(r["cos_flete_internacional_usd"]), int(r["log_numero_contenedores"]))
+            for r in rows
+            if r.get("cos_flete_internacional_usd") and r.get("log_numero_contenedores")
+        ]
+        _flete_cont_total = sum(f for f, _ in _fletes_cont)
+        _contenedores_total = sum(c for _, c in _fletes_cont)
+        flete_prom = round(_flete_cont_total / _contenedores_total, 2) if _contenedores_total else 0
 
         avances = []
+        _prog_cache: dict = {}
         for r in rows:
             prog = _calcular_progreso(r)
+            _prog_cache[r["id"]] = prog
             t = sum(s["total"] for s in prog.values())
             c = sum(s["completados"] for s in prog.values())
             avances.append(round(c / t * 100) if t else 0)
@@ -414,7 +1484,7 @@ def dashboard():
         # ── Por origen (top 10) ───────────────────────────────────────────────
         por_origen: dict = {}
         for r in rows:
-            o = (r.get("log_origen") or "Sin origen").strip().upper()
+            o = _norm_origen(r.get("log_origen")) or "Sin origen"
             por_origen[o] = por_origen.get(o, 0) + 1
         por_origen_list = sorted(
             [{"origen": k, "count": v} for k, v in por_origen.items()],
@@ -443,16 +1513,30 @@ def dashboard():
                 label = mes_key
             por_mes_list.append({"mes": mes_key, "label": label, **por_mes[mes_key]})
 
-        # ── Flete promedio por vía ────────────────────────────────────────────
-        f_mar = [float(r["cos_flete_internacional_usd"]) for r in rows
-                 if r.get("cos_flete_internacional_usd") and (r.get("via_transporte") or "MARITIMO") == "MARITIMO"]
-        f_aer = [float(r["cos_flete_internacional_usd"]) for r in rows
-                 if r.get("cos_flete_internacional_usd") and r.get("via_transporte") == "AEREO"]
+        # ── Flete promedio por vía (POR CONTENEDOR, no por embarque) ──────────
+        f_mar_cont = [
+            (float(r["cos_flete_internacional_usd"]), int(r["log_numero_contenedores"]))
+            for r in rows
+            if r.get("cos_flete_internacional_usd") and r.get("log_numero_contenedores")
+            and (r.get("via_transporte") or "MARITIMO") == "MARITIMO"
+        ]
+        f_aer_cont = [
+            (float(r["cos_flete_internacional_usd"]), int(r["log_numero_contenedores"]))
+            for r in rows
+            if r.get("cos_flete_internacional_usd") and r.get("log_numero_contenedores")
+            and r.get("via_transporte") == "AEREO"
+        ]
+        _mar_flete_sum = sum(f for f, _ in f_mar_cont)
+        _mar_cont_sum  = sum(c for _, c in f_mar_cont)
+        _aer_flete_sum = sum(f for f, _ in f_aer_cont)
+        _aer_cont_sum  = sum(c for _, c in f_aer_cont)
         flete_por_via = {
-            "maritimo_avg":   round(sum(f_mar) / len(f_mar), 2) if f_mar else 0,
-            "maritimo_count": len(f_mar),
-            "aereo_avg":      round(sum(f_aer) / len(f_aer), 2) if f_aer else 0,
-            "aereo_count":    len(f_aer),
+            "maritimo_avg":          round(_mar_flete_sum / _mar_cont_sum, 2) if _mar_cont_sum else 0,
+            "maritimo_count":        len(f_mar_cont),
+            "maritimo_contenedores": _mar_cont_sum,
+            "aereo_avg":             round(_aer_flete_sum / _aer_cont_sum, 2) if _aer_cont_sum else 0,
+            "aereo_count":           len(f_aer_cont),
+            "aereo_contenedores":    _aer_cont_sum,
         }
 
         # ── Por estado ────────────────────────────────────────────────────────
@@ -462,10 +1546,184 @@ def dashboard():
             por_estado[e] = por_estado.get(e, 0) + 1
         por_estado_list = [{"estado": k, "count": v} for k, v in por_estado.items()]
 
+        # ── Latencias ─────────────────────────────────────────────────────────
+        from datetime import date as _dt, timedelta as _td
+
+        def _lat_dias(row, f_ini, f_fin):
+            a, b = row.get(f_ini), row.get(f_fin)
+            if not a or not b:
+                return None
+            try:
+                def _parse(v):
+                    return v if isinstance(v, _dt) else _dt.fromisoformat(str(v)[:10])
+                return (_parse(b) - _parse(a)).days
+            except Exception:
+                return None
+
+        def _days_between(a, b):
+            if not a or not b: return None
+            try:
+                def _p(v): return v if isinstance(v, _dt) else _dt.fromisoformat(str(v)[:10])
+                return (_p(b) - _p(a)).days
+            except Exception: return None
+
+        def _fmt_d(v): return str(v)[:10] if v else None
+
+        def _campos_na(r):
+            raw = r.get("campos_na")
+            if isinstance(raw, str):
+                try:
+                    return set(_json.loads(raw) or [])
+                except Exception:
+                    return set()
+            if isinstance(raw, list):
+                return set(raw)
+            return set()
+
+        # Tránsito (Resumen): proceso completo, Entrega del proveedor →
+        # Liberación Final -- MISMO tramo para ambas vías (igual que
+        # "lat_total" por embarque), filtrando solo por via_transporte, así
+        # el número de Marítimo y Aéreo se puede comparar directamente.
+        _trans_maritimo = [d for r in rows
+                        if r.get("via_transporte", "MARITIMO") == "MARITIMO"
+                        for d in [_lat_dias(r, "log_fecha_entrega", "rec_liberacion_final")]
+                        if d is not None and d >= 0]
+        transito_prom = round(sum(_trans_maritimo) / len(_trans_maritimo), 1) if _trans_maritimo else None
+
+        _trans_aereo = [d for r in rows
+                        if r.get("via_transporte") == "AEREO"
+                        for d in [_lat_dias(r, "log_fecha_entrega", "rec_liberacion_final")]
+                        if d is not None and d >= 0]
+        transito_aereo_prom = round(sum(_trans_aereo) / len(_trans_aereo), 1) if _trans_aereo else None
+
+        # Total (log_fecha_entrega → rec_liberacion_final)
+        _all_lat = [d for d in (_lat_dias(r, "log_fecha_entrega", "rec_liberacion_final") for r in rows) if d is not None and d >= 0]
+        latencia_total_dias = round(sum(_all_lat) / len(_all_lat), 1) if _all_lat else None
+
+        # Por origen
+        _lo_s: dict = {}; _lo_n: dict = {}
+        for r in rows:
+            d = _lat_dias(r, "log_fecha_entrega", "rec_liberacion_final")
+            if d is not None and d >= 0:
+                o = _norm_origen(r.get("log_origen")) or "Sin origen"
+                _lo_s[o] = _lo_s.get(o, 0) + d; _lo_n[o] = _lo_n.get(o, 0) + 1
+        latencia_x_origen = sorted(
+            [{"origen": o, "dias_promedio": round(_lo_s[o] / _lo_n[o], 1), "n": _lo_n[o]} for o in _lo_s],
+            key=lambda x: -x["dias_promedio"]
+        )
+
+        # Por embarque (total: log_fecha_entrega → rec_liberacion_final)
+        _lat_emb_raw = [(r, _lat_dias(r, "log_fecha_entrega", "rec_liberacion_final")) for r in rows]
+        latencia_x_embarque = sorted(
+            [{"id": r["id"], "referencia": r["referencia"], "nombre": r.get("nombre") or "",
+              "log_origen": _norm_origen(r.get("log_origen")),
+              "fecha_ini": str(r.get("log_fecha_entrega") or "")[:10],
+              "fecha_fin": str(r.get("rec_liberacion_final") or "")[:10],
+              "dias": d}
+             for r, d in _lat_emb_raw if d is not None and d >= 0],
+            key=lambda x: -x["dias"]
+        )
+
+        # Almacén: des_llegada_almacen → rec_recepcion_odoo
+        _d_alm = [d for d in (_lat_dias(r, "des_llegada_almacen", "rec_recepcion_odoo") for r in rows) if d is not None and d >= 0]
+        latencia_almacen = {"dias_promedio": round(sum(_d_alm) / len(_d_alm), 1) if _d_alm else None, "n": len(_d_alm)}
+
+        # Contabilidad: des_fecha_cruce_real → log_recepcion_documentos
+        _d_cont = [d for d in (_lat_dias(r, "des_fecha_cruce_real", "log_recepcion_documentos") for r in rows) if d is not None and d >= 0]
+        latencia_contabilidad = {"dias_promedio": round(sum(_d_cont) / len(_d_cont), 1) if _d_cont else None, "n": len(_d_cont)}
+
+        # Tránsito: log_fecha_entrega → des_llegada_almacen
+        _d_trans = [d for d in (_lat_dias(r, "log_fecha_entrega", "des_llegada_almacen") for r in rows) if d is not None and d >= 0]
+        latencia_transito = {"dias_promedio": round(sum(_d_trans) / len(_d_trans), 1) if _d_trans else None, "n": len(_d_trans)}
+
+        # Almacén x embarque
+        _alm_emb = []
+        for r in rows:
+            d = _lat_dias(r, "des_llegada_almacen", "rec_recepcion_odoo")
+            if d is not None and d >= 0:
+                _alm_emb.append({"id": r["id"], "referencia": r["referencia"], "nombre": r.get("nombre") or "",
+                                  "log_origen": _norm_origen(r.get("log_origen")),
+                                  "fecha_ini": str(r.get("des_llegada_almacen") or "")[:10],
+                                  "fecha_fin": str(r.get("rec_recepcion_odoo") or "")[:10], "dias": d})
+        _alm_emb.sort(key=lambda x: -x["dias"])
+
+        # Contabilidad x embarque
+        _cont_emb = []
+        for r in rows:
+            d = _lat_dias(r, "des_fecha_cruce_real", "log_recepcion_documentos")
+            if d is not None and d >= 0:
+                _cont_emb.append({"id": r["id"], "referencia": r["referencia"], "nombre": r.get("nombre") or "",
+                                   "log_origen": _norm_origen(r.get("log_origen")),
+                                   "fecha_ini": str(r.get("des_fecha_cruce_real") or "")[:10],
+                                   "fecha_fin": str(r.get("log_recepcion_documentos") or "")[:10], "dias": d})
+        _cont_emb.sort(key=lambda x: -x["dias"])
+
+        # Tránsito x embarque
+        _trans_emb = []
+        for r in rows:
+            d = _lat_dias(r, "log_fecha_entrega", "des_llegada_almacen")
+            if d is not None and d >= 0:
+                _trans_emb.append({"id": r["id"], "referencia": r["referencia"], "nombre": r.get("nombre") or "",
+                                   "log_origen": _norm_origen(r.get("log_origen")),
+                                   "fecha_ini": str(r.get("log_fecha_entrega") or "")[:10],
+                                   "fecha_fin": str(r.get("des_llegada_almacen") or "")[:10], "dias": d})
+        _trans_emb.sort(key=lambda x: -x["dias"])
+
+        # Tránsito x importador
+        _lti_s: dict = {}; _lti_n: dict = {}
+        for r in rows:
+            d = _lat_dias(r, "log_fecha_entrega", "des_llegada_almacen")
+            if d is not None and d >= 0:
+                imp = (r.get("odoo_importador") or "Sin importador").strip()
+                _lti_s[imp] = _lti_s.get(imp, 0) + d; _lti_n[imp] = _lti_n.get(imp, 0) + 1
+        latencia_transito_x_importador = sorted(
+            [{"importador": imp, "dias_promedio": round(_lti_s[imp] / _lti_n[imp], 1), "n": _lti_n[imp]} for imp in _lti_s],
+            key=lambda x: x["importador"]
+        )
+
+        # Etiquetado: proyectado vs real
+        _proy_etiq = [r["alm_proyectado_dias_etiquetado"] for r in rows if r.get("alm_proyectado_dias_etiquetado")]
+        _real_etiq = [r["alm_real_dias_etiquetado"] for r in rows if r.get("alm_real_dias_etiquetado")]
+        _etiq_x_emb = []
+        for r in rows:
+            proy = r.get("alm_proyectado_dias_etiquetado")
+            real = r.get("alm_real_dias_etiquetado")
+            if proy is not None or real is not None:
+                _etiq_x_emb.append({
+                    "id":          r["id"],
+                    "referencia":  r["referencia"],
+                    "nombre":      r.get("nombre") or "",
+                    "proyectado":  proy,
+                    "real":        real,
+                    "diferencia":  (real - proy) if (proy is not None and real is not None) else None,
+                })
+        latencia_etiquetado = {
+            "proyectado_promedio": round(sum(_proy_etiq) / len(_proy_etiq), 1) if _proy_etiq else None,
+            "real_promedio":       round(sum(_real_etiq) / len(_real_etiq), 1) if _real_etiq else None,
+            "n_proyectado":        len(_proy_etiq),
+            "n_real":              len(_real_etiq),
+            "x_embarque":         sorted(_etiq_x_emb, key=lambda x: -(x["diferencia"] or 0)),
+        }
+
+        # Costo paquetería x importación (USD) — mismos 11 conceptos que precio/bici
+        _cam_paq = ["cos_maniobras_usd", "cos_cargos_adicionales_usd", "cos_flete_terrestre_usd",
+                    "cos_flete_internacional_usd", "cos_pernoctas_usd", "cos_paquetexpress_usd",
+                    "cos_demoras_usd", "cos_lavado_contenedor_usd", "cos_reconocimiento_aduanero_usd",
+                    "cos_gastos_forwarder_usd", "cos_custodia_usd"]
+        costo_paqueteria = sorted(
+            [{"id": r["id"], "referencia": r["referencia"], "nombre": r.get("nombre") or "",
+              "log_origen": _norm_origen(r.get("log_origen")),
+              "total_usd": round(sum(float(r.get(c) or 0) for c in _cam_paq), 2)}
+             for r in rows],
+            key=lambda x: -x["total_usd"]
+        )
+
         # ── Resumen por embarque ──────────────────────────────────────────────
         embarques_res = []
         for r in rows:
-            prog = _calcular_progreso(r)
+            na_set = _campos_na(r)
+
+            prog = _prog_cache[r["id"]]
             t = sum(s["total"] for s in prog.values())
             c = sum(s["completados"] for s in prog.values())
             pct_global = round(c / t * 100) if t else 0
@@ -490,25 +1748,162 @@ def dashboard():
                 2
             )
 
+            # Costo Real (subconjunto definido para la tarjeta PROY/REAL)
+            costo_real_pesos = round(
+                float(r.get("cos_maniobras_pesos")          or 0) +
+                float(r.get("cos_cargos_adicionales_pesos") or 0) +
+                float(r.get("cos_demoras_usd")              or 0) * tc +
+                float(r.get("cos_lavado_contenedor_pesos")  or 0) +
+                float(r.get("cos_reconocimiento_aduanero")  or 0) +
+                float(r.get("cos_flete_internacional_usd")  or 0) * tc +
+                float(r.get("cos_flete_terrestre_usd")      or 0) * tc +
+                float(r.get("cos_custodia_pesos")           or 0) +
+                float(r.get("cos_paquetexpress_usd")        or 0) * tc +
+                float(r.get("cos_gastos_forwarder_pesos")   or 0) +
+                float(r.get("cos_honorarios_pesos")         or 0),
+                2
+            )
+
+            # Costo Proyectado
+            tc_proy = float(r.get("cos_tipo_cambio_proyectado") or 0)
+            costo_proyectado_pesos = round(
+                float(r.get("cos_flete_proyectado_usd")        or 0) * tc_proy +
+                float(r.get("cos_maniobras_proyectado_pesos")  or 0) +
+                float(r.get("cos_honorarios_proyectado_pesos") or 0),
+                2
+            ) if tc_proy else None
+
+            nbici = r.get("cos_cantidad_bicicletas")
+
             embarques_res.append({
-                "id":                         r["id"],
-                "referencia":                 r["referencia"],
-                "nombre":                     r.get("nombre") or "",
-                "via_transporte":             r.get("via_transporte") or "MARITIMO",
-                "log_origen":                 r.get("log_origen") or "",
-                "estado":                     r.get("estado") or "activo",
-                "pct_global":                 pct_global,
-                "log_fecha_booking":          r.get("log_fecha_booking"),
-                "des_llegada_almacen":        r.get("des_llegada_almacen"),
-                "log_dias_transito_maritimo": r.get("log_dias_transito_maritimo"),
+                "id":                          r["id"],
+                "referencia":                  r["referencia"],
+                "nombre":                      r.get("nombre") or "",
+                "via_transporte":              r.get("via_transporte") or "MARITIMO",
+                "log_origen":                  r.get("log_origen") or "",
+                "log_tipo_productos":          r.get("log_tipo_productos") or "",
+                "log_fecha_notificacion":      _fmt_d(r.get("log_fecha_notificacion")),
+                "estado":                      r.get("estado") or "activo",
+                "pct_global":                  pct_global,
+                "des_llegada_almacen":         r.get("des_llegada_almacen"),
+                "des_fecha_entrega_almacen_prog": r.get("des_fecha_entrega_almacen_prog"),
                 "cos_flete_internacional_usd": float(r["cos_flete_internacional_usd"]) if r.get("cos_flete_internacional_usd") else None,
-                "costo_total_pesos":          costo_total_pesos,
-                "progreso":                   prog,
+                "costo_total_pesos":           costo_total_pesos,
+                "costo_real_pesos":            costo_real_pesos if costo_real_pesos else None,
+                "costo_proyectado_pesos":      costo_proyectado_pesos,
+                "cos_cantidad_bicicletas":     int(nbici) if nbici else None,
+                "costo_por_bicicleta":         round(costo_total_pesos / tc / float(nbici), 2) if nbici and costo_total_pesos and tc else None,
+                "notas":                       r.get("notas") or "",
+                "progreso":                    prog,
+                # Cada etapa muestra el MISMO campo que usa _estado_actual() para
+                # avanzar el badge -- así el pipeline y el badge siempre coinciden.
+                "pipeline": {
+                    "entrega":         {"proy": _fmt_d(r.get("log_fecha_entrega_prog")),           "real": _fmt_d(r.get("log_fecha_entrega")),           "delta": _days_between(r.get("log_fecha_entrega_prog"), r.get("log_fecha_entrega")),                     "na_proy": "log_fecha_entrega_prog" in na_set,           "na_real": "log_fecha_entrega" in na_set},
+                    "booking":         {"proy": _fmt_d(r.get("log_fecha_booking_prog")),           "real": _fmt_d(r.get("log_fecha_booking")),           "delta": _days_between(r.get("log_fecha_booking_prog"), r.get("log_fecha_booking")),                     "na_proy": "log_fecha_booking_prog" in na_set,           "na_real": "log_fecha_booking" in na_set},
+                    "transito":        {"proy": _fmt_d(r.get("imp_llegada_contenedor_prog")),      "real": _fmt_d(r.get("imp_llegada_contenedor_puerto")),"delta": _days_between(r.get("imp_llegada_contenedor_prog"), r.get("imp_llegada_contenedor_puerto")),    "na_proy": "imp_llegada_contenedor_prog" in na_set,      "na_real": "imp_llegada_contenedor_puerto" in na_set},
+                    "trans_dest":      {"proy": _fmt_d(r.get("des_fecha_cruce_prog")),             "real": _fmt_d(r.get("des_fecha_cruce_real")),        "delta": _days_between(r.get("des_fecha_cruce_prog"), r.get("des_fecha_cruce_real")),                     "na_proy": "des_fecha_cruce_prog" in na_set,             "na_real": "des_fecha_cruce_real" in na_set},
+                    "en_almacen":      {"proy": _fmt_d(r.get("des_fecha_entrega_almacen_prog")),   "real": _fmt_d(r.get("des_llegada_almacen")),         "delta": _days_between(r.get("des_fecha_entrega_almacen_prog"), r.get("des_llegada_almacen")),           "na_proy": "des_fecha_entrega_almacen_prog" in na_set,   "na_real": "des_llegada_almacen" in na_set},
+                    "recepcion_odoo":  {"proy": _fmt_d(r.get("rec_recepcion_odoo_prog")),          "real": _fmt_d(r.get("rec_recepcion_odoo")),          "delta": _days_between(r.get("rec_recepcion_odoo_prog"), r.get("rec_recepcion_odoo")),                   "na_proy": "rec_recepcion_odoo_prog" in na_set,          "na_real": "rec_recepcion_odoo" in na_set},
+                    "verif":           {"proy": _fmt_d(r.get("alm_liberacion_uva_prog")),          "real": _fmt_d(r.get("alm_liberacion_uva")),          "delta": _days_between(r.get("alm_liberacion_uva_prog"), r.get("alm_liberacion_uva")),                   "na_proy": "alm_liberacion_uva_prog" in na_set,          "na_real": "alm_liberacion_uva" in na_set},
+                    "liberacion_verif":{"proy": _fmt_d(r.get("rec_liberacion_verificacion_prog")), "real": _fmt_d(r.get("rec_liberacion_verificacion")), "delta": _days_between(r.get("rec_liberacion_verificacion_prog"), r.get("rec_liberacion_verificacion")), "na_proy": "rec_liberacion_verificacion_prog" in na_set, "na_real": "rec_liberacion_verificacion" in na_set},
+                    "etiquetado":      {"proy": _fmt_d(r.get("alm_terminacion_etiquetado_prog")),  "real": _fmt_d(r.get("alm_terminacion_etiquetado")),  "delta": _days_between(r.get("alm_terminacion_etiquetado_prog"), r.get("alm_terminacion_etiquetado")),   "na_proy": "alm_terminacion_etiquetado_prog" in na_set,  "na_real": "alm_terminacion_etiquetado" in na_set},
+                    "liberado":        {"proy": _fmt_d(r.get("rec_liberacion_final_prog")),        "real": _fmt_d(r.get("rec_liberacion_final")),        "delta": _days_between(r.get("rec_liberacion_final_prog"), r.get("rec_liberacion_final")),               "na_proy": "rec_liberacion_final_prog" in na_set,        "na_real": "rec_liberacion_final" in na_set},
+                },
+                "lat_total": _days_between(r.get("log_fecha_entrega"), r.get("rec_liberacion_final")),
+                "estado_actual": _estado_actual(r),
+                "tiene_productos": _productos_count.get(r["id"], 0) > 0,
             })
+
+        # ── Precio por bicicleta promedio x tipo de caja (calculado en tiempo real) ──
+        _CAJAS_DEF = [
+            ("cos_caja_scott_r24",          0.1640, "SCOTT R-24",          "0.164 m³"),
+            ("cos_caja_scott_r20",          0.1360, "SCOTT R-20",          "0.136 m³"),
+            ("cos_caja_scott_adulto",       0.2500, "SCOTT Adulto",        "0.25 m³"),
+            ("cos_caja_scott_tw",           0.4228, "SCOTT TW",            "0.4228 m³"),
+            ("cos_caja_scott_tw_electrica", 0.4500, "SCOTT TW Eléctrica",  "0.45 m³"),
+            ("cos_caja_megamo_track",       0.3200, "Megamo Track/Pulse",  "0.32 m³"),
+            ("cos_caja_megamo_reason",      0.4200, "Megamo Reason/Flame", "0.42 m³"),
+            ("cos_caja_megamo_vitae",       0.4600, "Megamo Vitae",        "0.46 m³"),
+        ]
+        def _precio_bici_row(r):
+            """Calcula precio/bici por modelo para un row desde inputs crudos."""
+            tc = r.get("cos_tipo_cambio_pedimento")
+            try: tc = float(tc) if tc else None
+            except: tc = None
+
+            # Sumar costos de distribución en USD
+            total_usd = 0.0
+            for f in ["cos_flete_terrestre_usd", "cos_flete_internacional_usd",
+                      "cos_pernoctas_usd", "cos_paquetexpress_usd", "cos_demoras_usd"]:
+                try: total_usd += float(r.get(f) or 0)
+                except: pass
+            for campo_p, campo_u in [
+                ("cos_maniobras_pesos",          "cos_maniobras_usd"),
+                ("cos_cargos_adicionales_pesos", "cos_cargos_adicionales_usd"),
+                ("cos_lavado_contenedor_pesos",  "cos_lavado_contenedor_usd"),
+                ("cos_reconocimiento_aduanero",  "cos_reconocimiento_aduanero_usd"),
+                ("cos_gastos_forwarder_pesos",   "cos_gastos_forwarder_usd"),
+                ("cos_custodia_pesos",           "cos_custodia_usd"),
+            ]:
+                v_usd = r.get(campo_u)
+                if v_usd is not None:
+                    try: total_usd += float(v_usd); continue
+                    except: pass    
+                v_pesos = r.get(campo_p)
+                if v_pesos and tc:
+                    try: total_usd += float(v_pesos) / tc
+                    except: pass
+
+            # Cajas activas con cantidad válida
+            cajas_activas = []
+            for campo_c, vol, label, _ in _CAJAS_DEF:
+                raw = r.get(campo_c)
+                if raw is not None and str(raw) != "__NA__":
+                    try:
+                        qty = int(raw)
+                        if qty > 0:
+                            cajas_activas.append((qty, vol, label))
+                    except: pass
+
+            if not cajas_activas or total_usd <= 0:
+                return None
+            total_vol = sum(q * v for q, v, _ in cajas_activas)
+            total_bikes = sum(q for q, _, _ in cajas_activas)
+            model_prices = {
+                label: round((total_usd * (qty * vol) / total_vol) / qty, 4)
+                for qty, vol, label in cajas_activas
+            }
+            return model_prices, round(total_usd / total_bikes, 4)
+
+        # Acumular precio/bici por modelo -- y adjuntar el desglose por caja
+        # también a cada embarque individual (embarques_res está en el mismo
+        # orden y con la misma longitud que rows, un elemento por fila).
+        _model_vals: dict = {}
+        _total_vals: list = []
+        for i, r in enumerate(rows):
+            res = _precio_bici_row(r)
+            if res is None:
+                continue
+            model_prices, total_price = res
+            embarques_res[i]["precio_bici_x_caja"] = model_prices
+            for label, price in model_prices.items():
+                _model_vals.setdefault(label, []).append(price)
+            _total_vals.append(total_price)
+
+        precio_bici_x_caja = []
+        for _, _, label, vol_str in _CAJAS_DEF:
+            vals = _model_vals.get(label, [])
+            if vals:
+                precio_bici_x_caja.append({
+                    "label": label, "vol": vol_str,
+                    "promedio": round(sum(vals) / len(vals), 2),
+                    "n": len(vals),
+                })
+        precio_bici_total_promedio = round(sum(_total_vals) / len(_total_vals), 2) if _total_vals else None
 
         # ── Opciones para filtros ─────────────────────────────────────────────
         all_origenes = sorted({
-            (r.get("log_origen") or "").strip().upper()
+            _norm_origen(r.get("log_origen"))
             for r in rows if r.get("log_origen")
         })
         all_anios = sorted({
@@ -517,15 +1912,20 @@ def dashboard():
             if str(r.get("log_fecha_booking") or r.get("created_at", ""))[:4].isdigit()
         }, reverse=True)
 
-        return jsonify({
+        resp = make_response(jsonify({
             "kpis": {
                 "total":                           total,
                 "activos":                         activos,
                 "cerrados":                        cerrados,
                 "cancelados":                      cancelados,
                 "flete_total_usd":                 flete_total,
+                "flete_total_maritimo_usd":        flete_total_maritimo,
+                "flete_total_aereo_usd":            flete_total_aereo,
                 "flete_promedio_usd":              flete_prom,
                 "transito_maritimo_promedio_dias": transito_prom,
+                "transito_maritimo_n":             len(_trans_maritimo),
+                "transito_aereo_promedio_dias":   transito_aereo_prom,
+                "transito_aereo_n":               len(_trans_aereo),
                 "pct_avance_promedio":             pct_prom,
             },
             "por_via":       por_via_list,
@@ -534,11 +1934,28 @@ def dashboard():
             "flete_por_via": flete_por_via,
             "por_estado":    por_estado_list,
             "embarques":     embarques_res,
+            "latencias": {
+                "total_dias":              latencia_total_dias,
+                "x_origen":               latencia_x_origen,
+                "x_embarque":             latencia_x_embarque,
+                "almacen":                {**latencia_almacen,      "x_embarque": _alm_emb},
+                "contabilidad":           {**latencia_contabilidad, "x_embarque": _cont_emb},
+                "transito":               {**latencia_transito,     "x_embarque": _trans_emb},
+                "transito_x_importador":  latencia_transito_x_importador,
+                "etiquetado":             latencia_etiquetado,
+            },
+            "costo_paqueteria": costo_paqueteria,
+            "precio_bici_x_caja": precio_bici_x_caja,
+            "precio_bici_total_promedio": precio_bici_total_promedio,
             "filtros": {
                 "origenes": all_origenes,
                 "anios":    all_anios,
             },
-        }), 200
+        }))
+        # Dashboard operativo: nunca servir una copia vieja del navegador --
+        # los datos cambian con cada captura y el usuario espera verlas de inmediato.
+        resp.headers["Cache-Control"] = "no-store"
+        return resp, 200
     except Exception as e:
         import traceback
         traceback.print_exc()
@@ -550,6 +1967,7 @@ def dashboard():
 # ── POST /importaciones  →  crear nuevo embarque ─────────────────────────────
 
 @importaciones_bp.route("", methods=["POST"])
+@requiere_autenticacion
 def crear():
     data = request.get_json() or {}
     if not data.get("referencia"):
@@ -560,9 +1978,14 @@ def crear():
         return jsonify({"error": "Sin conexion a BD"}), 500
     try:
         # Calcular campos derivados
-        data = _recalcular_campos(data)
+        data = _recalcular_campos(data, conn)
 
-        cols = [k for k in data if k != "id"]
+        cols = list(dict.fromkeys(
+            [k for k in data if k != "id" and k in _COLS_PERMITIDAS]
+            + [c for c in _CAMPOS_CALC if data.get(c) is not None]
+        ))
+        if not cols:
+            return jsonify({"error": "Sin campos válidos para insertar"}), 400
         placeholders = ", ".join(["%s"] * len(cols))
         col_names = ", ".join(cols)
         vals = [data[c] for c in cols]
@@ -584,6 +2007,7 @@ def crear():
 # ── PUT /importaciones/<id>  →  actualizar campos ────────────────────────────
 
 @importaciones_bp.route("/<int:id_imp>", methods=["PUT"])
+@requiere_autenticacion
 def actualizar(id_imp):
     data = request.get_json() or {}
     data.pop("id", None)
@@ -606,32 +2030,118 @@ def actualizar(id_imp):
             return jsonify({"error": "No encontrado"}), 404
 
         if borrador_seccion:
-            # ── Guardar borrador: solo actualiza JSON, no toca columnas reales ──
-            borradores = _json.loads(existing.get("borradores") or "{}")
-            if borrador_seccion not in borradores:
-                borradores[borrador_seccion] = {}
-            borradores[borrador_seccion].update(data)
-            cursor.execute(
-                "UPDATE importaciones SET borradores = %s WHERE id = %s",
-                (_json.dumps(borradores, ensure_ascii=False), id_imp)
-            )
+            if borrador_seccion not in _SECCIONES_VALIDAS:
+                return jsonify({"error": "Sección de borrador no válida"}), 400
+            if not data:
+                return jsonify({"ok": True, "borrador": True}), 200  # no-op, nothing to save
+
+            # N/A es un estado oficial binario, no un valor a medio llenar --
+            # se aplica siempre a la columna real campos_na, aunque el resto
+            # del guardado sea de borrador. Si esto no se hiciera aquí, marcar
+            # o quitar un N/A desde un guardado de borrador nunca se vería
+            # reflejado fuera del formulario (dashboard, progreso) ni
+            # sobreviviría a volver a abrir el embarque, porque camposNA se
+            # inicializa siempre desde esta columna, no desde borradores.
+            existing_campos_na_raw = existing.get("campos_na") or "[]"
+            if isinstance(existing_campos_na_raw, str):
+                try: existing_campos_na = set(_json.loads(existing_campos_na_raw))
+                except Exception: existing_campos_na = set()
+            elif isinstance(existing_campos_na_raw, list):
+                existing_campos_na = set(existing_campos_na_raw)
+            else:
+                existing_campos_na = set()
+
+            campos_na_cambio = False
+            for campo, valor in data.items():
+                if valor == "__NA__":
+                    if campo not in existing_campos_na:
+                        existing_campos_na.add(campo)
+                        campos_na_cambio = True
+                elif campo in existing_campos_na:
+                    existing_campos_na.discard(campo)
+                    campos_na_cambio = True
+
+            if campos_na_cambio:
+                cursor.execute(
+                    "UPDATE importaciones SET campos_na = %s WHERE id = %s",
+                    (_json.dumps(sorted(existing_campos_na), ensure_ascii=False), id_imp),
+                )
+
+            # Separar: campos que ya tienen valor en DB → actualizar columna directamente (correcciones)
+            #          campos vacíos en DB → guardar en borradores JSON (rellenos nuevos pendientes)
+            directo = {}
+            borrador_data = {}
+            for campo, valor in data.items():
+                val_actual = existing.get(campo)
+                tiene_valor = val_actual is not None and val_actual != "" and val_actual != "__NA__"
+                if tiene_valor and valor != val_actual:
+                    directo[campo] = valor   # corrección de campo existente → columna real
+                else:
+                    borrador_data[campo] = valor  # campo vacío → borrador
+
+            if directo:
+                valid_cols = set(existing.keys())
+                set_parts = [f"`{c}` = %s" for c in directo if c in valid_cols]
+                vals_directo = [directo[c] for c in directo if c in valid_cols]
+                if set_parts:
+                    cursor.execute(
+                        f"UPDATE importaciones SET {', '.join(set_parts)} WHERE id = %s",
+                        vals_directo + [id_imp],
+                    )
+
+            if borrador_data:
+                # Un solo JSON_MERGE_PATCH (no dos anidados): un valor null en
+                # borrador_data debe borrar esa clave dentro de la sección
+                # (RFC 7396) -- si el null se resuelve antes en un merge
+                # interno separado, la clave ya ausente del resultado
+                # intermedio no vuelve a instruir el borrado en el merge
+                # externo, y el valor __NA__ viejo de esa clave sobrevive.
+                cursor.execute(
+                    """UPDATE importaciones SET borradores = JSON_MERGE_PATCH(
+                        COALESCE(borradores, JSON_OBJECT()),
+                        JSON_OBJECT(%s, CAST(%s AS JSON))
+                    ) WHERE id = %s""",
+                    (borrador_seccion, _json.dumps(borrador_data, ensure_ascii=False), id_imp),
+                )
+
             conn.commit()
             return jsonify({"ok": True, "borrador": True}), 200
 
         # ── Guardar oficial: actualiza columnas reales y limpia borradores ──
-        merged = {**{k: v for k, v in existing.items()}, **data}
-        merged = _recalcular_campos(merged)
+        # Separar campos marcados como __NA__ → van a campos_na, se guardan NULL en columna real
+        existing_campos_na_raw = existing.get("campos_na") or "[]"
+        if isinstance(existing_campos_na_raw, str):
+            try: existing_campos_na = set(_json.loads(existing_campos_na_raw))
+            except: existing_campos_na = set()
+        elif isinstance(existing_campos_na_raw, list):
+            existing_campos_na = set(existing_campos_na_raw)
+        else:
+            existing_campos_na = set()
 
-        campos_calc = [
-            "log_dias_salida_tras_entrega", "log_dias_transito_maritimo",
-            "imp_fecha_limite_cruce", "imp_dias_despacho_aduanero",
-            "des_dias_transito_terrestre",
-        ]
-        campos_a_actualizar = list(data.keys()) + [c for c in campos_calc if c not in data]
+        for campo, valor in list(data.items()):
+            if valor == "__NA__":
+                existing_campos_na.add(campo)
+                data[campo] = None  # Store NULL in the actual column
+            elif campo in existing_campos_na:
+                existing_campos_na.discard(campo)  # Real value overrides N/A
+
+        merged = {**{k: v for k, v in existing.items()}, **data}
+        merged = _recalcular_campos(merged, conn)
+
+        campos_a_actualizar = (
+            [c for c in data.keys() if c in _COLS_PERMITIDAS]
+            + [c for c in _CAMPOS_CALC if c not in data]
+        )
         campos_a_actualizar = list(dict.fromkeys(campos_a_actualizar))
+        if not campos_a_actualizar:
+            return jsonify({"error": "Sin campos válidos para actualizar"}), 400
 
         set_clause = ", ".join([f"`{c}` = %s" for c in campos_a_actualizar])
         vals = [merged.get(c) for c in campos_a_actualizar]
+
+        # Always persist campos_na
+        set_clause += ", campos_na = %s"
+        vals.append(_json.dumps(sorted(existing_campos_na), ensure_ascii=False))
 
         if seccion_oficial:
             borradores = _json.loads(existing.get("borradores") or "{}")
@@ -642,7 +2152,52 @@ def actualizar(id_imp):
         vals.append(id_imp)
         cursor.execute(f"UPDATE importaciones SET {set_clause} WHERE id = %s", vals)
         conn.commit()
-        return jsonify({"ok": True}), 200
+
+        # El historial de auditoria es secundario al guardado principal (que
+        # ya tiene commit arriba) -- si esto truena (ej. la tabla todavia no
+        # existe en un servidor donde no se corrio /inicializar-tablas antes
+        # del despliegue), no debe verse como un 500 para quien esta
+        # guardando el formulario, cuyo dato real ya quedo persistido.
+        try:
+            _registrar_primera_captura(cursor, id_imp, existing, merged, campos_a_actualizar)
+            conn.commit()
+        except Exception:
+            logging.exception(
+                "No se pudo registrar el historial de auditoria para importacion %s", id_imp
+            )
+            conn.rollback()
+
+        # ── Auto-transición de estado según progreso global ───────────────────
+        cursor.execute("SELECT * FROM importaciones WHERE id = %s", (id_imp,))
+        saved = cursor.fetchone()
+        if saved:
+            prog   = _calcular_progreso(saved)
+            t      = sum(s["total"]      for s in prog.values())
+            c      = sum(s["completados"] for s in prog.values())
+            pct_g  = round(c / t * 100) if t else 0
+            estado_actual = saved.get("estado") or "activo"
+
+            if pct_g == 100 and estado_actual == "activo":
+                cursor.execute(
+                    "UPDATE importaciones SET estado = 'cerrado' WHERE id = %s", (id_imp,)
+                )
+                conn.commit()
+            elif pct_g < 100 and estado_actual == "cerrado":
+                cursor.execute(
+                    "UPDATE importaciones SET estado = 'activo' WHERE id = %s", (id_imp,)
+                )
+                conn.commit()
+
+        return jsonify({
+            "ok": True,
+            # Fechas proyectadas recién calculadas -- evita un segundo round-trip
+            # al frontend solo para refrescar estos 4 campos de solo lectura.
+            "log_fecha_booking_prog":         merged.get("log_fecha_booking_prog"),
+            "imp_llegada_contenedor_prog":    merged.get("imp_llegada_contenedor_prog"),
+            "des_fecha_cruce_prog":           merged.get("des_fecha_cruce_prog"),
+            "des_fecha_entrega_almacen_prog": merged.get("des_fecha_entrega_almacen_prog"),
+            "tiempos_estimados_faltantes":    merged.get("tiempos_estimados_faltantes", False),
+        }), 200
     except Exception as e:
         conn.rollback()
         return jsonify({"error": str(e)}), 500
@@ -653,6 +2208,7 @@ def actualizar(id_imp):
 # ── DELETE /importaciones/<id>  →  soft delete ───────────────────────────────
 
 @importaciones_bp.route("/<int:id_imp>", methods=["DELETE"])
+@requiere_autenticacion
 def eliminar(id_imp):
     conn = obtener_conexion()
     if not conn:
@@ -676,67 +2232,63 @@ def eliminar(id_imp):
 # ── GET /importaciones/resumen  →  dashboard general ─────────────────────────
 
 @importaciones_bp.route("/resumen", methods=["GET"])
+@requiere_autenticacion
 def resumen():
-    conn = obtener_conexion()
-    if not conn:
-        return jsonify({"error": "Sin conexion a BD"}), 500
-    try:
-        cursor = conn.cursor(dictionary=True)
-        cursor.execute("""
-            SELECT id, referencia, nombre, estado,
-                   log_fecha_booking, log_eta_puerto,
-                   imp_llegada_contenedor_puerto, des_fecha_cruce_real,
-                   des_llegada_almacen, rec_liberacion_final
-            FROM importaciones
-            WHERE estado != 'eliminado'
-            ORDER BY created_at DESC
-        """)
-        rows = cursor.fetchall()
-
-        # Para el resumen necesitamos todos los campos para calcular progreso
-        cursor.execute("SELECT * FROM importaciones WHERE estado != 'eliminado'")
-        todos = {r["id"]: r for r in cursor.fetchall()}
-
-        resultado = []
-        for row in rows:
-            row = _serialize(row)
-            full = _serialize(todos.get(row["id"], {}))
-            row["progreso"] = _calcular_progreso(full)
-            resultado.append(row)
-
-        return jsonify(resultado), 200
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-    finally:
-        conn.close()
+    return listar()
 
 
 # ── lógica de cálculos automáticos ───────────────────────────────────────────
 
-def _recalcular_campos(data: dict) -> dict:
+def _buscar_regla_tiempos(conn, origen, tipo_producto, via_transporte):
+    """Busca en importaciones_tiempos_estimados la regla exacta para esta
+    combinación. None si no hay conexión o no existe ninguna regla configurada."""
+    if not conn:
+        return None
+    try:
+        cur = conn.cursor(dictionary=True)
+        cur.execute(
+            """SELECT dias_hasta_booking, dias_booking_a_puerto,
+                      dias_puerto_a_destino, dias_destino_a_almacen
+               FROM importaciones_tiempos_estimados
+               WHERE origen = %s AND tipo_producto = %s AND via_transporte = %s""",
+            (origen, tipo_producto, via_transporte),
+        )
+        regla = cur.fetchone()
+        cur.close()
+        return regla
+    except Exception as e:
+        logging.warning("No se pudo consultar importaciones_tiempos_estimados: %s", e)
+        return None
+
+
+def _recalcular_campos(data: dict, conn=None) -> dict:
     # Días que tardó en salir (Booking - Fecha de entrega Scott)
     data["log_dias_salida_tras_entrega"] = _calc_dias(
         data.get("log_fecha_entrega"),
         data.get("log_fecha_booking")
     )
 
-    # Días de tránsito marítimo (ETA puerto - Booking)
+    # Días de tránsito marítimo (Llegada contenedor a puerto - Booking)
     data["log_dias_transito_maritimo"] = _calc_dias(
         data.get("log_fecha_booking"),
-        data.get("log_eta_puerto")
+        data.get("imp_llegada_contenedor_puerto")
     )
 
-    # Fecha límite para cruce sin almacenajes (Llegada + días libres)
-    dias_libres = data.get("imp_dias_libres_almacenaje") or 17
-    data["imp_fecha_limite_cruce"] = _add_days(
-        data.get("imp_llegada_contenedor_puerto"),
-        int(dias_libres)
-    )
+    # Días libres en terminal (Fecha límite - Llegada a puerto)
+    fecha_limite = data.get("imp_fecha_limite_cruce")
+    llegada = data.get("imp_llegada_contenedor_puerto")
+    if fecha_limite and llegada:
+        try:
+            fl = date.fromisoformat(str(fecha_limite)[:10])
+            ll = date.fromisoformat(str(llegada)[:10])
+            data["imp_dias_libres_almacenaje"] = (fl - ll).days
+        except Exception:
+            pass
 
-    # Días de despacho aduanero (Pago pedimento - Llegada a puerto)
+    # Días de despacho aduanero (Fecha cruce real - Llegada a puerto)
     data["imp_dias_despacho_aduanero"] = _calc_dias(
         data.get("imp_llegada_contenedor_puerto"),
-        data.get("imp_fecha_pago_pedimento")
+        data.get("des_fecha_cruce_real")
     )
 
     # Días de tránsito terrestre (Llegada almacen - Cruce real)
@@ -744,5 +2296,147 @@ def _recalcular_campos(data: dict) -> dict:
         data.get("des_fecha_cruce_real"),
         data.get("des_llegada_almacen")
     )
+
+    # Fecha límite naviera = Llegada de contenedor a puerto + Días sin demoras
+    # para devolver contenedor (antes usaba log_eta_puerto, eliminado por
+    # duplicar imp_llegada_contenedor_puerto).
+    eta_puerto = data.get("imp_llegada_contenedor_puerto")
+    dias_sin_demoras = data.get("des_dias_sin_demoras")
+    if eta_puerto is not None and dias_sin_demoras is not None:
+        try:
+            eta = date.fromisoformat(str(eta_puerto)[:10])
+            data["des_fecha_limite_naviera"] = (eta + timedelta(days=int(dias_sin_demoras))).isoformat()
+        except Exception:
+            data["des_fecha_limite_naviera"] = None
+    else:
+        data["des_fecha_limite_naviera"] = None
+
+    # Real días de etiquetado = fecha terminación - fecha inicio
+    data["alm_real_dias_etiquetado"] = _calc_dias(
+        data.get("alm_inicio_etiquetado"),
+        data.get("alm_terminacion_etiquetado")
+    )
+
+    # Conversiones USD = pesos / tipo_cambio_pedimento
+    tc = data.get("cos_tipo_cambio_pedimento")
+    _pesos_usd = [
+        ("cos_gastos_forwarder_pesos",   "cos_gastos_forwarder_usd"),
+        ("cos_seguro_pesos",             "cos_seguro_usd"),
+        ("cos_custodia_pesos",           "cos_custodia_usd"),
+        ("cos_maniobras_pesos",          "cos_maniobras_usd"),
+        ("cos_cargos_adicionales_pesos", "cos_cargos_adicionales_usd"),
+        ("cos_honorarios_pesos",         "cos_honorarios_usd"),
+        ("cos_verificacion_pesos",       "cos_verificacion_usd"),
+        ("cos_lavado_contenedor_pesos",  "cos_lavado_contenedor_usd"),
+        ("cos_monitoreo_pesos",          "cos_monitoreo_usd"),
+        ("cos_impuestos_pagados_pesos",  "cos_impuestos_pagados_usd"),
+        ("cos_reconocimiento_aduanero",  "cos_reconocimiento_aduanero_usd"),
+    ]
+    for campo_pesos, campo_usd in _pesos_usd:
+        pesos = data.get(campo_pesos)
+        try:
+            data[campo_usd] = round(float(pesos) / float(tc), 4) if pesos and tc else None
+        except Exception:
+            data[campo_usd] = None
+
+    # ── Precio por bicicleta por tipo de caja ────────────────────────────────
+    # Suma los 11 conceptos de distribución logística (todos ya en USD)
+    _CAMPOS_SUM_USD = [
+        "cos_maniobras_usd", "cos_cargos_adicionales_usd",
+        "cos_flete_terrestre_usd", "cos_flete_internacional_usd",
+        "cos_pernoctas_usd", "cos_paquetexpress_usd",
+        "cos_demoras_usd", "cos_lavado_contenedor_usd",
+        "cos_reconocimiento_aduanero_usd", "cos_gastos_forwarder_usd",
+        "cos_custodia_usd",
+    ]
+    # (campo_cantidad, m³_por_caja, campo_resultado)
+    _CAJAS = [
+        ("cos_caja_scott_r24",          0.1640, "cos_precio_bici_scott_r24"),
+        ("cos_caja_scott_r20",          0.1360, "cos_precio_bici_scott_r20"),
+        ("cos_caja_scott_adulto",       0.2500, "cos_precio_bici_scott_adulto"),
+        ("cos_caja_scott_tw",           0.4228, "cos_precio_bici_scott_tw"),
+        ("cos_caja_scott_tw_electrica", 0.4500, "cos_precio_bici_scott_tw_electrica"),
+        ("cos_caja_megamo_track",       0.3200, "cos_precio_bici_megamo_track"),
+        ("cos_caja_megamo_reason",      0.4200, "cos_precio_bici_megamo_reason"),
+        ("cos_caja_megamo_vitae",       0.4600, "cos_precio_bici_megamo_vitae"),
+    ]
+    total_usd_dist = sum(float(data.get(f) or 0) for f in _CAMPOS_SUM_USD)
+
+    # Cajas activas (con cantidad válida, sin N/A)
+    cajas_activas = []
+    for campo, vol, campo_precio in _CAJAS:
+        raw = data.get(campo)
+        if raw is not None and str(raw) != "__NA__":
+            try:
+                qty = int(raw)
+                if qty > 0:
+                    cajas_activas.append((qty, vol, campo_precio))
+            except Exception:
+                pass
+
+    total_vol = sum(qty * vol for qty, vol, _ in cajas_activas)
+    total_bikes = sum(qty for qty, _, _ in cajas_activas)
+
+    if total_usd_dist > 0 and total_vol > 0:
+        activos_precios = {cp for _, _, cp in cajas_activas}
+        for qty, vol, campo_precio in cajas_activas:
+            pct = (qty * vol) / total_vol
+            data[campo_precio] = round((total_usd_dist * pct) / qty, 4)
+        for _, _, campo_precio in _CAJAS:
+            if campo_precio not in activos_precios:
+                data[campo_precio] = None
+    else:
+        for _, _, campo_precio in _CAJAS:
+            data[campo_precio] = None
+
+    data["cos_precio_bici_total"] = (
+        round(total_usd_dist / total_bikes, 4) if total_usd_dist > 0 and total_bikes > 0 else None
+    )
+
+    # ── Fechas proyectadas Booking→Almacén (solo lectura, calculadas) ──────────
+    # A partir de Entrega (PROYECTADA) + la regla de
+    # importaciones_tiempos_estimados que haga match exacto con origen + tipo
+    # de producto + vía. Toda esta cadena son fechas proyectadas -- se ancla
+    # en la Entrega Proyectada, nunca en la Real (usar la real desfasaba la
+    # cadena completa en cuanto se capturaba, ~10 días en el caso real que lo
+    # evidenció: R26-1545, reportado por el usuario 2026-10-14). Se
+    # recalculan SIEMPRE que se guarde el embarque -- PERO solo se
+    # sobre-escriben cuando SÍ hay una regla que aplique. Si no hay regla, NO
+    # se tocan: muchos embarques (los de antes de que existiera esta función,
+    # con origen/tipo de producto en texto libre) ya traían estas fechas
+    # capturadas a mano, y machacarlas a NULL en cuanto alguien guardaba
+    # cualquier otro campo del embarque las borraba en silencio -- eso pasó
+    # de verdad en producción (ver incidente 2026-09-23, docs/superpowers/specs).
+    entrega       = data.get("log_fecha_entrega_prog")
+    origen        = data.get("log_origen")
+    tipo_producto = data.get("log_tipo_productos")
+    via           = data.get("via_transporte")
+
+    data["tiempos_estimados_faltantes"] = False
+
+    if entrega and origen and tipo_producto and via:
+        regla = _buscar_regla_tiempos(conn, origen, tipo_producto, via)
+        if regla:
+            try:
+                base = date.fromisoformat(str(entrega)[:10])
+                f_booking = base      + timedelta(days=int(regla["dias_hasta_booking"]))
+                f_puerto  = f_booking + timedelta(days=int(regla["dias_booking_a_puerto"]))
+                f_destino = f_puerto  + timedelta(days=int(regla["dias_puerto_a_destino"]))
+                f_almacen = f_destino + timedelta(days=int(regla["dias_destino_a_almacen"]))
+                data["log_fecha_booking_prog"]         = f_booking.isoformat()
+                data["imp_llegada_contenedor_prog"]    = f_puerto.isoformat()
+                data["des_fecha_cruce_prog"]           = f_destino.isoformat()
+                data["des_fecha_entrega_almacen_prog"] = f_almacen.isoformat()
+            except Exception as e:
+                # Fallo real de cálculo (p.ej. Entrega mal formada): no se puede
+                # confiar en el resultado, pero tampoco se borra lo que ya había.
+                logging.warning("Error calculando fechas proyectadas: %s", e)
+        else:
+            # Combinación origen+producto+vía sin regla configurada todavía --
+            # se avisa en la UI, pero NO se toca ningún campo existente.
+            data["tiempos_estimados_faltantes"] = True
+    # Si falta Entrega/origen/producto/vía, o no hay regla, no se tocan estos
+    # campos: en creación quedan como llegaron (None); en edición conservan lo
+    # que ya hubiera en `merged` (valor calculado antes, o capturado a mano).
 
     return data

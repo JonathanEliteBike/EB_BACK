@@ -4,13 +4,23 @@ import logging
 import os
 import uuid
 
-from flask import Blueprint, jsonify, request, send_file, redirect
-from services.s3_service import subir_archivo_s3, generar_url_firmada_s3, existe_archivo_s3
+from datetime import date, datetime, timedelta, timezone
+from functools import wraps
+
+from flask import Blueprint, jsonify, request, send_file, send_from_directory, g
+from services.s3_service import subir_archivo_s3, generar_url_firmada_s3, existe_archivo_s3, descargar_archivo_s3
 from werkzeug.utils import secure_filename
 
 from db_conexion import obtener_conexion
-from services.garantias_service import exportar_excel, get_dashboard_data, invalidar_cache
+from services.garantias_service import exportar_pdf, get_dashboard_data, invalidar_cache
 from utils.jwt_utils import verificar_token
+from utils.auth_decorators import (
+    requiere_autenticacion,
+    requiere_rol,
+    requiere_modulo,
+    requiere_permiso_interno,
+    usuario_actual_tiene_modulo,
+)
 
 garantias_bp = Blueprint("garantias", __name__, url_prefix="/garantias")
 
@@ -19,17 +29,143 @@ os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
 ALLOWED_EXTENSIONS = {'pdf', 'jpg', 'jpeg', 'png', 'gif', 'mp4', 'mov', 'avi', 'webp'}
 
+_STATIC_EMAIL_DIR = os.path.join(os.path.dirname(__file__), '..', 'static', 'email')
+_STATIC_EMAIL_ARCHIVOS = {'logo_elite_icon.png', 'logos-marcas.png'}
+
+
+@garantias_bp.route("/assets/<nombre>", methods=["GET"])
+def servir_asset_email(nombre):
+    """Imagenes de marca (logo, tira de marcas) para los correos de garantias.
+    Publica a proposito -- sin datos de clientes, solo branding -- porque los
+    clientes de correo (Gmail, etc.) cargan imagenes sin poder mandar un token."""
+    if nombre not in _STATIC_EMAIL_ARCHIVOS:
+        return jsonify({"error": "No encontrado"}), 404
+    return send_from_directory(_STATIC_EMAIL_DIR, nombre, max_age=86400)
+
+
+# CDMX no usa horario de verano desde 2022: UTC-6 fijo.
+ZONA_CDMX = timezone(timedelta(hours=-6))
+
+
+def _conexion_garantias():
+    """Conexión con la zona horaria de sesión en CDMX, para que NOW() y los DEFAULT
+    DATETIME de estas tablas guarden la hora local y no la del servidor (UTC)."""
+    conn = obtener_conexion()
+    if conn:
+        cur = conn.cursor()
+        cur.execute("SET time_zone = '-06:00'")
+        cur.close()
+    return conn
+
+
+def _hoy_cdmx():
+    return datetime.now(ZONA_CDMX).date()
+
 
 def allowed_file(filename):
     return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
 
 
+def _requiere_permiso_archivo_garantia(f):
+    """Valida la acción real de una carga de evidencia para el rol interno."""
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        accion = request.form.get('accion')
+        if accion not in {'crear', 'editar'}:
+            return jsonify({
+                "error": "Debe indicar si el archivo corresponde a crear o editar una garantía."
+            }), 400
+
+        try:
+            rol_id = int(g.usuario_actual.get('rol'))
+        except (AttributeError, TypeError, ValueError):
+            return jsonify({"error": "Rol no autorizado."}), 403
+
+        # La capa de permisos internos sólo aplica al rol 4. Los roles de
+        # distribuidores e hijos conservan la validación histórica de módulo
+        # dentro de la función, sin aceptar una acción enviada por el cliente.
+        if rol_id == 4:
+            from services.permisos_internos_service import PermisosInternosService
+
+            permitido = (
+                PermisosInternosService.validar_permiso_usuario(
+                    g.usuario_actual['id'], 'garantias', 'ver'
+                )
+                and PermisosInternosService.validar_permiso_usuario(
+                    g.usuario_actual['id'], 'garantias', accion
+                )
+            )
+            if not permitido:
+                return jsonify({
+                    "error": (
+                        "Acceso denegado: Sin permiso interno de "
+                        f"'{accion}' en 'garantias'."
+                    )
+                }), 403
+
+        return f(*args, **kwargs)
+
+    # Evita que requiere_autenticacion resuelva la operación condicional con
+    # una regla estática del endpoint antes de conocer request.form['accion'].
+    decorated_function._permiso_interno = ('garantias', 'archivo_condicional')
+    return decorated_function
+
+
+def _usuario_actual_puede_ver_formulario(cursor, formulario_id):
+    """Restringe los detalles a los tickets visibles para la cuenta actual."""
+    cursor.execute(
+        "SELECT rol_id, correo, cliente_id FROM usuarios WHERE id = %s AND activo = 1",
+        (g.usuario_actual['id'],),
+    )
+    usuario = cursor.fetchone()
+    if not usuario:
+        return False
+    if usuario['rol_id'] in (1, 4):
+        return True
+
+    nombre_cliente = None
+    if usuario.get('cliente_id'):
+        cursor.execute("SELECT nombre_cliente FROM clientes WHERE id = %s", (usuario['cliente_id'],))
+        cliente = cursor.fetchone()
+        nombre_cliente = cliente['nombre_cliente'] if cliente else None
+
+    if nombre_cliente:
+        cursor.execute(
+            "SELECT 1 FROM garantia_formularios WHERE id = %s AND (email = %s OR distribuidor = %s)",
+            (formulario_id, usuario['correo'], nombre_cliente),
+        )
+    else:
+        cursor.execute(
+            "SELECT 1 FROM garantia_formularios WHERE id = %s AND email = %s",
+            (formulario_id, usuario['correo']),
+        )
+    return bool(cursor.fetchone())
+
+
+def _usuario_actual_puede_descargar_archivo(cursor, nombre_archivo):
+    """Comprueba que el archivo solicitado esté ligado a un ticket visible."""
+    cursor.execute(
+        "SELECT id FROM garantia_formularios WHERE datos LIKE %s",
+        (f"%{nombre_archivo}%",),
+    )
+    formularios = cursor.fetchall()
+    return any(
+        _usuario_actual_puede_ver_formulario(cursor, formulario['id'])
+        for formulario in formularios
+    )
+
+
 # ── Dashboard (existing) ─────────────────────────────────────────────────────
 
 @garantias_bp.route("/dashboard", methods=["GET"])
+@requiere_autenticacion
+@requiere_rol(1)
+@requiere_permiso_interno("garantias", "ver")
 def dashboard():
     try:
-        data = get_dashboard_data()
+        desde = request.args.get('desde') or None
+        hasta = request.args.get('hasta') or None
+        data = get_dashboard_data(desde, hasta)
         return jsonify(data)
     except Exception as e:
         logging.exception("Error en /garantias/dashboard: %s", e)
@@ -37,23 +173,33 @@ def dashboard():
 
 
 @garantias_bp.route("/exportar", methods=["GET"])
+@requiere_autenticacion
+@requiere_rol(1)
+@requiere_permiso_interno("garantias", "ver")
 def exportar():
     try:
-        excel_bytes = exportar_excel()
-        buf = io.BytesIO(excel_bytes)
+        distribuidor = request.args.get('distribuidor') or None
+        desde = request.args.get('desde') or None
+        hasta = request.args.get('hasta') or None
+        pdf_bytes = exportar_pdf(distribuidor, desde, hasta)
+        buf = io.BytesIO(pdf_bytes)
         buf.seek(0)
+        nombre = "garantias.pdf" if not distribuidor else f"garantias_{secure_filename(distribuidor)}.pdf"
         return send_file(
             buf,
             as_attachment=True,
-            download_name="garantias.xlsx",
-            mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            download_name=nombre,
+            mimetype="application/pdf",
         )
     except Exception as e:
-        logging.exception("Error al exportar garantias Excel: %s", e)
-        return jsonify({"error": "Error al generar Excel"}), 500
+        logging.exception("Error al exportar garantias PDF: %s", e)
+        return jsonify({"error": "Error al generar PDF"}), 500
 
 
 @garantias_bp.route("/refrescar", methods=["POST"])
+@requiere_autenticacion
+@requiere_rol(1)
+@requiere_permiso_interno("garantias", "editar")
 def refrescar():
     invalidar_cache()
     return jsonify({"ok": True, "mensaje": "Cache invalidado"})
@@ -62,8 +208,10 @@ def refrescar():
 # ── DB initialization ─────────────────────────────────────────────────────────
 
 @garantias_bp.route("/inicializar-tablas", methods=["POST"])
+@requiere_autenticacion
+@requiere_rol(1)
 def inicializar_tablas():
-    conn = obtener_conexion()
+    conn = _conexion_garantias()
     if not conn:
         return jsonify({"error": "Sin conexion a BD"}), 500
     try:
@@ -102,6 +250,28 @@ def inicializar_tablas():
                 INDEX idx_formulario (formulario_id)
             ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci
         """)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS garantia_piezas (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                nombre VARCHAR(200) NOT NULL UNIQUE,
+                activo TINYINT(1) DEFAULT 1,
+                fecha_creacion DATETIME DEFAULT NOW()
+            ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci
+        """)
+        conn.commit()
+        # Sembrar piezas por defecto si la tabla está vacía
+        cursor.execute("SELECT COUNT(*) as cnt FROM garantia_piezas")
+        if cursor.fetchone()['cnt'] == 0:
+            piezas_default = [
+                'N/A', 'ASIENTO', 'BATERIA', 'CUADRO', 'DROPPER', 'DROPPER POST',
+                'FRENOS', 'GOOGLES', 'GUANTES', 'HANGER', 'LLANTA', 'MANDO E-BIKE',
+                'MAUBRIO', 'POTENCIA', 'RINES', 'SUSPENSION', 'TRANSMISION',
+                'TWINLOCK', 'UNIDAD MOTRIZ', 'ZAPATOS',
+            ]
+            for p in piezas_default:
+                cursor.execute("INSERT IGNORE INTO garantia_piezas (nombre) VALUES (%s)", (p,))
+            conn.commit()
+
         # Columnas de seguimiento ampliado — se agregan si no existen
         for col_sql in [
             "ALTER TABLE garantia_formularios ADD COLUMN estatus_pieza VARCHAR(50) DEFAULT 'Sin pieza'",
@@ -109,12 +279,31 @@ def inicializar_tablas():
             "ALTER TABLE garantia_formularios ADD COLUMN serie_validada TINYINT(1) DEFAULT 0",
             "ALTER TABLE garantia_formularios ADD COLUMN validacion_docs_json LONGTEXT DEFAULT NULL",
             "ALTER TABLE garantia_formularios ADD COLUMN pieza_reemplazo VARCHAR(100) DEFAULT NULL",
+            "ALTER TABLE garantia_formularios ADD COLUMN fecha_estatus DATE DEFAULT NULL",
+            "ALTER TABLE garantia_formularios ADD COLUMN fecha_pieza DATE DEFAULT NULL",
+            "ALTER TABLE garantia_formularios ADD COLUMN clave_distribuidor VARCHAR(10) DEFAULT NULL",
         ]:
             try:
                 cursor.execute(col_sql)
                 conn.commit()
             except Exception:
                 conn.rollback()  # columna ya existe, ignorar
+
+        # Backfill: tickets antiguos sin clave_distribuidor -- se resuelve por el
+        # correo con el que se registró el ticket, buscando el cliente_id de esa
+        # cuenta. Idempotente: solo toca filas donde aun falta.
+        try:
+            cursor.execute("""
+                UPDATE garantia_formularios f
+                JOIN usuarios u ON u.correo COLLATE utf8mb4_unicode_ci = f.email
+                JOIN clientes c ON c.id = u.cliente_id
+                SET f.clave_distribuidor = c.clave
+                WHERE f.clave_distribuidor IS NULL
+            """)
+            conn.commit()
+        except Exception:
+            conn.rollback()
+
         return jsonify({"ok": True, "mensaje": "Tablas creadas correctamente"})
     except Exception as e:
         logging.exception("Error al inicializar tablas de garantias: %s", e)
@@ -126,8 +315,11 @@ def inicializar_tablas():
 # ── Form submissions ──────────────────────────────────────────────────────────
 
 @garantias_bp.route("/formulario/enviar", methods=["POST"])
+@requiere_autenticacion
+@requiere_modulo("usuarios_garantias")
+@requiere_permiso_interno("garantias", "crear")
 def enviar_formulario():
-    conn = obtener_conexion()
+    conn = _conexion_garantias()
     if not conn:
         return jsonify({"error": "Sin conexion a BD"}), 500
     try:
@@ -135,20 +327,28 @@ def enviar_formulario():
 
         # Determinar el email del ticket (a quién pertenece)
         email = datos.get('email', '')
-        auth_header = request.headers.get('Authorization', '')
-        if auth_header:
-            raw_token = auth_header.split(' ')[1] if ' ' in auth_header else None
-            if raw_token:
-                payload = verificar_token(raw_token)
-                if payload and payload.get('id'):
-                    cursor_u = conn.cursor(dictionary=True)
-                    cursor_u.execute("SELECT correo, rol_id FROM usuarios WHERE id = %s", (payload['id'],))
-                    user = cursor_u.fetchone()
-                    if user and user.get('correo'):
-                        email = user['correo']
-                        # Si el administrador asigna explícitamente a otro usuario, usar ese email
-                        if user.get('rol_id') == 1 and datos.get('email_asignado'):
-                            email = datos['email_asignado']
+        cursor_u = conn.cursor(dictionary=True)
+        cursor_u.execute("SELECT correo, rol_id, cliente_id FROM usuarios WHERE id = %s", (g.usuario_actual['id'],))
+        user = cursor_u.fetchone()
+        cliente_id_dueno = user.get('cliente_id') if user else None
+        if user and user.get('correo'):
+            email = user['correo']
+            # Si el administrador asigna explícitamente a otro usuario, usar ese email
+            # y resolver la clave de distribuidor con el cliente de esa cuenta.
+            if user.get('rol_id') == 1 and datos.get('email_asignado'):
+                email = datos['email_asignado']
+                cursor_u.execute("SELECT cliente_id FROM usuarios WHERE correo = %s", (email,))
+                asignado = cursor_u.fetchone()
+                cliente_id_dueno = asignado['cliente_id'] if asignado else None
+
+        # Clave del distribuidor (identifica la sucursal exacta, ej. NARUCO tiene
+        # varias con la misma razón social pero clave distinta) -- se resuelve del
+        # cliente ligado a la cuenta que llena el ticket, no del texto del <select>.
+        clave_distribuidor = None
+        if cliente_id_dueno:
+            cursor_u.execute("SELECT clave FROM clientes WHERE id = %s", (cliente_id_dueno,))
+            cli = cursor_u.fetchone()
+            clave_distribuidor = cli['clave'] if cli else None
 
         cursor = conn.cursor()
         fecha_ingreso = datos.get('fecha_ingreso') or None
@@ -157,11 +357,12 @@ def enviar_formulario():
         if fecha_ingreso:
             cursor.execute("""
                 INSERT INTO garantia_formularios
-                    (email, distribuidor, contacto, puesto, marca, datos, fecha_creacion)
-                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                    (email, distribuidor, clave_distribuidor, contacto, puesto, marca, datos, fecha_creacion)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
             """, (
                 email,
                 datos.get('distribuidor', ''),
+                clave_distribuidor,
                 datos.get('contacto', ''),
                 datos.get('puesto', ''),
                 datos.get('marca', ''),
@@ -171,11 +372,12 @@ def enviar_formulario():
         else:
             cursor.execute("""
                 INSERT INTO garantia_formularios
-                    (email, distribuidor, contacto, puesto, marca, datos)
-                VALUES (%s, %s, %s, %s, %s, %s)
+                    (email, distribuidor, clave_distribuidor, contacto, puesto, marca, datos)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
             """, (
                 email,
                 datos.get('distribuidor', ''),
+                clave_distribuidor,
                 datos.get('contacto', ''),
                 datos.get('puesto', ''),
                 datos.get('marca', ''),
@@ -194,17 +396,21 @@ def enviar_formulario():
 
 
 @garantias_bp.route("/formulario/lista", methods=["GET"])
+@requiere_autenticacion
+@requiere_rol(1)
+@requiere_permiso_interno("garantias", "ver")
 def lista_formularios():
-    conn = obtener_conexion()
+    conn = _conexion_garantias()
     if not conn:
         return jsonify({"error": "Sin conexion a BD"}), 500
     try:
         cursor = conn.cursor(dictionary=True)
         cursor.execute("""
-            SELECT id, folio, email, distribuidor, contacto, puesto, marca,
+            SELECT id, folio, email, distribuidor, clave_distribuidor, contacto, puesto, marca,
                    estatus, estatus_pieza, pieza_reemplazo,
                    docs_validados, serie_validada,
-                   validacion_docs_json, fecha_creacion
+                   validacion_docs_json, fecha_creacion,
+                   fecha_estatus, fecha_pieza
             FROM garantia_formularios
             ORDER BY fecha_creacion DESC
         """)
@@ -212,6 +418,10 @@ def lista_formularios():
         for r in rows:
             if r.get('fecha_creacion'):
                 r['fecha_creacion'] = r['fecha_creacion'].strftime('%d/%m/%Y %H:%M')
+            if r.get('fecha_estatus'):
+                r['fecha_estatus'] = r['fecha_estatus'].strftime('%Y-%m-%d')
+            if r.get('fecha_pieza'):
+                r['fecha_pieza'] = r['fecha_pieza'].strftime('%Y-%m-%d')
         return jsonify(rows)
     except Exception as e:
         logging.exception("Error al listar formularios de garantias: %s", e)
@@ -221,22 +431,16 @@ def lista_formularios():
 
 
 @garantias_bp.route("/formulario/<int:form_id>/actualizar-dato", methods=["PUT"])
+@requiere_autenticacion
+@requiere_modulo("usuarios_garantias")
 def actualizar_dato_usuario(form_id):
     """El usuario dueño del ticket actualiza un campo rechazado y resetea su validación."""
-    auth_header = request.headers.get('Authorization', '')
-    raw_token = auth_header.split(' ')[1] if ' ' in auth_header else None
-    if not raw_token:
-        return jsonify({"error": "No autorizado"}), 401
-    payload = verificar_token(raw_token)
-    if not payload or not payload.get('id'):
-        return jsonify({"error": "Token inválido"}), 401
-
-    conn = obtener_conexion()
+    conn = _conexion_garantias()
     if not conn:
         return jsonify({"error": "Sin conexion a BD"}), 500
     try:
         cursor = conn.cursor(dictionary=True)
-        cursor.execute("SELECT correo FROM usuarios WHERE id = %s", (payload['id'],))
+        cursor.execute("SELECT correo FROM usuarios WHERE id = %s", (g.usuario_actual['id'],))
         user = cursor.fetchone()
         if not user:
             return jsonify({"error": "Usuario no encontrado"}), 404
@@ -295,37 +499,52 @@ def actualizar_dato_usuario(form_id):
 
 
 @garantias_bp.route("/mis-tickets", methods=["GET"])
+@requiere_autenticacion
+@requiere_modulo("usuarios_garantias")
 def mis_tickets():
-    """Devuelve los tickets del usuario autenticado (filtra por su correo registrado)."""
-    auth_header = request.headers.get('Authorization', '')
-    raw_token = auth_header.split(' ')[1] if ' ' in auth_header else None
-    if not raw_token:
-        return jsonify({"error": "No autorizado"}), 401
-    payload = verificar_token(raw_token)
-    if not payload:
-        return jsonify({"error": "Token inválido"}), 401
-    user_id = payload.get('id')
-    if not user_id:
-        return jsonify({"error": "Token inválido"}), 401
+    """Devuelve los tickets del usuario autenticado.
 
-    conn = obtener_conexion()
+    Filtra por el cliente asociado a la cuenta (usuarios.cliente_id -> clientes.nombre_cliente
+    == garantia_formularios.distribuidor), no solo por el correo con el que se llenó cada
+    formulario -- un mismo cliente puede tener varias cuentas/usuarios (ej. la real y una de
+    pruebas) y todas deben ver el mismo conjunto de garantías del cliente. Se conserva el
+    match por correo como respaldo adicional (OR), no como sustituto.
+    """
+    user_id = g.usuario_actual['id']
+
+    conn = _conexion_garantias()
     if not conn:
         return jsonify({"error": "Sin conexion a BD"}), 500
     try:
         cursor = conn.cursor(dictionary=True)
-        cursor.execute("SELECT correo FROM usuarios WHERE id = %s", (user_id,))
+        cursor.execute("SELECT correo, cliente_id FROM usuarios WHERE id = %s", (user_id,))
         user = cursor.fetchone()
         if not user:
             return jsonify({"error": "Usuario no encontrado"}), 404
         email = user['correo']
 
-        cursor.execute("""
-            SELECT id, folio, email, distribuidor, contacto, puesto, marca,
-                   estatus, estatus_pieza, fecha_creacion
-            FROM garantia_formularios
-            WHERE email = %s
-            ORDER BY fecha_creacion DESC
-        """, (email,))
+        nombre_cliente = None
+        if user.get('cliente_id'):
+            cursor.execute("SELECT nombre_cliente FROM clientes WHERE id = %s", (user['cliente_id'],))
+            cli = cursor.fetchone()
+            nombre_cliente = cli['nombre_cliente'] if cli else None
+
+        if nombre_cliente:
+            cursor.execute("""
+                SELECT id, folio, email, distribuidor, clave_distribuidor, contacto, puesto, marca,
+                       estatus, estatus_pieza, fecha_creacion
+                FROM garantia_formularios
+                WHERE distribuidor = %s OR email = %s
+                ORDER BY fecha_creacion DESC
+            """, (nombre_cliente, email))
+        else:
+            cursor.execute("""
+                SELECT id, folio, email, distribuidor, clave_distribuidor, contacto, puesto, marca,
+                       estatus, estatus_pieza, fecha_creacion
+                FROM garantia_formularios
+                WHERE email = %s
+                ORDER BY fecha_creacion DESC
+            """, (email,))
         rows = cursor.fetchall()
         for r in rows:
             if r.get('fecha_creacion'):
@@ -339,26 +558,15 @@ def mis_tickets():
 
 
 @garantias_bp.route("/formulario/<int:form_id>", methods=["DELETE"])
+@requiere_autenticacion
+@requiere_rol(1)
+@requiere_permiso_interno("garantias", "eliminar")
 def eliminar_formulario(form_id):
     """Elimina un ticket y renumera los folios consecutivamente. Solo admins."""
-    auth_header = request.headers.get('Authorization', '')
-    raw_token = auth_header.split(' ')[1] if ' ' in auth_header else None
-    if not raw_token:
-        return jsonify({"error": "No autorizado"}), 401
-    payload = verificar_token(raw_token)
-    if not payload or not payload.get('id'):
-        return jsonify({"error": "Token inválido"}), 401
-
-    conn = obtener_conexion()
+    conn = _conexion_garantias()
     if not conn:
         return jsonify({"error": "Sin conexion a BD"}), 500
     try:
-        cursor_u = conn.cursor(dictionary=True)
-        cursor_u.execute("SELECT rol_id FROM usuarios WHERE id = %s", (payload['id'],))
-        user = cursor_u.fetchone()
-        if not user or user.get('rol_id') != 1:
-            return jsonify({"error": "Solo administradores pueden eliminar tickets"}), 403
-
         cursor = conn.cursor()
         cursor.execute("DELETE FROM garantia_comentarios WHERE formulario_id = %s", (form_id,))
         cursor.execute("DELETE FROM garantia_formularios WHERE id = %s", (form_id,))
@@ -386,12 +594,17 @@ def eliminar_formulario(form_id):
 
 
 @garantias_bp.route("/formulario/<int:form_id>", methods=["GET"])
+@requiere_autenticacion
+@requiere_modulo("usuarios_garantias")
+@requiere_permiso_interno("garantias", "ver")
 def obtener_formulario(form_id):
-    conn = obtener_conexion()
+    conn = _conexion_garantias()
     if not conn:
         return jsonify({"error": "Sin conexion a BD"}), 500
     try:
         cursor = conn.cursor(dictionary=True)
+        if not _usuario_actual_puede_ver_formulario(cursor, form_id):
+            return jsonify({"error": "Ticket no encontrado o no autorizado"}), 403
         cursor.execute("SELECT * FROM garantia_formularios WHERE id = %s", (form_id,))
         row = cursor.fetchone()
         if not row:
@@ -400,6 +613,10 @@ def obtener_formulario(form_id):
             row['fecha_creacion'] = row['fecha_creacion'].strftime('%d/%m/%Y %H:%M')
         if row.get('fecha_actualizacion'):
             row['fecha_actualizacion'] = row['fecha_actualizacion'].strftime('%d/%m/%Y %H:%M')
+        if row.get('fecha_estatus'):
+            row['fecha_estatus'] = row['fecha_estatus'].strftime('%Y-%m-%d')
+        if row.get('fecha_pieza'):
+            row['fecha_pieza'] = row['fecha_pieza'].strftime('%Y-%m-%d')
         if row.get('datos') and isinstance(row['datos'], str):
             row['datos'] = json.loads(row['datos'])
         if row.get('validacion_docs_json') and isinstance(row['validacion_docs_json'], str):
@@ -413,24 +630,29 @@ def obtener_formulario(form_id):
 
 
 @garantias_bp.route("/formulario/<int:form_id>/estatus", methods=["PUT"])
+@requiere_autenticacion
+@requiere_rol(1)
+@requiere_permiso_interno("garantias", "editar")
 def actualizar_estatus(form_id):
-    conn = obtener_conexion()
+    conn = _conexion_garantias()
     if not conn:
         return jsonify({"error": "Sin conexion a BD"}), 500
     try:
         datos = request.get_json(force=True) or {}
         nuevo_estatus = datos.get('estatus', 'Enviado')
+        fecha = datos.get('fecha') or _hoy_cdmx().isoformat()
         cursor = conn.cursor()
         cursor.execute(
-            "UPDATE garantia_formularios SET estatus = %s WHERE id = %s",
-            (nuevo_estatus, form_id)
+            "UPDATE garantia_formularios SET estatus = %s, fecha_estatus = %s WHERE id = %s",
+            (nuevo_estatus, fecha, form_id)
         )
         cursor.execute(
             "INSERT INTO garantia_comentarios (formulario_id, autor, texto, tipo) VALUES (%s,%s,%s,%s)",
-            (form_id, 'Sistema', f'Estatus actualizado a "{nuevo_estatus}"', 'estatus')
+            (form_id, 'Sistema', f'Estatus actualizado a "{nuevo_estatus}" (fecha: {fecha})', 'estatus')
         )
         conn.commit()
-        return jsonify({"ok": True})
+        _notificar_cambio_estatus(form_id, nuevo_estatus)
+        return jsonify({"ok": True, "fecha_estatus": fecha})
     except Exception as e:
         logging.exception("Error al actualizar estatus: %s", e)
         return jsonify({"error": str(e)}), 500
@@ -438,9 +660,72 @@ def actualizar_estatus(form_id):
         conn.close()
 
 
+@garantias_bp.route("/formulario/<int:form_id>/fecha-estatus", methods=["PUT"])
+@requiere_autenticacion
+@requiere_rol(1)
+@requiere_permiso_interno("garantias", "editar")
+def actualizar_fecha_estatus(form_id):
+    """Edita solo la fecha del estatus actual sin cambiar el estatus."""
+    conn = _conexion_garantias()
+    if not conn:
+        return jsonify({"error": "Sin conexion a BD"}), 500
+    try:
+        datos = request.get_json(force=True) or {}
+        fecha = datos.get('fecha') or _hoy_cdmx().isoformat()
+        cursor = conn.cursor()
+        cursor.execute(
+            "UPDATE garantia_formularios SET fecha_estatus = %s WHERE id = %s",
+            (fecha, form_id)
+        )
+        cursor.execute(
+            "INSERT INTO garantia_comentarios (formulario_id, autor, texto, tipo) VALUES (%s,%s,%s,%s)",
+            (form_id, 'Sistema', f'Fecha de estatus corregida a {fecha}', 'estatus')
+        )
+        conn.commit()
+        return jsonify({"ok": True, "fecha_estatus": fecha})
+    except Exception as e:
+        logging.exception("Error al actualizar fecha_estatus: %s", e)
+        return jsonify({"error": str(e)}), 500
+    finally:
+        conn.close()
+
+
+@garantias_bp.route("/formulario/<int:form_id>/fecha-creacion", methods=["PUT"])
+@requiere_autenticacion
+@requiere_rol(1)
+@requiere_permiso_interno("garantias", "editar")
+def actualizar_fecha_creacion(form_id):
+    """Corrige la fecha de alta (creación) del ticket cuando se registró mal, sin borrar y recrear."""
+    conn = _conexion_garantias()
+    if not conn:
+        return jsonify({"error": "Sin conexion a BD"}), 500
+    try:
+        datos = request.get_json(force=True) or {}
+        fecha = datos.get('fecha') or _hoy_cdmx().isoformat()
+        cursor = conn.cursor()
+        cursor.execute(
+            "UPDATE garantia_formularios SET fecha_creacion = %s WHERE id = %s",
+            (fecha, form_id)
+        )
+        cursor.execute(
+            "INSERT INTO garantia_comentarios (formulario_id, autor, texto, tipo) VALUES (%s,%s,%s,%s)",
+            (form_id, 'Sistema', f'Fecha de creación corregida a {fecha}', 'estatus')
+        )
+        conn.commit()
+        return jsonify({"ok": True, "fecha_creacion": fecha})
+    except Exception as e:
+        logging.exception("Error al actualizar fecha_creacion: %s", e)
+        return jsonify({"error": str(e)}), 500
+    finally:
+        conn.close()
+
+
 @garantias_bp.route("/formulario/<int:form_id>/pieza-reemplazo", methods=["PUT"])
+@requiere_autenticacion
+@requiere_rol(1)
+@requiere_permiso_interno("garantias", "editar")
 def actualizar_pieza_reemplazo(form_id):
-    conn = obtener_conexion()
+    conn = _conexion_garantias()
     if not conn:
         return jsonify({"error": "Sin conexion a BD"}), 500
     try:
@@ -465,24 +750,28 @@ def actualizar_pieza_reemplazo(form_id):
 
 
 @garantias_bp.route("/formulario/<int:form_id>/pieza", methods=["PUT"])
+@requiere_autenticacion
+@requiere_rol(1)
+@requiere_permiso_interno("garantias", "editar")
 def actualizar_pieza(form_id):
-    conn = obtener_conexion()
+    conn = _conexion_garantias()
     if not conn:
         return jsonify({"error": "Sin conexion a BD"}), 500
     try:
         datos = request.get_json(force=True) or {}
         nuevo_estatus = datos.get('estatus_pieza', 'Sin pieza')
+        fecha = datos.get('fecha') or _hoy_cdmx().isoformat()
         cursor = conn.cursor()
         cursor.execute(
-            "UPDATE garantia_formularios SET estatus_pieza = %s WHERE id = %s",
-            (nuevo_estatus, form_id)
+            "UPDATE garantia_formularios SET estatus_pieza = %s, fecha_pieza = %s WHERE id = %s",
+            (nuevo_estatus, fecha, form_id)
         )
         cursor.execute(
             "INSERT INTO garantia_comentarios (formulario_id, autor, texto, tipo) VALUES (%s, %s, %s, %s)",
-            (form_id, 'Sistema', f'Estado de pieza actualizado a "{nuevo_estatus}"', 'pieza')
+            (form_id, 'Sistema', f'Estado de pieza actualizado a "{nuevo_estatus}" (fecha: {fecha})', 'pieza')
         )
         conn.commit()
-        return jsonify({"ok": True})
+        return jsonify({"ok": True, "fecha_pieza": fecha})
     except Exception as e:
         logging.exception("Error al actualizar pieza: %s", e)
         return jsonify({"error": str(e)}), 500
@@ -490,10 +779,43 @@ def actualizar_pieza(form_id):
         conn.close()
 
 
+@garantias_bp.route("/formulario/<int:form_id>/fecha-pieza", methods=["PUT"])
+@requiere_autenticacion
+@requiere_rol(1)
+@requiere_permiso_interno("garantias", "editar")
+def actualizar_fecha_pieza(form_id):
+    """Edita solo la fecha del estatus de pieza sin cambiar el estatus."""
+    conn = _conexion_garantias()
+    if not conn:
+        return jsonify({"error": "Sin conexion a BD"}), 500
+    try:
+        datos = request.get_json(force=True) or {}
+        fecha = datos.get('fecha') or _hoy_cdmx().isoformat()
+        cursor = conn.cursor()
+        cursor.execute(
+            "UPDATE garantia_formularios SET fecha_pieza = %s WHERE id = %s",
+            (fecha, form_id)
+        )
+        cursor.execute(
+            "INSERT INTO garantia_comentarios (formulario_id, autor, texto, tipo) VALUES (%s, %s, %s, %s)",
+            (form_id, 'Sistema', f'Fecha de pieza corregida a {fecha}', 'pieza')
+        )
+        conn.commit()
+        return jsonify({"ok": True, "fecha_pieza": fecha})
+    except Exception as e:
+        logging.exception("Error al actualizar fecha_pieza: %s", e)
+        return jsonify({"error": str(e)}), 500
+    finally:
+        conn.close()
+
+
 @garantias_bp.route("/formulario/<int:form_id>/validacion-doc", methods=["PUT"])
+@requiere_autenticacion
+@requiere_rol(1)
+@requiere_permiso_interno("garantias", "editar")
 def actualizar_validacion_doc(form_id):
     """Valida o rechaza un documento individual. body: {campo, estado, nombre_legible}"""
-    conn = obtener_conexion()
+    conn = _conexion_garantias()
     if not conn:
         return jsonify({"error": "Sin conexion a BD"}), 500
     try:
@@ -545,6 +867,8 @@ def actualizar_validacion_doc(form_id):
                 (form_id, 'Sistema', texto, 'validacion')
             )
         conn.commit()
+        if estado in ('valido', 'rechazado'):
+            _notificar_validacion_doc(form_id, nombre_legible, estado)
         return jsonify({"ok": True, "validacion_docs_json": val_json})
     except Exception as e:
         logging.exception("Error al validar documento: %s", e)
@@ -554,8 +878,11 @@ def actualizar_validacion_doc(form_id):
 
 
 @garantias_bp.route("/formulario/<int:form_id>/validacion", methods=["PUT"])
+@requiere_autenticacion
+@requiere_rol(1)
+@requiere_permiso_interno("garantias", "editar")
 def actualizar_validacion(form_id):
-    conn = obtener_conexion()
+    conn = _conexion_garantias()
     if not conn:
         return jsonify({"error": "Sin conexion a BD"}), 500
     try:
@@ -601,8 +928,11 @@ def actualizar_validacion(form_id):
 # ── Form structure (editor) ───────────────────────────────────────────────────
 
 @garantias_bp.route("/estructura", methods=["GET"])
+@requiere_autenticacion
+@requiere_modulo("usuarios_garantias")
+@requiere_permiso_interno("garantias", "ver")
 def obtener_estructura():
-    conn = obtener_conexion()
+    conn = _conexion_garantias()
     if not conn:
         return jsonify({"error": "Sin conexion a BD"}), 500
     try:
@@ -624,8 +954,11 @@ def obtener_estructura():
 
 
 @garantias_bp.route("/estructura", methods=["POST"])
+@requiere_autenticacion
+@requiere_rol(1)
+@requiere_permiso_interno("garantias", "editar")
 def guardar_estructura():
-    conn = obtener_conexion()
+    conn = _conexion_garantias()
     if not conn:
         return jsonify({"error": "Sin conexion a BD"}), 500
     try:
@@ -651,8 +984,11 @@ def guardar_estructura():
 # ── Stats (hub) ──────────────────────────────────────────────────────────────
 
 @garantias_bp.route("/stats", methods=["GET"])
+@requiere_autenticacion
+@requiere_rol(1)
+@requiere_permiso_interno("garantias", "ver")
 def get_stats():
-    conn = obtener_conexion()
+    conn = _conexion_garantias()
     if not conn:
         return jsonify({"error": "Sin conexion a BD"}), 500
     try:
@@ -683,27 +1019,200 @@ def get_stats():
         conn.close()
 
 
+# ── Notificaciones por correo al distribuidor ─────────────────────────────────
+
+_PORTAL_GARANTIAS_URL = "https://app.elite-bike.com/usuarios/garantias"
+_ASSETS_EMAIL_URL = "https://api.elite-bike.com/garantias/assets"
+_LOGO_ELITE_BIKE_ICON_URL = f"{_ASSETS_EMAIL_URL}/logo_elite_icon.png"
+_LOGOS_MARCAS_URL = f"{_ASSETS_EMAIL_URL}/logos-marcas.png"
+
+
+def _plantilla_email_garantia(folio: str, titulo: str, cuerpo_interno: str) -> str:
+    """Envoltura HTML con identidad de marca Elite Bike para los correos de
+    garantías -- logo recortado (el original tiene mucho margen transparente
+    y se ve casi invisible a tamaño de correo) + la tira de marcas que ya se
+    usa en el formulario de garantías."""
+    return f"""
+    <!DOCTYPE html>
+    <html>
+    <head><meta charset="UTF-8"></head>
+    <body style="margin:0;padding:0;background:#f4f4f4;font-family:'Segoe UI',Arial,sans-serif;">
+      <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#f4f4f4;padding:24px 0;">
+        <tr><td align="center">
+          <table role="presentation" width="100%" style="max-width:560px;background:#ffffff;border-radius:8px;overflow:hidden;border:1px solid #e5e5e5;">
+            <tr>
+              <td style="background:#1a1a2e;padding:18px 28px;">
+                <table role="presentation" cellpadding="0" cellspacing="0"><tr>
+                  <td style="vertical-align:middle;"><img src="{_LOGO_ELITE_BIKE_ICON_URL}" alt="" width="30" style="display:block;border:0;"></td>
+                  <td style="vertical-align:middle;padding-left:10px;"><span style="color:#ffffff;font-size:17px;font-weight:700;letter-spacing:.3px;">ELITE BIKE</span></td>
+                </tr></table>
+              </td>
+            </tr>
+            <tr><td style="height:4px;background:#EB5E28;line-height:4px;font-size:0;">&nbsp;</td></tr>
+            <tr>
+              <td style="padding:16px 28px;background:#fcfcfc;border-bottom:1px solid #eee;" align="center">
+                <img src="{_LOGOS_MARCAS_URL}" alt="Scott, Megamo, Syncros, Vittoria, Bold" style="max-width:480px;width:100%;height:auto;display:block;border:0;">
+              </td>
+            </tr>
+            <tr>
+              <td style="padding:28px;">
+                <p style="margin:0 0 4px;color:#999;font-size:12px;text-transform:uppercase;letter-spacing:.5px;">Ticket de garantía</p>
+                <h2 style="margin:0 0 18px;color:#1a1a2e;font-size:20px;">{titulo} <span style="color:#EB5E28;">{folio}</span></h2>
+                <div style="color:#333;font-size:14px;line-height:1.6;">{cuerpo_interno}</div>
+                <a href="{_PORTAL_GARANTIAS_URL}" style="display:inline-block;margin-top:22px;padding:11px 22px;background:#EB5E28;color:#ffffff;text-decoration:none;border-radius:6px;font-weight:600;font-size:13px;">Ver mi ticket</a>
+              </td>
+            </tr>
+            <tr>
+              <td style="padding:18px 28px;background:#fafafa;border-top:1px solid #eee;">
+                <p style="margin:0;font-size:12px;color:#999;">Correo automático del sistema de garantías de Elite Bike. Si tienes dudas, contacta a tu asesor.</p>
+              </td>
+            </tr>
+          </table>
+        </td></tr>
+      </table>
+    </body>
+    </html>
+    """
+
+
+def _enviar_notificacion_garantia(folio, email, asunto, cuerpo_html):
+    """Encola el envío (async vía Celery) -- nunca bloquea ni rompe la petición
+    que la dispara si Redis/Celery o el SMTP fallan."""
+    if not email:
+        return
+
+    cc = os.getenv('GARANTIAS_EMAIL_CC') or None
+
+    # Seguridad en pruebas: si hay un correo de override configurado (solo debe
+    # existir en .env local, NUNCA en producción), todo notificación se manda
+    # ahí en vez del destinatario real -- para no mandarle correos de prueba a
+    # distribuidores de verdad mientras se prueba en local.
+    override = os.getenv('GARANTIAS_EMAIL_OVERRIDE')
+    if override:
+        cuerpo_html = cuerpo_html.replace(
+            '<div style="color:#333;font-size:14px;line-height:1.6;">',
+            f'<p style="color:#888;font-size:12px;margin:0 0 14px;">[PRUEBA LOCAL -- este correo '
+            f'habria ido a <b>{email}</b>{f" (copia: {cc})" if cc else ""}]</p>'
+            '<div style="color:#333;font-size:14px;line-height:1.6;">',
+            1,
+        )
+        email = override
+        cc = None  # en pruebas locales, nada sale a direcciones reales, ni en copia
+
+    try:
+        from celery_worker import enviar_notificacion_garantia_async
+        enviar_notificacion_garantia_async.delay(email, folio, asunto, cuerpo_html, cc)
+    except Exception as e:
+        logging.exception("Error al encolar notificacion de garantia %s: %s", folio, e)
+
+
+def _email_contacto_formulario(row):
+    """Correo al que debe llegar la notificación: prioriza el que la persona
+    escribió a mano en el formulario (datos.email) -- es el que ve el admin en
+    pantalla -- y cae al correo de la cuenta (columna `email`) si ese viene
+    vacío o el JSON no trae nada usable."""
+    datos_raw = row.get('datos')
+    if datos_raw:
+        try:
+            datos = json.loads(datos_raw) if isinstance(datos_raw, str) else (datos_raw or {})
+            email_manual = (datos.get('email') or '').strip()
+            if email_manual:
+                return email_manual
+        except Exception:
+            pass
+    return row.get('email')
+
+
+def _notificar_comentario_admin(formulario_id, texto):
+    """Avisa al distribuidor que Elite Bike dejó un comentario nuevo en su ticket."""
+    conn = _conexion_garantias()
+    if not conn:
+        return
+    try:
+        cursor = conn.cursor(dictionary=True)
+        cursor.execute("SELECT folio, email, datos FROM garantia_formularios WHERE id = %s", (formulario_id,))
+        row = cursor.fetchone()
+    finally:
+        conn.close()
+    if not row:
+        return
+    cuerpo_interno = (
+        f"<p style=\"margin:0 0 14px;\">Hay un comentario nuevo de Elite Bike en tu ticket:</p>"
+        f"<p style=\"margin:0;padding:12px 16px;background:#f5f5f5;border-left:3px solid #EB5E28;border-radius:4px;\">{texto}</p>"
+    )
+    cuerpo = _plantilla_email_garantia(row['folio'], "Nuevo comentario en tu ticket", cuerpo_interno)
+    _enviar_notificacion_garantia(row['folio'], _email_contacto_formulario(row), f"Nuevo comentario en tu ticket {row['folio']}", cuerpo)
+
+
+def _notificar_cambio_estatus(formulario_id, nuevo_estatus):
+    """Avisa al distribuidor que el estatus principal de su ticket cambió."""
+    conn = _conexion_garantias()
+    if not conn:
+        return
+    try:
+        cursor = conn.cursor(dictionary=True)
+        cursor.execute("SELECT folio, email, datos FROM garantia_formularios WHERE id = %s", (formulario_id,))
+        row = cursor.fetchone()
+    finally:
+        conn.close()
+    if not row:
+        return
+    cuerpo_interno = (
+        f"<p style=\"margin:0;\">El estatus de tu ticket cambió a:</p>"
+        f"<p style=\"margin:10px 0 0;font-size:18px;font-weight:700;color:#1a1a2e;\">{nuevo_estatus}</p>"
+    )
+    cuerpo = _plantilla_email_garantia(row['folio'], "Actualización de estatus", cuerpo_interno)
+    _enviar_notificacion_garantia(row['folio'], _email_contacto_formulario(row), f"Actualización de tu ticket {row['folio']}: {nuevo_estatus}", cuerpo)
+
+
+def _notificar_validacion_doc(formulario_id, nombre_legible, estado):
+    """Avisa al distribuidor que un documento de su ticket fue validado o rechazado."""
+    conn = _conexion_garantias()
+    if not conn:
+        return
+    try:
+        cursor = conn.cursor(dictionary=True)
+        cursor.execute("SELECT folio, email, datos FROM garantia_formularios WHERE id = %s", (formulario_id,))
+        row = cursor.fetchone()
+    finally:
+        conn.close()
+    if not row:
+        return
+    if estado == 'rechazado':
+        asunto = f"Documento rechazado en tu ticket {row['folio']} -- se requiere corrección"
+        cuerpo_interno = (
+            f"<p style=\"margin:0 0 10px;\">El documento <b>\"{nombre_legible}\"</b> fue "
+            f"<span style=\"color:#e53935;font-weight:700;\">rechazado</span> y necesita corregirse.</p>"
+            f"<p style=\"margin:0;\">Sube el documento corregido desde tu portal.</p>"
+        )
+        titulo = "Documento rechazado"
+    else:
+        asunto = f"Documento validado en tu ticket {row['folio']}"
+        cuerpo_interno = (
+            f"<p style=\"margin:0;\">El documento <b>\"{nombre_legible}\"</b> fue "
+            f"<span style=\"color:#2e7d32;font-weight:700;\">validado</span> correctamente.</p>"
+        )
+        titulo = "Documento validado"
+    cuerpo = _plantilla_email_garantia(row['folio'], titulo, cuerpo_interno)
+    _enviar_notificacion_garantia(row['folio'], _email_contacto_formulario(row), asunto, cuerpo)
+
+
 # ── Comentarios de ticket ─────────────────────────────────────────────────────
 
 @garantias_bp.route("/ticket/<int:formulario_id>/comentarios", methods=["GET"])
+@requiere_autenticacion
+@requiere_modulo("usuarios_garantias")
+@requiere_permiso_interno("garantias", "ver")
 def get_comentarios(formulario_id):
-    conn = obtener_conexion()
+    conn = _conexion_garantias()
     if not conn:
         return jsonify({"error": "Sin conexion a BD"}), 500
     try:
-        es_admin = False
-        auth_header = request.headers.get('Authorization', '')
-        if auth_header:
-            raw_token = auth_header.split(' ')[1] if ' ' in auth_header else None
-            if raw_token:
-                payload = verificar_token(raw_token)
-                if payload and payload.get('id'):
-                    cursor_u = conn.cursor(dictionary=True)
-                    cursor_u.execute("SELECT rol_id FROM usuarios WHERE id = %s", (payload['id'],))
-                    user = cursor_u.fetchone()
-                    es_admin = bool(user and user.get('rol_id') == 1)
+        es_admin = int(g.usuario_actual.get('rol', 0)) in (1, 4)
 
         cursor = conn.cursor(dictionary=True)
+        if not _usuario_actual_puede_ver_formulario(cursor, formulario_id):
+            return jsonify({"error": "Ticket no encontrado o no autorizado"}), 403
         if es_admin:
             cursor.execute("""
                 SELECT * FROM garantia_comentarios
@@ -728,8 +1237,11 @@ def get_comentarios(formulario_id):
 
 
 @garantias_bp.route("/ticket/<int:formulario_id>/comentarios", methods=["POST"])
+@requiere_autenticacion
+@requiere_modulo("usuarios_garantias")
+@requiere_permiso_interno("garantias", "crear")
 def add_comentario(formulario_id):
-    conn = obtener_conexion()
+    conn = _conexion_garantias()
     if not conn:
         return jsonify({"error": "Sin conexion a BD"}), 500
     try:
@@ -740,22 +1252,20 @@ def add_comentario(formulario_id):
         tipo = datos.get('tipo', 'comentario')
 
         if tipo == 'nota_interna':
-            # Extraer nombre real del JWT — requerido para notas internas
-            auth_header = request.headers.get('Authorization', '')
-            raw_token = auth_header.split(' ')[1] if ' ' in auth_header else None
-            if not raw_token:
-                return jsonify({"error": "No autorizado"}), 401
-            tok_payload = verificar_token(raw_token)
-            if not tok_payload or not tok_payload.get('id'):
-                return jsonify({"error": "Token inválido"}), 401
+            # El decorador anterior ya exige garantias:ver + garantias:crear
+            # al rol 4; el rol 1 conserva su acceso administrativo.
             cursor_u = conn.cursor(dictionary=True)
-            cursor_u.execute("SELECT nombre, rol_id FROM usuarios WHERE id = %s", (tok_payload['id'],))
+            cursor_u.execute("SELECT nombre, rol_id FROM usuarios WHERE id = %s", (g.usuario_actual['id'],))
             user = cursor_u.fetchone()
-            if not user or user.get('rol_id') != 1:
+            if not user or user.get('rol_id') not in (1, 4):
                 return jsonify({"error": "No autorizado"}), 403
             autor = user.get('nombre') or 'Administrador'
         else:
             autor = (datos.get('autor') or 'Administrador').strip()
+
+        cursor_verificacion = conn.cursor(dictionary=True)
+        if not _usuario_actual_puede_ver_formulario(cursor_verificacion, formulario_id):
+            return jsonify({"error": "Ticket no encontrado o no autorizado"}), 403
 
         cursor = conn.cursor()
         cursor.execute("""
@@ -763,6 +1273,10 @@ def add_comentario(formulario_id):
             VALUES (%s, %s, %s, %s)
         """, (formulario_id, autor, texto, tipo))
         conn.commit()
+
+        if tipo == 'comentario' and int(g.usuario_actual.get('rol', 0)) in (1, 4):
+            _notificar_comentario_admin(formulario_id, texto)
+
         return jsonify({"ok": True, "id": cursor.lastrowid})
     except Exception as e:
         logging.exception("Error al agregar comentario: %s", e)
@@ -771,31 +1285,94 @@ def add_comentario(formulario_id):
         conn.close()
 
 
+@garantias_bp.route("/comentario/<int:comentario_id>", methods=["PUT"])
+@requiere_autenticacion
+@requiere_rol(1)
+@requiere_permiso_interno("garantias", "editar")
+def editar_comentario(comentario_id):
+    """Corrige el texto de un comentario o nota interna (ej. un dato mal escrito)."""
+    conn = _conexion_garantias()
+    if not conn:
+        return jsonify({"error": "Sin conexion a BD"}), 500
+    try:
+        datos = request.get_json(force=True) or {}
+        texto = (datos.get('texto') or '').strip()
+        if not texto:
+            return jsonify({"error": "El comentario no puede estar vacio"}), 400
+
+        cursor = conn.cursor()
+        cursor.execute(
+            "UPDATE garantia_comentarios SET texto = %s WHERE id = %s",
+            (texto, comentario_id)
+        )
+        if cursor.rowcount == 0:
+            conn.rollback()
+            return jsonify({"error": "Comentario no encontrado"}), 404
+        conn.commit()
+        return jsonify({"ok": True})
+    except Exception as e:
+        logging.exception("Error al editar comentario: %s", e)
+        return jsonify({"error": str(e)}), 500
+    finally:
+        conn.close()
+
+
+@garantias_bp.route("/comentario/<int:comentario_id>", methods=["DELETE"])
+@requiere_autenticacion
+@requiere_rol(1)
+@requiere_permiso_interno("garantias", "eliminar")
+def eliminar_comentario(comentario_id):
+    """Elimina un comentario o nota interna puesto por error."""
+    conn = _conexion_garantias()
+    if not conn:
+        return jsonify({"error": "Sin conexion a BD"}), 500
+    try:
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM garantia_comentarios WHERE id = %s", (comentario_id,))
+        if cursor.rowcount == 0:
+            conn.rollback()
+            return jsonify({"error": "Comentario no encontrado"}), 404
+        conn.commit()
+        return jsonify({"ok": True})
+    except Exception as e:
+        logging.exception("Error al eliminar comentario: %s", e)
+        return jsonify({"error": str(e)}), 500
+    finally:
+        conn.close()
+
+
 # ── Latencias por ticket ─────────────────────────────────────────────────────
 
 @garantias_bp.route("/latencias", methods=["GET"])
+@requiere_autenticacion
+@requiere_rol(1)
+@requiere_permiso_interno("garantias", "ver")
 def get_latencias():
     """Devuelve latencia de atención y de cierre por ticket individual."""
-    conn = obtener_conexion()
+    conn = _conexion_garantias()
     if not conn:
         return jsonify({"error": "Sin conexion a BD"}), 500
     try:
         cursor = conn.cursor(dictionary=True)
         cursor.execute("""
             SELECT
-                f.id, f.folio, f.estatus, f.distribuidor,
+                f.id, f.folio, f.estatus, f.distribuidor, f.marca,
+                DATE_FORMAT(f.fecha_creacion, '%d/%m/%Y %H:%i') AS fecha_creacion,
                 CASE WHEN f.estatus IN ('Cerrado','Rechazado')
-                     THEN DATEDIFF(f.fecha_actualizacion, f.fecha_creacion)
+                     THEN DATEDIFF(
+                         COALESCE(f.fecha_estatus, DATE(f.fecha_actualizacion)),
+                         DATE(f.fecha_creacion)
+                     )
                      ELSE NULL END AS lat_cierre,
                 MIN(CASE WHEN c.tipo = 'validacion' AND DATEDIFF(c.fecha, f.fecha_creacion) >= 0
                          THEN DATEDIFF(c.fecha, f.fecha_creacion)
                          ELSE NULL END) AS lat_atencion
             FROM garantia_formularios f
             LEFT JOIN garantia_comentarios c ON c.formulario_id = f.id
-            GROUP BY f.id, f.folio, f.estatus, f.distribuidor,
-                     f.fecha_creacion, f.fecha_actualizacion
+            GROUP BY f.id, f.folio, f.estatus, f.distribuidor, f.marca,
+                     f.fecha_creacion, f.fecha_actualizacion, f.fecha_estatus
             ORDER BY f.fecha_creacion DESC
-        """)
+        """, ())
         rows = cursor.fetchall()
         return jsonify(rows)
     except Exception as e:
@@ -805,10 +1382,516 @@ def get_latencias():
         conn.close()
 
 
+# ── Catálogo de piezas de reemplazo ──────────────────────────────────────────
+
+@garantias_bp.route("/piezas", methods=["GET"])
+@requiere_autenticacion
+@requiere_rol(1)
+@requiere_permiso_interno("garantias", "ver")
+def listar_piezas():
+    conn = _conexion_garantias()
+    if not conn:
+        return jsonify({"error": "Sin conexion a BD"}), 500
+    try:
+        cursor = conn.cursor(dictionary=True)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS garantia_piezas (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                nombre VARCHAR(200) NOT NULL UNIQUE,
+                activo TINYINT(1) DEFAULT 1,
+                fecha_creacion DATETIME DEFAULT NOW()
+            ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci
+        """)
+        cursor.execute("SELECT COUNT(*) as cnt FROM garantia_piezas")
+        if cursor.fetchone()['cnt'] == 0:
+            piezas_default = [
+                'N/A', 'ASIENTO', 'BATERIA', 'CUADRO', 'DROPPER', 'DROPPER POST',
+                'FRENOS', 'GOOGLES', 'GUANTES', 'HANGER', 'LLANTA', 'MANDO E-BIKE',
+                'MAUBRIO', 'POTENCIA', 'RINES', 'SUSPENSION', 'TRANSMISION',
+                'TWINLOCK', 'UNIDAD MOTRIZ', 'ZAPATOS',
+            ]
+            for p in piezas_default:
+                cursor.execute("INSERT IGNORE INTO garantia_piezas (nombre) VALUES (%s)", (p,))
+        conn.commit()
+        cursor.execute("""
+            SELECT nombre FROM garantia_piezas
+            WHERE activo = 1
+            ORDER BY nombre = 'N/A' DESC, nombre ASC
+        """)
+        return jsonify([r['nombre'] for r in cursor.fetchall()])
+    except Exception as e:
+        logging.exception("Error al listar piezas: %s", e)
+        return jsonify({"error": str(e)}), 500
+    finally:
+        conn.close()
+
+
+@garantias_bp.route("/piezas", methods=["POST"])
+@requiere_autenticacion
+@requiere_rol(1)
+@requiere_permiso_interno("garantias", "crear")
+def agregar_pieza():
+    conn = _conexion_garantias()
+    if not conn:
+        return jsonify({"error": "Sin conexion a BD"}), 500
+    try:
+        datos = request.get_json(force=True) or {}
+        nombre = (datos.get('nombre') or '').strip().upper()
+        if not nombre:
+            return jsonify({"error": "El nombre de la pieza es requerido"}), 400
+        cursor = conn.cursor()
+        cursor.execute("INSERT IGNORE INTO garantia_piezas (nombre) VALUES (%s)", (nombre,))
+        conn.commit()
+        if cursor.rowcount == 0:
+            return jsonify({"ok": True, "mensaje": "La pieza ya existía", "nombre": nombre})
+        return jsonify({"ok": True, "nombre": nombre})
+    except Exception as e:
+        logging.exception("Error al agregar pieza: %s", e)
+        return jsonify({"error": str(e)}), 500
+    finally:
+        conn.close()
+
+
+@garantias_bp.route("/piezas/uso", methods=["GET"])
+@requiere_autenticacion
+@requiere_rol(1)
+@requiere_permiso_interno("garantias", "ver")
+def contar_uso_pieza():
+    """Cuántos tickets tienen asignada esta pieza actualmente -- para avisar
+    antes de quitarla del catálogo (no se tocan esos tickets, solo informa)."""
+    nombre = (request.args.get('nombre') or '').strip().upper()
+    if not nombre:
+        return jsonify({"error": "El nombre de la pieza es requerido"}), 400
+    conn = _conexion_garantias()
+    if not conn:
+        return jsonify({"error": "Sin conexion a BD"}), 500
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT COUNT(*) FROM garantia_formularios WHERE pieza_reemplazo = %s",
+            (nombre,)
+        )
+        count = cursor.fetchone()[0]
+        return jsonify({"nombre": nombre, "count": count})
+    except Exception as e:
+        logging.exception("Error al contar uso de pieza: %s", e)
+        return jsonify({"error": str(e)}), 500
+    finally:
+        conn.close()
+
+
+@garantias_bp.route("/piezas", methods=["DELETE"])
+@requiere_autenticacion
+@requiere_rol(1)
+@requiere_permiso_interno("garantias", "eliminar")
+def eliminar_pieza():
+    """Quita una pieza del catálogo (soft-delete via activo=0) -- para
+    duplicados o nombres capturados por error (ej. 'MAUBRIO'). No afecta los
+    tickets que ya tengan esa pieza asignada, solo deja de ofrecerse en el
+    selector de nuevas asignaciones."""
+    conn = _conexion_garantias()
+    if not conn:
+        return jsonify({"error": "Sin conexion a BD"}), 500
+    try:
+        datos = request.get_json(force=True) or {}
+        nombre = (datos.get('nombre') or '').strip().upper()
+        if not nombre:
+            return jsonify({"error": "El nombre de la pieza es requerido"}), 400
+        if nombre == 'N/A':
+            return jsonify({"error": "No se puede eliminar 'N/A' del catálogo"}), 400
+        cursor = conn.cursor()
+        cursor.execute("UPDATE garantia_piezas SET activo = 0 WHERE nombre = %s", (nombre,))
+        conn.commit()
+        return jsonify({"ok": True, "nombre": nombre})
+    except Exception as e:
+        logging.exception("Error al eliminar pieza: %s", e)
+        return jsonify({"error": str(e)}), 500
+    finally:
+        conn.close()
+
+
+# ── Importación masiva histórica ──────────────────────────────────────────────
+
+COLUMNAS_IMPORTACION = [
+    ("folio_anterior",    "Folio anterior (referencia)",   "GAR-001"),
+    ("distribuidor",      "Distribuidor *",                "Elite Bike GDL"),
+    ("contacto",          "Contacto *",                    "Juan López"),
+    ("puesto",            "Puesto",                        "Gerente"),
+    ("marca",             "Marca *",                       "Scott"),
+    ("modelo",            "Modelo del producto",           "Scale 960"),
+    ("descripcion_dano",  "Descripción del daño *",        "Fisura en tubo inferior del cuadro"),
+    ("estatus",           "Estatus *",                     "Cerrado"),
+    ("estatus_pieza",     "Estatus pieza",                 "Enviada al cliente"),
+    ("pieza_reemplazo",   "Pieza de reemplazo",            "CUADRO"),
+    ("fecha_registro",    "Fecha de registro *",           "2024-03-15"),
+    ("fecha_atencion",    "Fecha de atención (validación docs)", "2024-03-22"),
+    ("fecha_cierre",      "Fecha de cierre",               "2024-04-02"),
+    ("asignado_a",        "Asignado a (nombre exacto del usuario)", "Victor Alejandro Garnier Morga"),
+]
+
+ESTATUSES_VALIDOS      = ['Enviado', 'En revisión', 'Aprobado', 'Rechazado', 'Cerrado']
+ESTATUSES_PIEZA_VALIDOS = ['Sin pieza', 'Solicitada', 'En tránsito', 'En almacén', 'Enviada al cliente', 'Rechazada']
+MARCAS_VALIDAS         = ['Scott', 'Megamo', 'Syncros', 'Vittoria', 'Bosch', 'Otra']
+
+
+def _requiere_admin(request):
+    """Retorna (payload, None) si es admin, o (None, response_error) si no."""
+    auth_header = request.headers.get('Authorization', '')
+    raw_token = auth_header.split(' ')[1] if ' ' in auth_header else None
+    if not raw_token:
+        return None, (jsonify({"error": "No autorizado"}), 401)
+    payload = verificar_token(raw_token)
+    if not payload or not payload.get('id'):
+        return None, (jsonify({"error": "Token inválido"}), 401)
+    conn = _conexion_garantias()
+    if not conn:
+        return None, (jsonify({"error": "Sin conexión a BD"}), 500)
+    try:
+        cursor = conn.cursor(dictionary=True)
+        cursor.execute("SELECT rol_id FROM usuarios WHERE id = %s", (payload['id'],))
+        user = cursor.fetchone()
+    finally:
+        conn.close()
+    if not user or user.get('rol_id') not in (1, 4):
+        return None, (jsonify({"error": "Solo administradores"}), 403)
+    return payload, None
+
+
+@garantias_bp.route("/importar/plantilla", methods=["GET"])
+@requiere_autenticacion
+@requiere_rol(1)
+@requiere_permiso_interno("garantias", "crear")
+def descargar_plantilla_importacion():
+    """Genera y devuelve el Excel plantilla para importación masiva de garantías."""
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+    from openpyxl.utils import get_column_letter
+    from openpyxl.worksheet.datavalidation import DataValidation
+
+    _, err = _requiere_admin(request)
+    if err:
+        return err
+
+    wb = Workbook()
+
+    # ── Hoja 1: Importar ────────────────────────────────────────────────────
+    ws = wb.active
+    ws.title = "Importar"
+
+    hdr_fill   = PatternFill("solid", fgColor="1A1A2E")
+    hdr_font   = Font(bold=True, color="FFFFFF", size=11)
+    req_fill   = PatternFill("solid", fgColor="C8102E")
+    ex_fill    = PatternFill("solid", fgColor="2A2A4E")
+    ex_font    = Font(color="AAAACC", italic=True, size=10)
+    thin       = Side(style='thin', color="444466")
+    border     = Border(left=thin, right=thin, top=thin, bottom=thin)
+    center     = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    left       = Alignment(horizontal="left",  vertical="center", wrap_text=True)
+
+    # Fila 1: instrucción general
+    ws.merge_cells("A1:N1")
+    ws["A1"] = (
+        "PLANTILLA DE IMPORTACIÓN MASIVA — GARANTÍAS ELITE BIKE  |  "
+        "Campos con * son obligatorios  |  Fechas en formato YYYY-MM-DD (ej. 2024-03-15)  |  "
+        "Consulta la hoja 'Usuarios' para los nombres exactos asignables"
+    )
+    ws["A1"].fill      = PatternFill("solid", fgColor="0D0D1A")
+    ws["A1"].font      = Font(bold=True, color="FFD700", size=10)
+    ws["A1"].alignment = Alignment(horizontal="left", vertical="center", wrap_text=True)
+    ws.row_dimensions[1].height = 32
+
+    # Fila 2: encabezados
+    for col_i, (_, label, _) in enumerate(COLUMNAS_IMPORTACION, start=1):
+        cell         = ws.cell(row=2, column=col_i, value=label)
+        cell.fill    = req_fill if label.endswith("*") else hdr_fill
+        cell.font    = hdr_font
+        cell.alignment = center
+        cell.border  = border
+    ws.row_dimensions[2].height = 36
+
+    # Fila 3: fila de ejemplo
+    for col_i, (_, _, ejemplo) in enumerate(COLUMNAS_IMPORTACION, start=1):
+        cell           = ws.cell(row=3, column=col_i, value=ejemplo)
+        cell.fill      = ex_fill
+        cell.font      = ex_font
+        cell.alignment = left
+        cell.border    = border
+    ws.row_dimensions[3].height = 22
+
+    # Anchos de columna
+    anchos = [15, 25, 22, 18, 14, 20, 40, 15, 22, 20, 16, 16, 16, 30]
+    for i, w in enumerate(anchos, start=1):
+        ws.column_dimensions[get_column_letter(i)].width = w
+
+    # Validaciones desplegables en columnas de estatus y marca (filas 4-300)
+    def add_dv(formula, col_letter):
+        dv = DataValidation(type="list", formula1=formula, allow_blank=True)
+        dv.sqref = f"{col_letter}4:{col_letter}300"
+        ws.add_data_validation(dv)
+
+    col_estatus      = get_column_letter(8)   # estatus
+    col_est_pieza    = get_column_letter(9)   # estatus_pieza
+    col_marca        = get_column_letter(5)   # marca
+
+    add_dv('"' + ','.join(ESTATUSES_VALIDOS) + '"',       col_estatus)
+    add_dv('"' + ','.join(ESTATUSES_PIEZA_VALIDOS) + '"', col_est_pieza)
+    add_dv('"' + ','.join(MARCAS_VALIDAS) + '"',          col_marca)
+
+    # ── Hoja 2: Usuarios ────────────────────────────────────────────────────
+    ws2 = wb.create_sheet("Usuarios disponibles")
+    ws2["A1"] = "Nombre exacto del usuario"
+    ws2["B1"] = "Correo"
+    ws2["A1"].font = Font(bold=True, color="FFFFFF")
+    ws2["B1"].font = Font(bold=True, color="FFFFFF")
+    ws2["A1"].fill = PatternFill("solid", fgColor="1A1A2E")
+    ws2["B1"].fill = PatternFill("solid", fgColor="1A1A2E")
+    ws2.column_dimensions["A"].width = 35
+    ws2.column_dimensions["B"].width = 35
+
+    conn = _conexion_garantias()
+    if conn:
+        try:
+            cur = conn.cursor(dictionary=True)
+            cur.execute("SELECT nombre, correo FROM usuarios WHERE activo = 1 ORDER BY nombre")
+            for i, u in enumerate(cur.fetchall(), start=2):
+                ws2.cell(row=i, column=1, value=u.get('nombre') or '')
+                ws2.cell(row=i, column=2, value=u.get('correo') or '')
+        finally:
+            conn.close()
+
+    # ── Hoja 3: Valores válidos ──────────────────────────────────────────────
+    ws3 = wb.create_sheet("Valores válidos")
+    secciones = [
+        ("Estatus del ticket",    ESTATUSES_VALIDOS),
+        ("Estatus de la pieza",   ESTATUSES_PIEZA_VALIDOS),
+        ("Marcas válidas",        MARCAS_VALIDAS),
+    ]
+    col_offset = 1
+    for titulo, valores in secciones:
+        ws3.cell(row=1, column=col_offset, value=titulo).font = Font(bold=True)
+        for i, v in enumerate(valores, start=2):
+            ws3.cell(row=i, column=col_offset, value=v)
+        ws3.column_dimensions[get_column_letter(col_offset)].width = 25
+        col_offset += 2
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    return send_file(
+        buf,
+        as_attachment=True,
+        download_name="plantilla_importacion_garantias.xlsx",
+        mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
+
+
+@garantias_bp.route("/importar", methods=["POST"])
+@requiere_autenticacion
+@requiere_rol(1)
+@requiere_permiso_interno("garantias", "crear")
+def importar_garantias():
+    """Recibe el Excel completado y hace la inserción masiva."""
+    from openpyxl import load_workbook
+
+    _, err = _requiere_admin(request)
+    if err:
+        return err
+
+    if 'archivo' not in request.files:
+        return jsonify({"error": "No se recibió archivo"}), 400
+
+    file = request.files['archivo']
+    if not file.filename or not file.filename.lower().endswith('.xlsx'):
+        return jsonify({"error": "El archivo debe ser .xlsx"}), 400
+
+    try:
+        wb = load_workbook(filename=io.BytesIO(file.read()), data_only=True)
+    except Exception as e:
+        return jsonify({"error": f"No se pudo leer el Excel: {e}"}), 400
+
+    ws = wb["Importar"] if "Importar" in wb.sheetnames else wb.active
+
+    # Cargar usuarios del sistema para mapeo nombre → correo
+    conn = _conexion_garantias()
+    if not conn:
+        return jsonify({"error": "Sin conexión a BD"}), 500
+
+    try:
+        cur = conn.cursor(dictionary=True)
+        cur.execute("SELECT id, nombre, correo FROM usuarios WHERE activo = 1")
+        usuarios_db = cur.fetchall()
+    finally:
+        conn.close()
+
+    # Índice nombre_normalizado → correo (acepta nombre completo, correo completo o prefijo del correo)
+    def _norm(s):
+        return str(s or '').strip().lower()
+
+    usuarios_idx = {_norm(u['nombre']): u['correo'] for u in usuarios_db}
+    # También indexar por correo completo y por prefijo antes del @
+    for u in usuarios_db:
+        correo = (u['correo'] or '').strip().lower()
+        if correo:
+            usuarios_idx[correo] = u['correo']
+            prefix = correo.split('@')[0]
+            if prefix:
+                usuarios_idx[prefix] = u['correo']
+
+    insertados = 0
+    errores    = []
+    filas_datos = list(ws.iter_rows(min_row=4, values_only=True))  # fila 1=instrucción, 2=header, 3=ejemplo
+
+    conn = _conexion_garantias()
+    if not conn:
+        return jsonify({"error": "Sin conexión a BD"}), 500
+
+    try:
+        cursor = conn.cursor()
+
+        for fila_num, row in enumerate(filas_datos, start=4):
+            # Ignorar filas completamente vacías
+            if all(c is None or str(c).strip() == '' for c in row):
+                continue
+
+            def cel(idx):
+                v = row[idx] if idx < len(row) else None
+                return str(v).strip() if v is not None else ''
+
+            distribuidor    = cel(1)
+            contacto        = cel(2)
+            puesto          = cel(3)
+            marca           = cel(4)
+            modelo          = cel(5)
+            descripcion     = cel(6)
+            estatus         = cel(7) or 'Enviado'
+            estatus_pieza   = cel(8) or 'Sin pieza'
+            pieza_reemplazo = cel(9)
+            fecha_registro  = cel(10)
+            fecha_atencion  = cel(11)
+            fecha_cierre    = cel(12)
+            asignado_a      = cel(13)
+
+            # Validaciones obligatorias
+            fila_err = []
+            if not distribuidor:  fila_err.append("Falta distribuidor")
+            if not contacto:      fila_err.append("Falta contacto")
+            if not marca:         fila_err.append("Falta marca")
+            if not descripcion:   fila_err.append("Falta descripción del daño")
+            if not fecha_registro: fila_err.append("Falta fecha de registro")
+            if estatus not in ESTATUSES_VALIDOS:
+                fila_err.append(f"Estatus inválido: '{estatus}'")
+
+            # Parsear fecha_registro
+            fecha_creacion_dt = None
+            if fecha_registro:
+                for fmt in ('%Y-%m-%d', '%d/%m/%Y', '%d-%m-%Y'):
+                    try:
+                        fecha_creacion_dt = datetime.strptime(fecha_registro, fmt)
+                        break
+                    except ValueError:
+                        continue
+                if not fecha_creacion_dt:
+                    fila_err.append(f"Fecha de registro inválida: '{fecha_registro}' (use YYYY-MM-DD)")
+
+            if fila_err:
+                errores.append({"fila": fila_num, "errores": fila_err})
+                continue
+
+            # Resolver email del asignado
+            email_ticket = ''
+            if asignado_a:
+                email_ticket = usuarios_idx.get(_norm(asignado_a), '')
+                if not email_ticket:
+                    errores.append({
+                        "fila": fila_num,
+                        "errores": [f"Usuario '{asignado_a}' no encontrado — ticket importado sin asignar"]
+                    })
+
+            # Construir JSON de datos del formulario
+            datos_json = json.dumps({
+                "distribuidor":     distribuidor,
+                "contacto":         contacto,
+                "puesto":           puesto,
+                "marca":            marca,
+                "modelo":           modelo,
+                "descripcion_dano": descripcion,
+                "importado":        True,
+            }, ensure_ascii=False)
+
+            # Insertar registro principal
+            cursor.execute("""
+                INSERT INTO garantia_formularios
+                    (email, distribuidor, contacto, puesto, marca,
+                     datos, estatus, estatus_pieza, pieza_reemplazo, fecha_creacion)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            """, (
+                email_ticket, distribuidor, contacto, puesto, marca,
+                datos_json, estatus,
+                estatus_pieza if estatus_pieza in ESTATUSES_PIEZA_VALIDOS else 'Sin pieza',
+                pieza_reemplazo or None,
+                fecha_creacion_dt,
+            ))
+            new_id = cursor.lastrowid
+            folio  = f"GAR-{new_id:04d}"
+            cursor.execute("UPDATE garantia_formularios SET folio = %s WHERE id = %s", (folio, new_id))
+
+            # Fecha de cierre → fecha_actualizacion si estatus es terminal
+            if fecha_cierre and estatus in ('Cerrado', 'Rechazado'):
+                for fmt in ('%Y-%m-%d', '%d/%m/%Y', '%d-%m-%Y'):
+                    try:
+                        dt_cierre = datetime.strptime(fecha_cierre, fmt)
+                        cursor.execute(
+                            "UPDATE garantia_formularios SET fecha_actualizacion = %s WHERE id = %s",
+                            (dt_cierre, new_id)
+                        )
+                        break
+                    except ValueError:
+                        continue
+
+            # Fecha de atención → comentario tipo 'validacion' para la latencia
+            if fecha_atencion:
+                for fmt in ('%Y-%m-%d', '%d/%m/%Y', '%d-%m-%Y'):
+                    try:
+                        dt_atencion = datetime.strptime(fecha_atencion, fmt)
+                        cursor.execute("""
+                            INSERT INTO garantia_comentarios (formulario_id, autor, texto, tipo, fecha)
+                            VALUES (%s, %s, %s, %s, %s)
+                        """, (new_id, 'Sistema', 'Documentos validados (importación histórica)', 'validacion', dt_atencion))
+                        break
+                    except ValueError:
+                        continue
+
+            insertados += 1
+
+        conn.commit()
+        return jsonify({
+            "ok":        True,
+            "insertados": insertados,
+            "errores":   errores,
+            "mensaje":   f"{insertados} tickets importados correctamente" + (f", {len(errores)} con advertencias" if errores else ""),
+        })
+
+    except Exception as e:
+        conn.rollback()
+        logging.exception("Error en importación masiva de garantías: %s", e)
+        return jsonify({"error": str(e)}), 500
+    finally:
+        conn.close()
+
+
 # ── File uploads ──────────────────────────────────────────────────────────────
 
 @garantias_bp.route("/archivo/subir", methods=["POST"])
+@requiere_autenticacion
+@_requiere_permiso_archivo_garantia
 def subir_archivo():
+    accion = request.form.get('accion')
+
+    if int(g.usuario_actual.get('rol', 0)) != 4:
+        permitido, error = usuario_actual_tiene_modulo('usuarios_garantias')
+        if not permitido:
+            return error
+
     if 'archivo' not in request.files:
         return jsonify({"error": "No se recibio archivo"}), 400
 
@@ -818,7 +1901,9 @@ def subir_archivo():
         return jsonify({"error": "Nombre de archivo vacio"}), 400
 
     if not allowed_file(file.filename):
-        return jsonify({"error": "Tipo de archivo no permitido"}), 400
+        if file.filename.lower().endswith(('.heic', '.heif')):
+            return jsonify({"error": "Formato HEIC no compatible. Convierte la foto a JPG antes de subirla."}), 400
+        return jsonify({"error": "Tipo de archivo no permitido. Formatos: JPG, PNG, WEBP, GIF, PDF, MP4, MOV, AVI."}), 400
 
     try:
         resultado = subir_archivo_s3(file)
@@ -838,17 +1923,33 @@ def subir_archivo():
 
 
 @garantias_bp.route("/archivo/<path:nombre>", methods=["GET"])
+@requiere_autenticacion
+@requiere_modulo("usuarios_garantias")
+@requiere_permiso_interno("garantias", "ver")
 def descargar_archivo(nombre):
+    conn = _conexion_garantias()
+    if not conn:
+        return jsonify({"error": "Sin conexion a BD"}), 500
     try:
+        cursor = conn.cursor(dictionary=True)
+        if not _usuario_actual_puede_descargar_archivo(cursor, nombre):
+            return jsonify({"error": "Archivo no encontrado o no autorizado"}), 403
+
         key_s3 = nombre
 
         if not existe_archivo_s3(key_s3):
             return jsonify({"error": "Archivo no encontrado"}), 404
 
-        url = generar_url_firmada_s3(key_s3)
+        contenido, content_type = descargar_archivo_s3(key_s3)
 
-        return redirect(url)
+        return send_file(
+            io.BytesIO(contenido),
+            mimetype=content_type,
+            download_name=os.path.basename(key_s3),
+        )
 
     except Exception as e:
         logging.exception("Error obteniendo archivo de garantia desde S3: %s", e)
         return jsonify({"error": "Error al obtener archivo"}), 500
+    finally:
+        conn.close()

@@ -31,6 +31,45 @@ def generar_token(id_usuario, rol, usuario, nombre, cliente_id, clave_cliente, n
     }
     return jwt.encode(payload, SECRET_KEY, algorithm='HS256')
 
+
+def generar_token_prewarm_interno():
+    """Genera un JWT de administrador activo para solicitudes locales de caché.
+
+    Los precalentadores consultan endpoints ya protegidos para reutilizar su
+    lógica de caché. No representan una sesión de navegador ni se exponen al
+    cliente; si no hay un administrador activo, el precalentamiento se omite.
+    """
+    from db_conexion import obtener_conexion
+
+    conexion = None
+    cursor = None
+    try:
+        conexion = obtener_conexion()
+        cursor = conexion.cursor(dictionary=True)
+        cursor.execute("""
+            SELECT u.id, u.usuario, u.nombre, u.cliente_id,
+                   c.clave, c.nombre_cliente, c.id_grupo
+            FROM usuarios u
+            LEFT JOIN clientes c ON c.id = u.cliente_id
+            WHERE u.rol_id = 1 AND u.activo = 1
+            ORDER BY u.id
+            LIMIT 1
+        """)
+        usuario = cursor.fetchone()
+        if not usuario:
+            return None
+
+        return generar_token(
+            usuario['id'], 1, usuario['usuario'], usuario['nombre'],
+            usuario['cliente_id'], usuario['clave'], usuario['nombre_cliente'],
+            usuario['id_grupo'], None,
+        )
+    finally:
+        if cursor:
+            cursor.close()
+        if conexion:
+            conexion.close()
+
 def verificar_token(token):
     try:
         return jwt.decode(token, SECRET_KEY, algorithms=['HS256'])
@@ -38,6 +77,18 @@ def verificar_token(token):
         return None  # Token expirado
     except jwt.InvalidTokenError:
         return None  # Token inválido
+
+def verificar_token_con_gracia(token, minutos_gracia=60):
+    """Verifica el token ignorando la expiración si no lleva más de `minutos_gracia` expirado."""
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=['HS256'], options={"verify_exp": False})
+        exp = payload.get('exp', 0)
+        ahora = datetime.datetime.utcnow().timestamp()
+        if exp > 0 and (ahora - exp) > minutos_gracia * 60:
+            return None  # Expirado más allá de la gracia permitida
+        return payload
+    except jwt.InvalidTokenError:
+        return None
 
 def registrar_auditoria(cursor, accion, tabla, id_registro, descripcion):
     """

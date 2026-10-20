@@ -1,9 +1,11 @@
 from flask import Blueprint, request, jsonify
 from db_conexion import obtener_conexion
+from utils.auth_decorators import requiere_autenticacion
 
 metas_bp = Blueprint('metas', __name__, url_prefix='')
 
 @metas_bp.route('/metas', methods=['GET'])
+@requiere_autenticacion
 def listar_metas():
     conexion = obtener_conexion()
     cursor = conexion.cursor(dictionary=True)
@@ -26,6 +28,7 @@ def listar_metas():
             conexion.close()
 
 @metas_bp.route('/metas/agregar', methods=['POST'])
+@requiere_autenticacion
 def agregar_meta():
     data = request.get_json()
     nivel = data.get('nivel')
@@ -62,6 +65,7 @@ def agregar_meta():
             conexion.close()
 
 @metas_bp.route('/metas/editar/<int:id_meta>', methods=['PUT'])
+@requiere_autenticacion
 def editar_meta(id_meta):
     data = request.get_json()
     nivel = data.get('nivel')
@@ -103,6 +107,7 @@ def editar_meta(id_meta):
             conexion.close()
 
 @metas_bp.route('/metas/eliminar/<int:id_meta>', methods=['DELETE'])
+@requiere_autenticacion
 def eliminar_meta(id_meta):
     conexion = obtener_conexion()
     cursor = conexion.cursor()

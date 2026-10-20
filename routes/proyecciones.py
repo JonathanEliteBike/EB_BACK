@@ -1,30 +1,79 @@
-from flask import Blueprint, jsonify
+from flask import Blueprint, jsonify, g
 from db_conexion import obtener_conexion
 from flask import request
-import mysql.connector
-import jwt
+import pymysql as mysql_connector_compat
 import json
 from werkzeug.utils import secure_filename
 import os
 from datetime import datetime
 from utils.tiempo import ahora_mx, ahora_str
-try:
-    import pandas as pd
-    PANDAS_OK = True
-except Exception:
-    pd = None  # type: ignore
-    PANDAS_OK = False
+from utils.auth_decorators import requiere_autenticacion, requiere_rol, requiere_modulo
+from services.politica_montos_service import PoliticaMontosService
+pd = None
+PANDAS_OK = False
+
+def _get_pandas():
+    global pd, PANDAS_OK
+    if pd is not None:
+        return pd
+    try:
+        import pandas as _pd
+        pd = _pd
+        PANDAS_OK = True
+    except Exception:
+        pd = None
+        PANDAS_OK = False
+    return pd
 import traceback
 try:
     import numpy as np
 except Exception:
     np = None  # type: ignore
 
-SECRET_KEY = "123456"
-
 proyecciones_bp = Blueprint('proyecciones', __name__, url_prefix='')
 
+
+_CAMPOS_MONETARIOS_PROYECCIONES = {
+    'precio_aplicado', 'precio_distribuidor_sin_iva', 'precio_partner_sin_iva',
+    'precio_elite_sin_iva', 'precio_elite_plus_sin_iva',
+    'precio_distribuidor_con_iva', 'precio_partner_con_iva',
+    'precio_elite_con_iva', 'precio_elite_plus_con_iva',
+    'orden_total_importe', 'importe_total', 'total_proyeccion', 'subtotal',
+}
+
+
+def _redactar_montos_proyecciones(filas):
+    """Elimina precios internos e importes, conservando precios públicos."""
+    for fila in filas:
+        for campo in list(fila):
+            nombre = str(campo).lower()
+            if (
+                nombre in _CAMPOS_MONETARIOS_PROYECCIONES
+                or (
+                    'precio' in nombre and nombre not in {
+                        'precio_publico', 'precio_publico_con_iva',
+                        'precio_publico_con_iva_my26', 'precio_publico_sin_iva',
+                    }
+                )
+                or 'importe' in nombre
+                or 'costo' in nombre or 'inversion' in nombre
+            ):
+                fila.pop(campo, None)
+        productos = fila.get('productos')
+        if isinstance(productos, list):
+            _redactar_montos_proyecciones(productos)
+        historial = fila.get('historial_clientes')
+        if isinstance(historial, list):
+            _redactar_montos_proyecciones(historial)
+    return filas
+
+
+def _debe_ocultar_montos_proyecciones():
+    return PoliticaMontosService.debe_ocultar_montos(g.usuario_actual['id'], 'proyeccion_compras')
+
 @proyecciones_bp.route('/proyecciones', methods=['GET'])
+@requiere_autenticacion
+@requiere_modulo('usuarios_proyeccion_compras')
 def listar_proyecciones():
     conexion = obtener_conexion()
     cursor = conexion.cursor(dictionary=True)
@@ -34,7 +83,7 @@ def listar_proyecciones():
         resultados = cursor.fetchall()
 
         if resultados:
-            return jsonify(resultados), 200
+            return jsonify(_redactar_montos_proyecciones(resultados) if _debe_ocultar_montos_proyecciones() else resultados), 200
         else:
             return jsonify({"mensaje": "No hay proyecciones registradas"}), 404
     except Exception as e:
@@ -47,6 +96,8 @@ def listar_proyecciones():
             conexion.close()
 
 @proyecciones_bp.route('/proyecciones-limpias', methods=['GET'])
+@requiere_autenticacion
+@requiere_modulo('usuarios_proyeccion_compras')
 def listar_proyecciones_limpias():
     conexion = obtener_conexion()
     cursor = conexion.cursor(dictionary=True)
@@ -118,7 +169,7 @@ def listar_proyecciones_limpias():
             ORDER BY pv.id
         """)
         resultados = cursor.fetchall()
-        return jsonify(resultados), 200 if resultados else 404
+        return jsonify(_redactar_montos_proyecciones(resultados) if _debe_ocultar_montos_proyecciones() else resultados), 200 if resultados else 404
 
     except Exception as e:
         print("Error al obtener proyecciones limpias:", str(e))
@@ -130,23 +181,11 @@ def listar_proyecciones_limpias():
             conexion.close()
 
 @proyecciones_bp.route('/proyecciones/agregar', methods=['POST'])
+@requiere_autenticacion
+@requiere_modulo('usuarios_proyeccion_compras')
 def agregar_proyecciones_cliente():
     data = request.get_json()
-    auth_header = request.headers.get('Authorization')
-
-    if not auth_header:
-        return jsonify({"error": "No se proporcionó token"}), 401
-
-    try:
-        token = auth_header.split(" ")[1]
-        decoded = jwt.decode(token, SECRET_KEY, algorithms=["HS256"])
-        id_usuario = decoded.get("id")
-    except Exception as e:
-        print("Error al decodificar token:", str(e))
-        return jsonify({"error": "Token inválido"}), 401
-
-    if not id_usuario:
-        return jsonify({"error": "No se proporcionó id_usuario en headers"}), 400
+    id_usuario = g.usuario_actual['id']
 
     if not isinstance(data, list):
         return jsonify({"error": "Se esperaba una lista de proyecciones"}), 400
@@ -248,7 +287,7 @@ def agregar_proyecciones_cliente():
             ))
 
         conexion.commit()
-        return jsonify({
+        respuesta = {
             "mensaje": "Proyecciones registradas correctamente",
             "folio": folio,
             "total_proyeccion": total_proyeccion,
@@ -261,9 +300,12 @@ def agregar_proyecciones_cliente():
                 'q1_abr_2026', 'q2_abr_2026',
                 'q1_may_2026', 'q2_may_2026'
             ]) for p in data)
-        }), 201
+        }
+        if _debe_ocultar_montos_proyecciones():
+            respuesta.pop('total_proyeccion', None)
+        return jsonify(respuesta), 201
 
-    except mysql.connector.Error as err:
+    except mysql_connector_compat.Error as err:
         print("Error al insertar proyecciones:", str(err))
         conexion.rollback()
         return jsonify({"error": "Error al insertar proyecciones"}), 500
@@ -274,21 +316,13 @@ def agregar_proyecciones_cliente():
             conexion.close()
 
 @proyecciones_bp.route('/proyecciones/historial', methods=['GET'])
+@requiere_autenticacion
+@requiere_modulo('usuarios_proyeccion_compras')
 def historial_proyecciones_cliente():
     conexion = obtener_conexion()
     cursor = conexion.cursor(dictionary=True)
 
-    auth_header = request.headers.get('Authorization')
-    if not auth_header:
-        return jsonify({"error": "No se proporcionó token"}), 401
-
-    try:
-        token = auth_header.split(" ")[1]
-        decoded = jwt.decode(token, SECRET_KEY, algorithms=["HS256"])
-        id_usuario = decoded.get("id")
-    except Exception as e:
-        print("Error al decodificar token:", str(e))
-        return jsonify({"error": "Token inválido"}), 401
+    id_usuario = g.usuario_actual['id']
 
     try:
         # Buscar el ID del cliente asociado al usuario autenticado
@@ -369,7 +403,7 @@ def historial_proyecciones_cliente():
         if not proyecciones:
             return jsonify({"mensaje": "Este cliente no tiene historial"}), 404
 
-        return jsonify(proyecciones), 200
+        return jsonify(_redactar_montos_proyecciones(proyecciones) if _debe_ocultar_montos_proyecciones() else proyecciones), 200
 
     except Exception as e:
         print("Error al obtener historial:", str(e))
@@ -381,6 +415,8 @@ def historial_proyecciones_cliente():
             conexion.close()
 
 @proyecciones_bp.route('/proyecciones/detalles/<int:id_proyeccion>', methods=['GET'])
+@requiere_autenticacion
+@requiere_rol(1)
 def detalles_proyeccion(id_proyeccion):
     conexion = obtener_conexion()
     cursor = conexion.cursor(dictionary=True)
@@ -473,7 +509,8 @@ def detalles_proyeccion(id_proyeccion):
         else:
             resultado["historial_clientes"] = []
 
-        return jsonify(resultado), 200
+        respuesta = _redactar_montos_proyecciones([resultado])[0] if _debe_ocultar_montos_proyecciones() else resultado
+        return jsonify(respuesta), 200
 
     except Exception as e:
         print("Error completo al obtener detalles:", str(e))
@@ -486,6 +523,8 @@ def detalles_proyeccion(id_proyeccion):
 
 # Disponibilidades
 @proyecciones_bp.route('/disponibilidades', methods=['GET'])
+@requiere_autenticacion
+@requiere_rol(1)
 def listar_disponibilidades():
     conexion = obtener_conexion()
     cursor = conexion.cursor(dictionary=True)
@@ -504,6 +543,8 @@ def listar_disponibilidades():
             conexion.close()
 
 @proyecciones_bp.route('/proyecciones/buscar/<int:id>', methods=['GET'])
+@requiere_autenticacion
+@requiere_rol(1)
 def buscar_proyeccion_por_id(id):
     conexion = obtener_conexion()
     cursor = conexion.cursor(dictionary=True)
@@ -526,6 +567,8 @@ def buscar_proyeccion_por_id(id):
             conexion.close()
 
 @proyecciones_bp.route('/proyecciones/nueva', methods=['POST'])
+@requiere_autenticacion
+@requiere_rol(1)
 def agregar_proyeccion():
     data = request.get_json()
 
@@ -631,6 +674,8 @@ def agregar_proyeccion():
             conexion.close()
 
 @proyecciones_bp.route('/proyecciones/editar/<int:id>', methods=['PUT'])
+@requiere_autenticacion
+@requiere_rol(1)
 def editar_proyeccion(id):
     data = request.get_json()
 
@@ -703,6 +748,8 @@ def editar_proyeccion(id):
             conexion.close()
 
 @proyecciones_bp.route('/proyecciones/eliminar/<int:id>', methods=['DELETE'])
+@requiere_autenticacion
+@requiere_rol(1)
 def eliminar_proyeccion(id):
     try:
         conexion = obtener_conexion()
@@ -728,22 +775,10 @@ def eliminar_proyeccion(id):
             conexion.close()
 
 @proyecciones_bp.route('/proyecciones/ya-enviada', methods=['GET'])
+@requiere_autenticacion
+@requiere_modulo('usuarios_proyeccion_compras')
 def verificar_proyeccion_enviada():
-    auth_header = request.headers.get('Authorization')
-    
-    if not auth_header:
-        return jsonify({"error": "No se proporcionó token"}), 401
-
-    try:
-        token = auth_header.split(" ")[1]
-        decoded = jwt.decode(token, SECRET_KEY, algorithms=["HS256"])
-        id_usuario = decoded.get("id")
-    except Exception as e:
-        print("Error al decodificar token:", str(e))
-        return jsonify({"error": "Token inválido"}), 401
-
-    if not id_usuario:
-        return jsonify({"error": "No se proporcionó id_usuario"}), 400
+    id_usuario = g.usuario_actual['id']
 
     try:
         conexion = obtener_conexion()
@@ -778,6 +813,8 @@ def verificar_proyeccion_enviada():
             conexion.close()
 
 @proyecciones_bp.route('/proyecciones/resumen-global', methods=['GET'])
+@requiere_autenticacion
+@requiere_rol(1)
 def resumen_global_proyecciones():
     conexion = obtener_conexion()
     cursor = conexion.cursor(dictionary=True)
@@ -886,7 +923,10 @@ def resumen_global_proyecciones():
 
             agrupado[id_cliente]["productos"].append(producto)
 
-        return jsonify(list(agrupado.values())), 200
+        respuesta = list(agrupado.values())
+        if _debe_ocultar_montos_proyecciones():
+            respuesta = _redactar_montos_proyecciones(respuesta)
+        return jsonify(respuesta), 200
 
     except Exception as e:
         print("Error al obtener el resumen global:", str(e))
@@ -899,6 +939,8 @@ def resumen_global_proyecciones():
             conexion.close()
 
 @proyecciones_bp.route('/importar_proyecciones', methods=['POST'])
+@requiere_autenticacion
+@requiere_rol(1)
 def importar_proyecciones():
     if 'file' not in request.files:
         return jsonify({'success': False, 'error': 'No se proporcionó archivo'}), 400
@@ -1064,18 +1106,10 @@ def importar_proyecciones():
             conexion.close()
 
 @proyecciones_bp.route('/proyecciones/autoguardado', methods=['POST'])
+@requiere_autenticacion
+@requiere_modulo('usuarios_proyeccion_compras')
 def manejar_autoguardado():
-    auth_header = request.headers.get('Authorization')
-    if not auth_header:
-        return jsonify({"error": "No se proporcionó token"}), 401
-
-    try:
-        token = auth_header.split(" ")[1]
-        decoded = jwt.decode(token, SECRET_KEY, algorithms=["HS256"])
-        id_usuario = decoded.get("id")
-    except Exception as e:
-        print("Error al decodificar token:", str(e))
-        return jsonify({"error": "Token inválido"}), 401
+    id_usuario = g.usuario_actual['id']
 
     conexion = obtener_conexion()
     cursor = conexion.cursor(dictionary=True)
@@ -1180,7 +1214,7 @@ def manejar_autoguardado():
         else:
             return jsonify({"error": "Acción no válida"}), 400
 
-    except mysql.connector.Error as err:
+    except mysql_connector_compat.Error as err:
         print("Error en autoguardado:", str(err))
         conexion.rollback()
         return jsonify({"error": "Error en el servidor"}), 500

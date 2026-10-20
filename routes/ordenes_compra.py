@@ -2,6 +2,7 @@ from datetime import date, datetime
 from decimal import Decimal
 from flask import Blueprint, jsonify, request
 from db_conexion import obtener_conexion
+from utils.jwt_utils import registrar_auditoria
 
 ordenes_compra_bp = Blueprint('ordenes_compra_bp', __name__, url_prefix='/flujo')
 
@@ -31,6 +32,10 @@ def crear_orden():
             imp_final,
             data.get('fecha_vencimiento')
         ))
+        registrar_auditoria(
+            cursor, 'INSERT_ORDEN_COMPRA', 'ordenes_compra', cursor.lastrowid,
+            f"Orden de compra {data.get('codigo_po') or 'sin código'} registrada"
+        )
         conexion.commit()
         return jsonify({"mensaje": "Orden registrada correctamente"}), 201
     except Exception as e:
@@ -88,6 +93,10 @@ def actualizar_orden(id_orden):
             data.get('estatus'), # Para cambiar a 'TRANSITO', 'CERRADO', etc.
             id_orden
         ))
+        registrar_auditoria(
+            cursor, 'UPDATE_ORDEN_COMPRA', 'ordenes_compra', id_orden,
+            f"Orden de compra {data.get('codigo_po') or id_orden} actualizada"
+        )
         conexion.commit()
         return jsonify({"mensaje": "Orden actualizada"}), 200
     except Exception as e:
@@ -104,6 +113,10 @@ def eliminar_orden(id_orden):
         cursor = conexion.cursor()
         # Nota: Esto fallará si la orden ya tiene embarques (por seguridad de la BD)
         cursor.execute("DELETE FROM ordenes_compra WHERE id_orden = %s", (id_orden,))
+        registrar_auditoria(
+            cursor, 'DELETE_ORDEN_COMPRA', 'ordenes_compra', id_orden,
+            f"Orden de compra {id_orden} eliminada"
+        )
         conexion.commit()
         return jsonify({"mensaje": "Orden eliminada"}), 200
     except Exception as e:
