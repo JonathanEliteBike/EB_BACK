@@ -215,7 +215,7 @@ def inicializar_tablas():
     if not conn:
         return jsonify({"error": "Sin conexion a BD"}), 500
     try:
-        cursor = conn.cursor()
+        cursor = conn.cursor(dictionary=True)
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS garantia_formularios (
                 id INT AUTO_INCREMENT PRIMARY KEY,
