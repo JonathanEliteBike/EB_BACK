@@ -1,9 +1,15 @@
+import os
+
 import jwt
+from dotenv import load_dotenv
 import datetime
 from flask import request
 import pytz
 
-SECRET_KEY = "121221"
+load_dotenv()
+SECRET_KEY = os.getenv("JWT_SECRET", "").strip()
+if len(SECRET_KEY) < 32:
+    raise RuntimeError("Configure JWT_SECRET con al menos 32 caracteres aleatorios antes de iniciar Flask")
 
 def generar_token(id_usuario, rol, usuario, nombre, cliente_id, clave_cliente, nombre_cliente, id_grupo, flujo):
     payload = {

@@ -1252,11 +1252,12 @@ def add_comentario(formulario_id):
         tipo = datos.get('tipo', 'comentario')
 
         if tipo == 'nota_interna':
-            # Solo rol 1 puede crear notas internas.
+            # El decorador anterior ya exige garantias:ver + garantias:crear
+            # al rol 4; el rol 1 conserva su acceso administrativo.
             cursor_u = conn.cursor(dictionary=True)
             cursor_u.execute("SELECT nombre, rol_id FROM usuarios WHERE id = %s", (g.usuario_actual['id'],))
             user = cursor_u.fetchone()
-            if not user or user.get('rol_id') != 1:
+            if not user or user.get('rol_id') not in (1, 4):
                 return jsonify({"error": "No autorizado"}), 403
             autor = user.get('nombre') or 'Administrador'
         else:
