@@ -312,33 +312,6 @@ def inicializar_tablas():
 
 # ── Form submissions ──────────────────────────────────────────────────────────
 
-@garantias_bp.route("/usuarios-asignables", methods=["GET"])
-@requiere_autenticacion
-@requiere_rol(1)
-@requiere_permiso_interno("garantias", "crear")
-def listar_usuarios_asignables():
-    """Usuarios activos que pueden recibir un ticket creado desde Garantías."""
-    conn = _conexion_garantias()
-    if not conn:
-        return jsonify({"error": "Sin conexion a BD"}), 500
-    try:
-        cursor = conn.cursor(dictionary=True)
-        cursor.execute("""
-            SELECT id, nombre, correo, usuario
-            FROM usuarios
-            WHERE activo = 1
-              AND rol_id != 1
-              AND correo IS NOT NULL
-              AND correo != ''
-            ORDER BY nombre, usuario
-        """)
-        return jsonify(cursor.fetchall())
-    except Exception as e:
-        logging.exception("Error al listar usuarios asignables de garantías: %s", e)
-        return jsonify({"error": "Error al obtener usuarios asignables"}), 500
-    finally:
-        conn.close()
-
 @garantias_bp.route("/formulario/enviar", methods=["POST"])
 @requiere_autenticacion
 @requiere_rol(1, 4)
@@ -358,20 +331,13 @@ def enviar_formulario():
         cliente_id_dueno = user.get('cliente_id') if user else None
         if user and user.get('correo'):
             email = user['correo']
-            # El rol 4 llega aquí sólo después de validar garantias:crear en el
-            # decorador. El destinatario se vuelve a consultar para no aceptar
-            # un correo arbitrario enviado desde el cliente.
-            if user.get('rol_id') in (1, 4) and datos.get('email_asignado'):
-                cursor_u.execute("""
-                    SELECT correo, cliente_id
-                    FROM usuarios
-                    WHERE correo = %s AND activo = 1
-                """, (datos['email_asignado'],))
+            # Si el administrador asigna explícitamente a otro usuario, usar ese email
+            # y resolver la clave de distribuidor con el cliente de esa cuenta.
+            if user.get('rol_id') == 1 and datos.get('email_asignado'):
+                email = datos['email_asignado']
+                cursor_u.execute("SELECT cliente_id FROM usuarios WHERE correo = %s", (email,))
                 asignado = cursor_u.fetchone()
-                if not asignado:
-                    return jsonify({"error": "Usuario asignado no válido."}), 400
-                email = asignado['correo']
-                cliente_id_dueno = asignado.get('cliente_id')
+                cliente_id_dueno = asignado['cliente_id'] if asignado else None
 
         # Clave del distribuidor (identifica la sucursal exacta, ej. NARUCO tiene
         # varias con la misma razón social pero clave distinta) -- se resuelve del
@@ -384,14 +350,6 @@ def enviar_formulario():
 
         cursor = conn.cursor()
         fecha_ingreso = datos.get('fecha_ingreso') or None
-        if fecha_ingreso:
-            try:
-                fecha_ingreso = datetime.strptime(fecha_ingreso, '%Y-%m-%d').date()
-            except (TypeError, ValueError):
-                return jsonify({"error": "La fecha de ingreso debe tener formato YYYY-MM-DD."}), 400
-            if fecha_ingreso > _hoy_cdmx():
-                return jsonify({"error": "La fecha de ingreso no puede ser futura."}), 400
-            fecha_ingreso = fecha_ingreso.isoformat()
 
         # Insertar sin folio para obtener el ID auto-increment
         if fecha_ingreso:
