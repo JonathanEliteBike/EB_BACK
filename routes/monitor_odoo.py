@@ -952,6 +952,21 @@ def sync_monitor_odoo():
         except Exception as _e:
             logging.warning('sync_monitor_odoo: no se pudo guardar timestamp: %s', _e)
 
+        # El letrero "Última Actualización" del Monitor Previo lee esta tabla
+        # (ver /ultima_actualizacion) -- antes de este fix nadie la escribía,
+        # así que se quedaba congelada en lo último que algún seed/restore
+        # manual hubiera puesto ahí, sin importar cuántas veces corriera el sync.
+        try:
+            zona_mx = ZoneInfo("America/Mexico_City")
+            cursor.execute(
+                "INSERT INTO cache_ultima_actualizacion (id, ultima_fecha) VALUES (1, %s) "
+                "ON DUPLICATE KEY UPDATE ultima_fecha = VALUES(ultima_fecha)",
+                (datetime.now(zona_mx),)
+            )
+            conexion.commit()
+        except Exception as _e:
+            logging.warning('sync_monitor_odoo: no se pudo actualizar cache_ultima_actualizacion: %s', _e)
+
         result = {
             'success': True,
             'message': f'Se sincronizaron {total_insertados} registros desde Odoo',

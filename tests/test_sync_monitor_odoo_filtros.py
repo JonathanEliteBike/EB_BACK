@@ -1,7 +1,14 @@
 from unittest.mock import MagicMock, patch
 import routes.monitor_odoo as mo
 from app import app
+from utils.jwt_utils import generar_token
 import inspect
+
+# requiere_autenticacion exige un Bearer real desde que se blindaron estos
+# endpoints (migracion de permisos); rol=1 tiene bypass total en los
+# decoradores de permiso interno.
+_TOKEN_ADMIN_TEST = generar_token(1, 1, 'test.admin', 'Test Admin', None, None, None, None, None)
+_AUTH_HEADERS = {'Authorization': f'Bearer {_TOKEN_ADMIN_TEST}'}
 
 
 def test_sync_monitor_odoo_excluye_reversed_e_invoicing_legacy():
@@ -9,7 +16,7 @@ def test_sync_monitor_odoo_excluye_reversed_e_invoicing_legacy():
     fake_models.execute_kw.return_value = []  # sin facturas -> corta temprano, solo nos interesa el dominio
 
     with patch("routes.monitor_odoo.get_odoo_models", return_value=(1, fake_models, None)):
-        with app.test_request_context("/sync-monitor-odoo", method="POST", json={}):
+        with app.test_request_context("/sync-monitor-odoo", method="POST", json={}, headers=_AUTH_HEADERS):
             mo.sync_monitor_odoo()
 
     args, kwargs = fake_models.execute_kw.call_args_list[0]
@@ -108,7 +115,7 @@ def test_linea_con_precio_negativo_se_excluye():
 
     with patch("routes.monitor_odoo.get_odoo_models", return_value=(1, fake_models, None)):
         with patch("routes.monitor_odoo.obtener_conexion", return_value=mock_connection):
-            with app.test_request_context("/sync-monitor-odoo", method="POST", json={}):
+            with app.test_request_context("/sync-monitor-odoo", method="POST", json={}, headers=_AUTH_HEADERS):
                 result = mo.sync_monitor_odoo()
 
     # Verificar que solo se insertó la línea válida, NO la de precio negativo
@@ -207,10 +214,80 @@ def test_prefijos_excluidos_incluye_fle():
 
     with patch("routes.monitor_odoo.get_odoo_models", return_value=(1, fake_models, None)):
         with patch("routes.monitor_odoo.obtener_conexion", return_value=mock_connection):
-            with app.test_request_context("/sync-monitor-odoo", method="POST", json={}):
+            with app.test_request_context("/sync-monitor-odoo", method="POST", json={}, headers=_AUTH_HEADERS):
                 result = mo.sync_monitor_odoo()
 
     # Solo debe insertarse la línea sin prefijo FLE
     assert len(insert_calls) == 1, f"Esperaba 1 INSERT, obtuvo {len(insert_calls)}"
     # El tercer parámetro es nombre_producto
     assert 'Bicicleta valida' in str(insert_calls[0][2])
+
+
+def test_sync_exitoso_actualiza_cache_ultima_actualizacion():
+    """
+    El letrero "Última Actualización" del Monitor Previo lee de
+    cache_ultima_actualizacion (routes/monitor_odoo.py:130) pero, antes de
+    este fix, sync_monitor_odoo() nunca escribía ahí -- por eso el letrero
+    se quedaba congelado en la fecha de la última restauración/seed manual
+    aunque el sync corriera bien (visto en producción: encuesta quedó en
+    2026-09-30 pese a sincronizar 24244 registros el 2026-10-22).
+    """
+    fake_models = MagicMock()
+    fake_factura = {
+        'id': 3,
+        'name': 'INV-2025-CACHE-001',
+        'invoice_date': '2025-07-17',
+        'partner_id': [3, 'Partner Test 3'],
+        'invoice_line_ids': [300],
+    }
+    fake_lines = [{
+        'id': 300,
+        'product_id': [400, '[BIKE002] Bicicleta valida'],
+        'price_unit': 150.0,
+        'price_total': 300.0,
+        'quantity': 2.0,
+        'display_type': False,
+    }]
+    fake_sale_report = [
+        {'product_id': [400, '[BIKE002] Bicicleta valida'], 'categ_id': [22, 'SCOTT / BICICLETA']},
+    ]
+    fake_categs = [{'id': 22, 'complete_name': 'All / SCOTT / BICICLETA'}]
+    fake_partner = {'id': 3, 'ref': 'CLAVE003', 'name': 'Partner Test 3', 'parent_id': False}
+
+    def side_effect_execute_kw(*args, **kwargs):
+        model = args[3] if len(args) > 3 else ''
+        if model == 'account.move':
+            return [fake_factura]
+        elif model == 'account.move.line':
+            return fake_lines
+        elif model == 'sale.report':
+            return fake_sale_report
+        elif model == 'product.category':
+            return fake_categs
+        elif model == 'res.partner':
+            return [fake_partner]
+        return []
+
+    fake_models.execute_kw.side_effect = side_effect_execute_kw
+
+    mock_cursor = MagicMock()
+    mock_connection = MagicMock()
+    mock_connection.cursor.return_value = mock_cursor
+    mock_connection.is_connected.return_value = True
+
+    cache_calls = []
+    def capture_execute(sql, params=None):
+        if 'cache_ultima_actualizacion' in sql:
+            cache_calls.append((sql, params))
+
+    mock_cursor.execute.side_effect = capture_execute
+
+    with patch("routes.monitor_odoo.get_odoo_models", return_value=(1, fake_models, None)):
+        with patch("routes.monitor_odoo.obtener_conexion", return_value=mock_connection):
+            with app.test_request_context("/sync-monitor-odoo", method="POST", json={}, headers=_AUTH_HEADERS):
+                mo.sync_monitor_odoo()
+
+    assert len(cache_calls) == 1, (
+        f"sync_monitor_odoo debe escribir en cache_ultima_actualizacion exactamente "
+        f"una vez por corrida exitosa, se ejecutaron: {len(cache_calls)}"
+    )
