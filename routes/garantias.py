@@ -17,7 +17,9 @@ from utils.jwt_utils import verificar_token
 from utils.auth_decorators import (
     requiere_autenticacion,
     requiere_rol,
+    requiere_modulo,
     requiere_permiso_interno,
+    usuario_actual_tiene_modulo,
 )
 
 garantias_bp = Blueprint("garantias", __name__, url_prefix="/garantias")
@@ -314,7 +316,7 @@ def inicializar_tablas():
 
 @garantias_bp.route("/formulario/enviar", methods=["POST"])
 @requiere_autenticacion
-@requiere_rol(1, 4)
+@requiere_modulo("usuarios_garantias")
 @requiere_permiso_interno("garantias", "crear")
 def enviar_formulario():
     conn = _conexion_garantias()
@@ -430,7 +432,7 @@ def lista_formularios():
 
 @garantias_bp.route("/formulario/<int:form_id>/actualizar-dato", methods=["PUT"])
 @requiere_autenticacion
-@requiere_rol(1, 4)
+@requiere_modulo("usuarios_garantias")
 def actualizar_dato_usuario(form_id):
     """El usuario dueño del ticket actualiza un campo rechazado y resetea su validación."""
     conn = _conexion_garantias()
@@ -498,7 +500,7 @@ def actualizar_dato_usuario(form_id):
 
 @garantias_bp.route("/mis-tickets", methods=["GET"])
 @requiere_autenticacion
-@requiere_rol(1, 4)
+@requiere_modulo("usuarios_garantias")
 def mis_tickets():
     """Devuelve los tickets del usuario autenticado.
 
@@ -593,7 +595,7 @@ def eliminar_formulario(form_id):
 
 @garantias_bp.route("/formulario/<int:form_id>", methods=["GET"])
 @requiere_autenticacion
-@requiere_rol(1, 4)
+@requiere_modulo("usuarios_garantias")
 @requiere_permiso_interno("garantias", "ver")
 def obtener_formulario(form_id):
     conn = _conexion_garantias()
@@ -927,7 +929,7 @@ def actualizar_validacion(form_id):
 
 @garantias_bp.route("/estructura", methods=["GET"])
 @requiere_autenticacion
-@requiere_rol(1, 4)
+@requiere_modulo("usuarios_garantias")
 @requiere_permiso_interno("garantias", "ver")
 def obtener_estructura():
     conn = _conexion_garantias()
@@ -1199,7 +1201,7 @@ def _notificar_validacion_doc(formulario_id, nombre_legible, estado):
 
 @garantias_bp.route("/ticket/<int:formulario_id>/comentarios", methods=["GET"])
 @requiere_autenticacion
-@requiere_rol(1, 4)
+@requiere_modulo("usuarios_garantias")
 @requiere_permiso_interno("garantias", "ver")
 def get_comentarios(formulario_id):
     conn = _conexion_garantias()
@@ -1236,7 +1238,7 @@ def get_comentarios(formulario_id):
 
 @garantias_bp.route("/ticket/<int:formulario_id>/comentarios", methods=["POST"])
 @requiere_autenticacion
-@requiere_rol(1, 4)
+@requiere_modulo("usuarios_garantias")
 @requiere_permiso_interno("garantias", "crear")
 def add_comentario(formulario_id):
     conn = _conexion_garantias()
@@ -1885,12 +1887,10 @@ def importar_garantias():
 def subir_archivo():
     accion = request.form.get('accion')
 
-    # Garantias esta bloqueado para distribuidores (rol 2) y usuarios hijo
-    # (rol 3): solo administrador (1) y usuario interno (4) pueden subir
-    # evidencia. El rol 4 ya resolvio su permiso en _requiere_permiso_archivo_garantia.
-    rol_actual = int(g.usuario_actual.get('rol', 0))
-    if rol_actual not in (1, 4):
-        return jsonify({"error": "Rol no autorizado."}), 403
+    if int(g.usuario_actual.get('rol', 0)) != 4:
+        permitido, error = usuario_actual_tiene_modulo('usuarios_garantias')
+        if not permitido:
+            return error
 
     if 'archivo' not in request.files:
         return jsonify({"error": "No se recibio archivo"}), 400
@@ -1924,7 +1924,7 @@ def subir_archivo():
 
 @garantias_bp.route("/archivo/<path:nombre>", methods=["GET"])
 @requiere_autenticacion
-@requiere_rol(1, 4)
+@requiere_modulo("usuarios_garantias")
 @requiere_permiso_interno("garantias", "ver")
 def descargar_archivo(nombre):
     conn = _conexion_garantias()
