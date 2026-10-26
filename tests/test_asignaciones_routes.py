@@ -48,6 +48,29 @@ def test_inicializar_tablas_con_rol_no_permitido_devuelve_403():
     assert resp.get_json()["error"]["code"] == "NO_AUTORIZADO"
 
 
+def test_asignaciones_rol_interno_usa_la_regla_dinamica(mocker):
+    """Rol 4 no usa el bloqueo histórico de roles 1/3.
+
+    La decisión queda exclusivamente en la matriz interna endpoint + acción;
+    aquí se simula una regla ya asignada para no depender del catálogo local.
+    """
+    mocker.patch(
+        "utils.auth_decorators._resultado_permiso_interno_endpoint",
+        return_value=True,
+    )
+    mocker.patch("services.asignaciones_service.listar_periodos_activos", return_value=[])
+
+    client = _cliente_test()
+    token = _token_valido(rol=4)
+    respuesta = client.get(
+        "/importaciones/asignaciones/periodos",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+
+    assert respuesta.status_code == 200
+    assert respuesta.get_json() == {"ok": True, "data": []}
+
+
 def test_error_de_negocio_respeta_el_contrato_uniforme_end_to_end():
     """El errorhandler del blueprint debe producir {"ok": false, "error": {code, message}}
     con el status del error, no un HTML 500 ni otra forma."""
