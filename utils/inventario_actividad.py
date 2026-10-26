@@ -6,7 +6,7 @@ from flask import g, request
 # Registrar nombres de campos, no datos personales ni adjuntos.
 CAMPOS_PERMITIDOS = frozenset({
     'inventario','numeroInventario','equipoId','colaboradorId','nombre','descripcion',
-    'categoria','marca','modelo','serie','empresa','departamento','responsable',
+    'categoria','marca','modelo','serie','empresa','departamento','prefijo','responsable',
     'cargo','estado','ubicacion','funcionamiento','extras','estadoCorreccion',
     'resultado','fechaProgramada','auditorResponsable','fechaDevolucion',
     'fechaAsignacion','accionRequerida','conclusiones','motivo','encontrado',
@@ -26,7 +26,7 @@ CAMPOS_HISTORICOS = {
     )),
     'Colaborador': ('inventario_colaboradores', (
         'numero_empleado', 'nombre', 'apellido_paterno', 'apellido_materno',
-        'empresa', 'departamento', 'puesto', 'ubicacion', 'estado',
+        'empresa', 'departamento', 'puesto', 'prefijo', 'ubicacion', 'estado',
     )),
     'Auditoría': ('inventario_auditorias', (
         'nombre', 'fecha_programada', 'auditor_responsable', 'estado',
