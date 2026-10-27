@@ -149,6 +149,16 @@ def agregar_cliente():
     f_inicio = data.get('f_inicio')
     f_fin = data.get('f_fin')
 
+    # Impedir altas con claves reservadas de Integral 2.
+    from services.metas_previo_my27_service import EVAC_INTEGRAL_2
+
+    clave_normalizada = str(clave or '').strip().upper()
+
+    if clave_normalizada in EVAC_INTEGRAL_2:
+        return jsonify({
+            "error": "Esta clave pertenece a un integrante protegido de Integral 2"
+        }), 409
+
     # Validar que todos los campos estén presentes
     if not all([clave, evac, nombre_cliente, nivel, f_inicio, f_fin]):
         return jsonify({"error": "Todos los campos son obligatorios"}), 400
