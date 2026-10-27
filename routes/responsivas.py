@@ -1737,3 +1737,180 @@ def descargar_responsiva_pdf(responsiva_id):
     finally:
         cursor.close()
         conexion.close()
+
+# ============================================================
+# PUT: RESTAURAR RESPONSIVA ANULADA
+#
+# Agregar este bloque al FINAL del archivo Python EXISTENTE que
+# declara responsivas_bp (NO reemplazar el backend por este archivo).
+# No requiere ALTER TABLE: recupera el estado anterior a partir de
+# fecha_firma, que no se elimina al anular.
+#
+# IMPORTANTE: adecuar autorización y auditoría al mecanismo real
+# del backend antes de habilitar en producción.
+# ============================================================
+
+@responsivas_bp.route('/<int:responsiva_id>/restaurar', methods=['PUT'])
+def restaurar_responsiva(responsiva_id):
+    conexion = obtener_conexion()
+    cursor = conexion.cursor(dictionary=True)
+
+    try:
+        conexion.start_transaction()
+
+        # Primera lectura solo para encontrar la asignación a bloquear.
+        cursor.execute(
+            "SELECT asignacion_id FROM inventario_responsivas WHERE id = %s",
+            (responsiva_id,),
+        )
+        referencia = cursor.fetchone()
+        if not referencia:
+            conexion.rollback()
+            return jsonify({'error': 'Responsiva no encontrada.'}), 404
+
+        # Mismo orden de bloqueo que la creación manual: asignación primero.
+        cursor.execute(
+            """
+            SELECT id, equipo_id, colaborador_id, estado
+            FROM inventario_asignaciones
+            WHERE id = %s
+            FOR UPDATE
+            """,
+            (referencia['asignacion_id'],),
+        )
+        asignacion = cursor.fetchone()
+        if not asignacion or asignacion['estado'] != 'Activa':
+            conexion.rollback()
+            return jsonify({
+                'error': 'No se puede restaurar: la asignación ya no está activa.'
+            }), 409
+
+        cursor.execute(
+            """
+            SELECT id, asignacion_id, equipo_id, colaborador_id,
+                   folio, estado, fecha_firma, archivo_pdf
+            FROM inventario_responsivas
+            WHERE id = %s
+            FOR UPDATE
+            """,
+            (responsiva_id,),
+        )
+        responsiva = cursor.fetchone()
+        if not responsiva:
+            conexion.rollback()
+            return jsonify({'error': 'Responsiva no encontrada.'}), 404
+
+        if responsiva['estado'] != 'Anulada':
+            conexion.rollback()
+            return jsonify({
+                'error': 'Solo pueden restaurarse responsivas anuladas.'
+            }), 409
+
+        if (
+            responsiva['asignacion_id'] != asignacion['id']
+            or responsiva['equipo_id'] != asignacion['equipo_id']
+            or responsiva['colaborador_id'] != asignacion['colaborador_id']
+        ):
+            conexion.rollback()
+            return jsonify({
+                'error': 'Los datos de la responsiva ya no coinciden con la asignación.'
+            }), 409
+
+        # No permitir dos responsivas vigentes para la misma asignación.
+        cursor.execute(
+            """
+            SELECT id FROM inventario_responsivas
+            WHERE asignacion_id = %s
+              AND id <> %s
+              AND estado IN ('Pendiente', 'Firmada')
+            LIMIT 1
+            """,
+            (asignacion['id'], responsiva_id),
+        )
+        if cursor.fetchone():
+            conexion.rollback()
+            return jsonify({
+                'error': 'Ya existe otra responsiva vigente para esta asignación.'
+            }), 409
+
+        cursor.execute(
+            "SELECT estado FROM inventario_equipos WHERE id = %s FOR UPDATE",
+            (asignacion['equipo_id'],),
+        )
+        equipo = cursor.fetchone()
+        if not equipo or equipo['estado'] != 'Asignado':
+            conexion.rollback()
+            return jsonify({
+                'error': 'No se puede restaurar: el equipo ya no está asignado.'
+            }), 409
+
+        estado_restaurado = (
+            'Firmada' if responsiva['fecha_firma'] is not None else 'Pendiente'
+        )
+        if estado_restaurado == 'Firmada' and not (responsiva['archivo_pdf'] or '').strip():
+            conexion.rollback()
+            return jsonify({
+                'error': 'La responsiva tenía fecha de firma pero no conserva su documento; requiere revisión.'
+            }), 409
+
+        # Capturar el estado anterior para la bitácora.
+        estado_anterior_bitacora = capturar_estado(
+            cursor,
+            'Responsiva',
+            responsiva_id
+        )
+
+        # Se modifica solo el estado. Se preservan el folio, PDF,
+        # fecha de firma y las evidencias de la anulación anterior.
+        cursor.execute(
+            """
+            UPDATE inventario_responsivas
+            SET estado = %s
+            WHERE id = %s AND estado = 'Anulada'
+            """,
+            (estado_restaurado, responsiva_id),
+        )
+
+        if cursor.rowcount != 1:
+            conexion.rollback()
+            return jsonify({
+                'error': 'El estado cambió mientras se procesaba la restauración.'
+            }), 409
+
+        cursor.execute(
+            """
+            UPDATE inventario_equipos
+            SET responsiva_estado = %s
+            WHERE id = %s
+            """,
+            (estado_restaurado, asignacion['equipo_id']),
+        )
+
+        # Registrar restauración en la bitácora.
+        registrar_evento(
+            cursor,
+            'restaurar',
+            'Responsiva',
+            responsiva_id,
+            anterior=estado_anterior_bitacora
+        )
+
+        conexion.commit()
+
+        return jsonify({
+            'message': 'Responsiva restaurada correctamente.',
+            'id': responsiva_id,
+            'folio': responsiva['folio'],
+            'estado': estado_restaurado,
+        }), 200
+    
+    except Exception as error:
+        conexion.rollback()
+        print('Error al restaurar responsiva:', error)
+        return jsonify({
+            'error': 'No se pudo restaurar la responsiva.'
+        }), 500
+    finally:
+        cursor.close()
+        conexion.close()
+
