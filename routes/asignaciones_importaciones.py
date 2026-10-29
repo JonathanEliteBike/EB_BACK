@@ -1,7 +1,7 @@
 import logging
 from functools import wraps
 
-from flask import Blueprint, request, jsonify
+from flask import Blueprint, request, jsonify, g
 
 from db_conexion import obtener_conexion
 from routes.clientes import token_required
@@ -14,7 +14,28 @@ def _requiere_rol_importaciones(f):
     @wraps(f)
     def decorated(*args, **kwargs):
         payload = getattr(request, "cliente_data", {}) or {}
-        if payload.get("rol") not in (1, 3):
+        # token_required es histórico y deja el payload en request. Lo
+        # exponemos también en g para que la capa aislada del rol 4 aplique
+        # exactamente la misma autorización dinámica que el resto del portal.
+        g.usuario_actual = payload
+        try:
+            rol = int(payload.get("rol"))
+        except (TypeError, ValueError):
+            rol = None
+
+        if rol == 4:
+            from utils.auth_decorators import (
+                _error_permiso_interno_endpoint,
+                _resultado_permiso_interno_endpoint,
+            )
+            resultado = _resultado_permiso_interno_endpoint()
+            if resultado is not True:
+                return _error_permiso_interno_endpoint(resultado)
+            return f(*args, **kwargs)
+
+        # No se cambia el contrato previo: los roles 1 y 3 mantienen su
+        # acceso y todos los demás (incluido 99) continúan sin entrar aquí.
+        if rol not in (1, 3):
             return jsonify({
                 "ok": False,
                 "error": {"code": "NO_AUTORIZADO", "message": "No tienes permiso para acceder a este módulo"},

@@ -7,6 +7,8 @@ from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 from datetime import datetime, timedelta
 
+from utils.jwt_utils import generar_token_prewarm_interno
+
 logger = logging.getLogger(__name__)
 
 MEXICO_TZ = pytz.timezone('America/Mexico_City')
@@ -44,7 +46,13 @@ def _run_sync_diario():
     try:
         logger.info('[SCHEDULER] === Sync diario iniciado ===')
 
-        r1 = requests.post(f'{base}/sync-monitor-odoo', json={'recalcular_previo': True}, timeout=300)
+        token = generar_token_prewarm_interno()
+        if not token:
+            logger.warning('[SCHEDULER] Sync diario omitido: no hay administrador activo para autenticarlo')
+            return
+        headers = {'Authorization': f'Bearer {token}'}
+
+        r1 = requests.post(f'{base}/sync-monitor-odoo', json={'recalcular_previo': True}, headers=headers, timeout=300)
         data1 = r1.json() if r1.headers.get('Content-Type', '').startswith('application/json') else {}
         logger.info('[SCHEDULER] sync-monitor-odoo → %s | registros: %s',
                     r1.status_code, data1.get('count', '?'))
@@ -53,7 +61,7 @@ def _run_sync_diario():
             logger.error('[SCHEDULER] sync-monitor-odoo falló: %s', data1)
             return
 
-        r2 = requests.post(f'{base}/sincronizar_notas', timeout=300)
+        r2 = requests.post(f'{base}/sincronizar_notas', headers=headers, timeout=300)
         data2 = r2.json() if r2.headers.get('Content-Type', '').startswith('application/json') else {}
         logger.info('[SCHEDULER] sincronizar_notas → %s | %s',
                     r2.status_code, data2.get('mensaje', '?'))
