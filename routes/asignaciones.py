@@ -1127,6 +1127,173 @@ def crear_asignacion():
 # PUT: FINALIZAR ASIGNACIÓN / DEVOLVER EQUIPO
 # ============================================================
 
+
+# ============================================================
+# EDITAR OBSERVACIONES SIN DEVOLVER EL EQUIPO
+# ============================================================
+
+@asignaciones_bp.route(
+    "/<int:asignacion_id>/observaciones-entrega",
+    methods=["PUT"]
+)
+def actualizar_observaciones_entrega(asignacion_id):
+    data = request.get_json(silent=True)
+
+    if not isinstance(data, dict) or "observacionesEntrega" not in data:
+        return jsonify({
+            "error": "Debes enviar las observaciones de entrega."
+        }), 400
+
+    if not isinstance(data["observacionesEntrega"], str):
+        return jsonify({
+            "error": "Las observaciones deben ser texto."
+        }), 400
+
+    observaciones = limpiar_texto(data["observacionesEntrega"])
+
+    conexion = obtener_conexion()
+    cursor = conexion.cursor(dictionary=True)
+
+    try:
+        conexion.start_transaction()
+
+        cursor.execute(
+            """
+            SELECT id, estado, observaciones_entrega
+            FROM inventario_asignaciones
+            WHERE id = %s
+            FOR UPDATE
+            """,
+            (asignacion_id,)
+        )
+
+        asignacion = cursor.fetchone()
+
+        if not asignacion:
+            conexion.rollback()
+            return jsonify({
+                "error": "Asignacion no encontrada."
+            }), 404
+
+        if asignacion["estado"] != "Activa":
+            conexion.rollback()
+            return jsonify({
+                "error": "Solo pueden corregirse asignaciones activas."
+            }), 409
+
+        cursor.execute(
+            """
+            SELECT id, estado, observaciones
+            FROM inventario_responsivas
+            WHERE asignacion_id = %s
+            ORDER BY id DESC
+            FOR UPDATE
+            """,
+            (asignacion_id,)
+        )
+
+        responsivas = cursor.fetchall()
+
+        if len(responsivas) != 1:
+            conexion.rollback()
+            return jsonify({
+                "error": "La asignacion requiere revision de su responsiva."
+            }), 409
+
+        responsiva = responsivas[0]
+
+        if responsiva["estado"] not in ("Pendiente", "Firmada"):
+            conexion.rollback()
+            return jsonify({
+                "error": (
+                    "La responsiva ya esta firmada o anulada. "
+                    "Debe conservarse el documento original."
+                )
+            }), 409
+
+        anterior_asignacion = (
+            asignacion["observaciones_entrega"] or ""
+        )
+        anterior_responsiva = (
+            responsiva["observaciones"] or ""
+        )
+        nuevo_texto = observaciones or ""
+
+        if (
+            anterior_asignacion == nuevo_texto
+            and (
+                responsiva["estado"] == "Firmada"
+                or anterior_responsiva == nuevo_texto
+            )
+        ):
+            conexion.rollback()
+            return jsonify({
+                "message": "Las observaciones ya estan actualizadas.",
+                "id": asignacion_id,
+                "observacionesEntrega": nuevo_texto
+            }), 200
+
+        estado_asignacion = capturar_estado(
+            cursor, "Asignaci\u00f3n", asignacion_id
+        )
+        estado_responsiva = (
+            capturar_estado(cursor, "Responsiva", responsiva["id"])
+            if responsiva["estado"] == "Pendiente"
+            else None
+        )
+
+        cursor.execute(
+            """
+            UPDATE inventario_asignaciones
+            SET observaciones_entrega = %s
+            WHERE id = %s AND estado = 'Activa'
+            """,
+            (observaciones, asignacion_id)
+        )
+
+        if responsiva["estado"] == "Pendiente":
+            cursor.execute(
+                """
+                UPDATE inventario_responsivas
+                SET observaciones = %s
+                WHERE id = %s AND estado = 'Pendiente'
+                """,
+                (observaciones, responsiva["id"])
+            )
+
+        registrar_evento(
+            cursor, "editar", "Asignaci\u00f3n",
+            asignacion_id, anterior=estado_asignacion
+        )
+
+        if responsiva["estado"] == "Pendiente":
+            registrar_evento(
+                cursor, "editar", "Responsiva",
+                responsiva["id"], anterior=estado_responsiva
+            )
+
+        conexion.commit()
+
+        return jsonify({
+            "message": (
+                "Observaciones corregidas. La responsiva firmada "
+                "original se conserva."
+                if responsiva["estado"] == "Firmada"
+                else "Observaciones corregidas correctamente."
+            ),
+            "id": asignacion_id,
+            "observacionesEntrega": nuevo_texto
+        }), 200
+
+    except Exception:
+        conexion.rollback()
+        raise
+
+    finally:
+        cursor.close()
+        conexion.close()
+
+
 @asignaciones_bp.route(
     "/<int:asignacion_id>/finalizar",
     methods=["PUT"]
