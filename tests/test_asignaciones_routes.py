@@ -71,6 +71,106 @@ def test_asignaciones_rol_interno_usa_la_regla_dinamica(mocker):
     assert respuesta.get_json() == {"ok": True, "data": []}
 
 
+def test_desactivar_producto_ruta_pasa_usuario_y_motivo_al_servicio(mocker):
+    desactivar = mocker.patch(
+        "routes.asignaciones_importaciones.svc.desactivar_producto",
+        return_value={"id": 10, "activo": 0},
+    )
+    client = _cliente_test()
+    token = _token_valido(rol=1)
+
+    resp = client.post(
+        "/importaciones/1/asignaciones/productos/10/desactivar",
+        json={"motivo": "Captura incorrecta"},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+
+    assert resp.status_code == 200
+    assert resp.get_json() == {"ok": True, "data": {"id": 10, "activo": 0}}
+    desactivar.assert_called_once_with(
+        producto_id=10,
+        motivo="Captura incorrecta",
+        usuario_id=1,
+        importacion_id=1,
+    )
+
+
+@pytest.mark.parametrize("rol", [1, 99])
+def test_desactivar_producto_permite_roles_administrador_e_importaciones(mocker, rol):
+    desactivar = mocker.patch(
+        "routes.asignaciones_importaciones.svc.desactivar_producto",
+        return_value={"id": 10, "activo": 0},
+    )
+    client = _cliente_test()
+
+    resp = client.post(
+        "/importaciones/1/asignaciones/productos/10/desactivar",
+        json={"motivo": "Captura incorrecta"},
+        headers={"Authorization": f"Bearer {_token_valido(rol=rol)}"},
+    )
+
+    assert resp.status_code == 200
+    assert desactivar.called
+
+
+def test_desactivar_producto_permite_rol_interno_con_editar(mocker):
+    mocker.patch("utils.auth_decorators._resultado_permiso_interno_endpoint", return_value=True)
+    desactivar = mocker.patch(
+        "routes.asignaciones_importaciones.svc.desactivar_producto",
+        return_value={"id": 10, "activo": 0},
+    )
+    client = _cliente_test()
+
+    resp = client.post(
+        "/importaciones/1/asignaciones/productos/10/desactivar",
+        json={"motivo": "Captura incorrecta"},
+        headers={"Authorization": f"Bearer {_token_valido(rol=4)}"},
+    )
+
+    assert resp.status_code == 200
+    assert desactivar.called
+
+
+def test_desactivar_producto_deniega_rol_interno_sin_editar(mocker):
+    mocker.patch("utils.auth_decorators._resultado_permiso_interno_endpoint", return_value=False)
+    desactivar = mocker.patch("routes.asignaciones_importaciones.svc.desactivar_producto")
+    client = _cliente_test()
+
+    resp = client.post(
+        "/importaciones/1/asignaciones/productos/10/desactivar",
+        json={"motivo": "Captura incorrecta"},
+        headers={"Authorization": f"Bearer {_token_valido(rol=4)}"},
+    )
+
+    assert resp.status_code == 403
+    assert not desactivar.called
+
+
+@pytest.mark.parametrize("rol", [2, 3])
+def test_desactivar_producto_deniega_roles_no_autorizados(mocker, rol):
+    desactivar = mocker.patch("routes.asignaciones_importaciones.svc.desactivar_producto")
+    client = _cliente_test()
+
+    resp = client.post(
+        "/importaciones/1/asignaciones/productos/10/desactivar",
+        json={"motivo": "Captura incorrecta"},
+        headers={"Authorization": f"Bearer {_token_valido(rol=rol)}"},
+    )
+
+    assert resp.status_code == 403
+    assert resp.get_json()["error"]["code"] == "NO_AUTORIZADO"
+    assert not desactivar.called
+
+
+def test_desactivar_producto_sin_token_devuelve_401():
+    client = _cliente_test()
+    resp = client.post(
+        "/importaciones/1/asignaciones/productos/10/desactivar",
+        json={"motivo": "Captura incorrecta"},
+    )
+    assert resp.status_code == 401
+
+
 def test_error_de_negocio_respeta_el_contrato_uniforme_end_to_end():
     """El errorhandler del blueprint debe producir {"ok": false, "error": {code, message}}
     con el status del error, no un HTML 500 ni otra forma."""

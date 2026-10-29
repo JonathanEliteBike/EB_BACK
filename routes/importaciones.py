@@ -1428,7 +1428,7 @@ def dashboard():
             placeholders = ",".join(["%s"] * len(_ids_embarque))
             cursor.execute(
                 f"SELECT importacion_id, COUNT(*) AS n FROM importacion_productos "
-                f"WHERE importacion_id IN ({placeholders}) GROUP BY importacion_id",
+                f"WHERE activo = 1 AND importacion_id IN ({placeholders}) GROUP BY importacion_id",
                 _ids_embarque,
             )
             _productos_count = {row["importacion_id"]: row["n"] for row in cursor.fetchall()}

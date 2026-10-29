@@ -393,6 +393,20 @@ def _verificar_pertenencia(producto: dict, importacion_id, code: str = "PRODUCTO
         raise AsignacionesError(code, mensaje, 404)
 
 
+def _verificar_producto_activo(producto: dict):
+    """Evita operaciones operativas sobre un SKU desactivado.
+
+    La ausencia de ``activo`` se interpreta como activo para conservar la
+    compatibilidad con datos o esquemas previos a la migración.
+    """
+    if not producto.get("activo", 1):
+        raise AsignacionesError(
+            "SKU_DESACTIVADO",
+            "El SKU está desactivado y no admite operaciones operativas",
+            409,
+        )
+
+
 def _verificar_pertenencia_venta(cursor, venta: dict, importacion_id):
     """Igual que _verificar_pertenencia, pero para recursos identificados por venta_id:
     resuelve el embarque a través del producto al que pertenece la venta."""
@@ -506,7 +520,24 @@ def _kpis_reserva_producto(cursor, producto_id: int) -> dict:
     }
 
 
-def listar_productos(importacion_id: int) -> list:
+_ESTADOS_SKU_FILTRO = ("activos", "desactivados", "todos")
+
+
+def _condicion_estado_sku(estado: str = None, alias: str = "") -> str:
+    """Condición SQL para el estado operativo de un producto de embarque."""
+    estado = (estado or "activos").strip().lower()
+    if estado not in _ESTADOS_SKU_FILTRO:
+        raise AsignacionesError(
+            "ESTADO_SKU_INVALIDO",
+            "estado debe ser 'activos', 'desactivados' o 'todos'",
+        )
+    if estado == "todos":
+        return "1 = 1"
+    columna = f"{alias}.activo" if alias else "activo"
+    return f"{columna} = {1 if estado == 'activos' else 0}"
+
+
+def listar_productos(importacion_id: int, estado: str = "activos") -> list:
     conn = obtener_conexion()
     if not conn:
         raise AsignacionesError("DB_NO_DISPONIBLE", "Sin conexión a BD", 500)
@@ -516,8 +547,10 @@ def listar_productos(importacion_id: int) -> list:
         if not cursor.fetchone():
             raise AsignacionesError("IMPORTACION_NO_EXISTE", "El embarque no existe", 404)
 
+        condicion_estado = _condicion_estado_sku(estado)
         cursor.execute(
-            "SELECT * FROM importacion_productos WHERE importacion_id = %s ORDER BY sku",
+            f"SELECT * FROM importacion_productos WHERE importacion_id = %s "
+            f"AND {condicion_estado} ORDER BY sku",
             (importacion_id,),
         )
         productos = cursor.fetchall()
@@ -560,6 +593,7 @@ def actualizar_producto(producto_id: int, cantidad_embarcada=None, descripcion: 
         if not producto:
             raise AsignacionesError("PRODUCTO_NO_EXISTE", "El producto no existe", 404)
         _verificar_pertenencia(producto, importacion_id)
+        _verificar_producto_activo(producto)
 
         if cantidad_embarcada is not None:
             if not isinstance(cantidad_embarcada, int) or cantidad_embarcada < 0:
@@ -590,6 +624,79 @@ def actualizar_producto(producto_id: int, cantidad_embarcada=None, descripcion: 
                 (descripcion, producto_id),
             )
 
+        conn.commit()
+        cursor.execute("SELECT * FROM importacion_productos WHERE id = %s", (producto_id,))
+        return cursor.fetchone()
+    except AsignacionesError:
+        conn.rollback()
+        raise
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def desactivar_producto(producto_id: int, motivo, usuario_id: int = None,
+                       importacion_id: int = None) -> dict:
+    """Desactiva lógicamente un SKU de un embarque sin tocar su historial.
+
+    El producto se bloquea antes de consultar sus operaciones vigentes. Las
+    altas de reservas y ventas toman el mismo bloqueo de producto, por lo que
+    no pueden intercalarse con una desactivación exitosa.
+    """
+    if not isinstance(motivo, str):
+        raise AsignacionesError("MOTIVO_REQUERIDO", "El motivo de desactivación es obligatorio")
+    motivo = motivo.strip()
+    if not motivo:
+        raise AsignacionesError("MOTIVO_REQUERIDO", "El motivo de desactivación es obligatorio")
+    if len(motivo) > 500:
+        raise AsignacionesError("MOTIVO_INVALIDO", "El motivo no puede exceder 500 caracteres")
+
+    conn = obtener_conexion()
+    if not conn:
+        raise AsignacionesError("DB_NO_DISPONIBLE", "Sin conexión a BD", 500)
+    try:
+        cursor = conn.cursor(dictionary=True)
+        cursor.execute("SELECT * FROM importacion_productos WHERE id = %s FOR UPDATE", (producto_id,))
+        producto = cursor.fetchone()
+        if not producto:
+            raise AsignacionesError("PRODUCTO_NO_EXISTE", "El producto no existe", 404)
+        _verificar_pertenencia(producto, importacion_id)
+        if not producto.get("activo", 1):
+            raise AsignacionesError("SKU_YA_DESACTIVADO", "El SKU ya está desactivado", 409)
+
+        cursor.execute(
+            "SELECT 1 FROM importacion_asignaciones "
+            "WHERE importacion_producto_id = %s "
+            f"AND estado IN {_SQL_ESTADOS_VIGENTES} LIMIT 1",
+            (producto_id,),
+        )
+        if cursor.fetchone():
+            raise AsignacionesError(
+                "SKU_CON_RESERVAS_VIGENTES",
+                "No se puede desactivar el SKU porque tiene reservas vigentes",
+                409,
+            )
+
+        cursor.execute(
+            "SELECT 1 FROM importacion_sobrantes_ventas "
+            "WHERE importacion_producto_id = %s "
+            "AND estado IN ('PENDIENTE_VALIDACION', 'VALIDADO') LIMIT 1",
+            (producto_id,),
+        )
+        if cursor.fetchone():
+            raise AsignacionesError(
+                "SKU_CON_VENTAS_VIGENTES",
+                "No se puede desactivar el SKU porque tiene ventas de sobrante vigentes",
+                409,
+            )
+
+        cursor.execute(
+            "UPDATE importacion_productos SET activo = 0, desactivado_at = NOW(), "
+            "desactivado_por = %s, motivo_desactivacion = %s WHERE id = %s",
+            (usuario_id, motivo, producto_id),
+        )
         conn.commit()
         cursor.execute("SELECT * FROM importacion_productos WHERE id = %s", (producto_id,))
         return cursor.fetchone()
@@ -700,10 +807,10 @@ def importar_productos(importacion_id: int, periodo: str, filas: list, usuario_i
         if not cur.fetchone():
             raise AsignacionesError("IMPORTACION_NO_EXISTE", "El embarque no existe", 404)
         cur.execute(
-            "SELECT id, sku_norm FROM importacion_productos WHERE importacion_id = %s",
+            "SELECT id, sku_norm, activo FROM importacion_productos WHERE importacion_id = %s",
             (importacion_id,),
         )
-        existentes = {r["sku_norm"]: r["id"] for r in cur.fetchall()}
+        existentes = {r["sku_norm"]: r for r in cur.fetchall()}
     finally:
         conn.close()
 
@@ -719,9 +826,16 @@ def importar_productos(importacion_id: int, periodo: str, filas: list, usuario_i
         descripcion = f.get("descripcion") or None
         num_fila = f.get("fila")
         try:
-            if sku_norm in existentes:
+            existente = existentes.get(sku_norm)
+            if existente and not existente.get("activo", 1):
+                raise AsignacionesError(
+                    "SKU_DESACTIVADO",
+                    "El SKU ya existe en el embarque, pero está desactivado",
+                    409,
+                )
+            if existente:
                 actualizar_producto(
-                    existentes[sku_norm],
+                    existente["id"],
                     cantidad_embarcada=cantidad,
                     descripcion=descripcion,
                     usuario_id=usuario_id,
@@ -733,10 +847,10 @@ def importar_productos(importacion_id: int, periodo: str, filas: list, usuario_i
                     importacion_id, sku, cantidad, periodo,
                     descripcion=descripcion, usuario_id=usuario_id,
                 )
-                existentes[sku_norm] = nuevo["id"]
+                existentes[sku_norm] = {"id": nuevo["id"], "activo": 1}
                 insertados += 1
         except AsignacionesError as e:
-            errores.append({"fila": num_fila, "sku": sku, "motivo": e.message})
+            errores.append({"fila": num_fila, "sku": sku, "motivo": e.message, "code": e.code})
 
     return {
         "insertados": insertados,
@@ -788,6 +902,7 @@ def _persistir_reservas(producto_id: int, reservas: list, *, origen: str, estado
         if not producto:
             raise AsignacionesError("PRODUCTO_NO_EXISTE", "El producto no existe", 404)
         _verificar_pertenencia(producto, importacion_id)
+        _verificar_producto_activo(producto)
 
         for item in reservas:
             mv = item.get("mes_objetivo")
@@ -972,6 +1087,7 @@ def crear_venta_sobrante(producto_id: int, clave_cliente: str, cantidad, numero_
         if not producto:
             raise AsignacionesError("PRODUCTO_NO_EXISTE", "El producto no existe", 404)
         _verificar_pertenencia(producto, importacion_id)
+        _verificar_producto_activo(producto)
 
         cursor.execute("SELECT clave FROM clientes WHERE clave = %s", (clave,))
         if not cursor.fetchone():
@@ -1029,6 +1145,7 @@ def _reservas_vigentes_por_mes(cursor, sku_norm: str, periodo: str) -> dict:
         "FROM importacion_asignaciones a "
         "JOIN importacion_productos p ON p.id = a.importacion_producto_id "
         "WHERE p.sku_norm = %s AND p.periodo = %s AND a.mes_objetivo IS NOT NULL "
+        "AND p.activo = 1 "
         f"AND a.estado IN {_SQL_ESTADOS_VIGENTES} "
         "GROUP BY a.clave_cliente, a.mes_objetivo",
         (sku_norm, periodo),
@@ -1111,7 +1228,7 @@ def _propuesta_reparto(importacion_id: int, periodo_filtro, columnas_fn, origen:
         if not cursor.fetchone():
             raise AsignacionesError("IMPORTACION_NO_EXISTE", "El embarque no existe", 404)
 
-        sql = "SELECT * FROM importacion_productos WHERE importacion_id = %s"
+        sql = "SELECT * FROM importacion_productos WHERE importacion_id = %s AND activo = 1"
         params = [importacion_id]
         if periodo_filtro:
             sql += " AND periodo = %s"
@@ -1548,7 +1665,7 @@ def obtener_detalle_producto(producto_id: int, importacion_id: int = None) -> di
         r["faltante"] = max(0, proyectado - reservado)
 
     # Reusa el cálculo de listar_productos para las cantidades del producto.
-    productos = listar_productos(producto["importacion_id"])
+    productos = listar_productos(producto["importacion_id"], estado="todos")
     producto_calculado = next((p for p in productos if p["id"] == producto_id), producto)
 
     return {
@@ -1560,7 +1677,7 @@ def obtener_detalle_producto(producto_id: int, importacion_id: int = None) -> di
     }
 
 
-def resumen_embarque(importacion_id: int) -> dict:
+def resumen_embarque(importacion_id: int, estado: str = "activos") -> dict:
     conn = obtener_conexion()
     if not conn:
         raise AsignacionesError("DB_NO_DISPONIBLE", "Sin conexión a BD", 500)
@@ -1575,7 +1692,7 @@ def resumen_embarque(importacion_id: int) -> dict:
     finally:
         conn.close()
 
-    productos = listar_productos(importacion_id)
+    productos = listar_productos(importacion_id, estado=estado)
     reservadas = sum(p["reservado_total"] for p in productos)
     kpis = {
         "unidades_embarcadas": sum(p["cantidad_embarcada"] for p in productos),
@@ -1654,6 +1771,7 @@ def resumen_global(filtros: dict = None) -> dict:
         raise AsignacionesError("DB_NO_DISPONIBLE", "Sin conexión a BD", 500)
     filtros = filtros or {}
     where_sql, params = _filtros_embarque(filtros)
+    estado_sku_sql = _condicion_estado_sku(filtros.get("estado_sku"), alias="p")
     having = "HAVING disponibles > 0" if _es_true(filtros.get("solo_con_disponible")) else ""
     try:
         cursor = conn.cursor(dictionary=True)
@@ -1681,6 +1799,7 @@ def resumen_global(filtros: dict = None) -> dict:
                 (SELECT MAX(m.created_at) FROM importacion_movimientos m
                    WHERE m.importacion_producto_id = p.id) AS ultima_actividad
               FROM importacion_productos p
+              WHERE {estado_sku_sql}
             ) pa ON pa.importacion_id = i.id
             WHERE {where_sql}
             GROUP BY i.id, i.referencia, i.nombre, i.estado
@@ -1721,7 +1840,7 @@ def listar_productos_global(filtros: dict = None, limite: int = 200, offset: int
     if not conn:
         raise AsignacionesError("DB_NO_DISPONIBLE", "Sin conexión a BD", 500)
     f = filtros or {}
-    where = ["i.estado <> 'eliminado'"]
+    where = ["i.estado <> 'eliminado'", _condicion_estado_sku(f.get("estado_sku"), alias="p")]
     params: list = []
     if f.get("estado"):
         where.append("i.estado = %s")

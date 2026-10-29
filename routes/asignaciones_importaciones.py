@@ -44,6 +44,40 @@ def _requiere_rol_importaciones(f):
     return decorated
 
 
+def _requiere_permiso_desactivar_sku(f):
+    """Regla excepcional y acotada para la desactivación lógica de SKU.
+
+    No altera el acceso histórico del resto de Asignaciones: Administrador e
+    Importaciones (99) pueden desactivar; el rol interno (4) requiere la
+    acción ya existente ``importaciones:editar``; los roles 2 y 3 no entran.
+    """
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        payload = getattr(request, "cliente_data", {}) or {}
+        g.usuario_actual = payload
+        try:
+            rol = int(payload.get("rol"))
+        except (TypeError, ValueError):
+            rol = None
+
+        if rol in (1, 99):
+            return f(*args, **kwargs)
+        if rol == 4:
+            from utils.auth_decorators import (
+                _error_permiso_interno_endpoint,
+                _resultado_permiso_interno_endpoint,
+            )
+            resultado = _resultado_permiso_interno_endpoint()
+            if resultado is True:
+                return f(*args, **kwargs)
+            return _error_permiso_interno_endpoint(resultado)
+        return jsonify({
+            "ok": False,
+            "error": {"code": "NO_AUTORIZADO", "message": "No tienes permiso para desactivar SKU"},
+        }), 403
+    return decorated
+
+
 @asignaciones_bp.errorhandler(svc.AsignacionesError)
 def _manejar_error_asignaciones(err):
     return jsonify({"ok": False, "error": {"code": err.code, "message": err.message}}), err.status
@@ -102,7 +136,7 @@ def crear_siguiente_periodo_ruta():
 @token_required
 @_requiere_rol_importaciones
 def listar_productos_ruta(importacion_id):
-    data = svc.listar_productos(importacion_id)
+    data = svc.listar_productos(importacion_id, estado=request.args.get("estado", "activos"))
     return jsonify({"ok": True, "data": data}), 200
 
 
@@ -157,6 +191,23 @@ def actualizar_producto_ruta(importacion_id, producto_id):
         producto_id=producto_id,
         cantidad_embarcada=body.get("cantidad_embarcada"),
         descripcion=body.get("descripcion"),
+        usuario_id=payload.get("id"),
+        importacion_id=importacion_id,
+    )
+    return jsonify({"ok": True, "data": data}), 200
+
+
+@asignaciones_bp.route(
+    "/<int:importacion_id>/asignaciones/productos/<int:producto_id>/desactivar", methods=["POST"]
+)
+@token_required
+@_requiere_permiso_desactivar_sku
+def desactivar_producto_ruta(importacion_id, producto_id):
+    body = request.get_json(silent=True) or {}
+    payload = getattr(request, "cliente_data", {}) or {}
+    data = svc.desactivar_producto(
+        producto_id=producto_id,
+        motivo=body.get("motivo"),
         usuario_id=payload.get("id"),
         importacion_id=importacion_id,
     )
@@ -298,7 +349,7 @@ def cancelar_venta_ruta(importacion_id, venta_id):
 @token_required
 @_requiere_rol_importaciones
 def resumen_ruta(importacion_id):
-    data = svc.resumen_embarque(importacion_id)
+    data = svc.resumen_embarque(importacion_id, estado=request.args.get("estado", "activos"))
     return jsonify({"ok": True, "data": data}), 200
 
 
@@ -336,8 +387,15 @@ def reservas_embarque_ruta(importacion_id):
 @token_required
 @_requiere_rol_importaciones
 def resumen_global_ruta():
+    estado = request.args.get("estado")
+    estado_sku = request.args.get("estado_sku")
+    # `estado` ya filtra el embarque. Se aceptan los tres valores reservados
+    # del SKU como alias sin romper los estados existentes del embarque.
+    if estado in ("activos", "desactivados", "todos") and not estado_sku:
+        estado_sku, estado = estado, None
     filtros = {
-        "estado": request.args.get("estado"),
+        "estado": estado,
+        "estado_sku": estado_sku,
         "origen": request.args.get("origen"),
         "anio": request.args.get("anio"),
         "q": request.args.get("q"),
@@ -351,8 +409,13 @@ def resumen_global_ruta():
 @token_required
 @_requiere_rol_importaciones
 def listar_productos_global_ruta():
+    estado = request.args.get("estado")
+    estado_sku = request.args.get("estado_sku")
+    if estado in ("activos", "desactivados", "todos") and not estado_sku:
+        estado_sku, estado = estado, None
     filtros = {
-        "estado": request.args.get("estado"),
+        "estado": estado,
+        "estado_sku": estado_sku,
         "origen": request.args.get("origen"),
         "anio": request.args.get("anio"),
         "importacion_id": request.args.get("importacion_id"),
