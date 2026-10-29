@@ -749,8 +749,10 @@ def actualizar_responsiva(responsiva_id):
     observaciones = limpiar_texto(
         data.get("observaciones")
     )
-    archivo_pdf = limpiar_texto(
-        data.get("archivoPdf")
+    archivo_pdf = (
+        limpiar_texto(data.get("archivoPdf"))
+        if "archivoPdf" in data
+        else None
     )
 
     conexion = obtener_conexion()
@@ -778,16 +780,14 @@ def actualizar_responsiva(responsiva_id):
                 {"error": "Responsiva no encontrada."}
             ), 404
 
-        if responsiva["estado"] == "Anulada":
+        if responsiva["estado"] in ("Anulada", "Firmada"):
             conexion.rollback()
-
-            return jsonify(
-                {
-                    "error": (
-                        "Una responsiva anulada no puede editarse."
-                    )
-                }
-            ), 409
+            return jsonify({
+                "error": (
+                    "La responsiva firmada o anulada no puede "
+                    "modificarse. Se requiere una correccion documentada."
+                )
+            }), 409
 
         estado_anterior_bitacora = capturar_estado(cursor, 'Responsiva', responsiva_id)
         cursor.execute(
@@ -795,7 +795,7 @@ def actualizar_responsiva(responsiva_id):
             UPDATE inventario_responsivas
             SET
                 observaciones = %s,
-                archivo_pdf = %s
+                archivo_pdf = COALESCE(%s, archivo_pdf)
             WHERE id = %s
             """,
             (
