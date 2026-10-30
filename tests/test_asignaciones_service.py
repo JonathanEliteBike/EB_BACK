@@ -230,6 +230,27 @@ def test_crear_producto_exitoso_normaliza_sku_y_registra_entrada(mocker):
     assert inserts[0].args[1][2] == 10
 
 
+def test_crear_producto_ignora_historico_desactivado_y_conserva_sku_original(mocker):
+    cursor = MagicMock()
+    cursor.fetchone.side_effect = [
+        {"id": 1},  # importación existe
+        None,        # no existe un SKU activo con la misma normalización
+        {"id": 11, "sku": "427536-8086006", "sku_norm": "4275368086006", "activo": 1},
+    ]
+    cursor.lastrowid = 11
+    _mock_conn(mocker, cursor)
+
+    resultado = crear_producto(1, "427536-8086006", 10, "2026-2027")
+
+    consulta = [c for c in cursor.execute.call_args_list
+                if "SELECT id FROM importacion_productos" in c.args[0]][0]
+    assert "activo = 1" in consulta.args[0]
+    insercion = [c for c in cursor.execute.call_args_list
+                 if "INSERT INTO importacion_productos" in c.args[0]][0]
+    assert insercion.args[1][2:4] == ("427536-8086006", "4275368086006")
+    assert resultado["sku"] == "427536-8086006"
+
+
 def test_listar_productos_calcula_disponible_asignado_sobrante_vendido(mocker):
     cursor = MagicMock()
     cursor.fetchone.side_effect = [
@@ -1821,24 +1842,23 @@ def test_importar_productos_inserta_nuevos_y_actualiza_existentes(mocker):
     assert crear.call_args.args[1] == "BB-2" and crear.call_args.args[2] == 8
 
 
-def test_importar_productos_reporta_sku_desactivado_sin_modificarlo(mocker):
+def test_importar_productos_inserta_sku_corregido_si_solo_existe_desactivado(mocker):
     cursor = MagicMock()
     cursor.fetchone.return_value = {"id": 1}
-    cursor.fetchall.return_value = [{"id": 10, "sku_norm": "AA1", "activo": 0}]
+    # La consulta de importación solo devuelve SKU activos; el histórico
+    # desactivado no bloquea la creación del SKU corregido.
+    cursor.fetchall.return_value = []
     _mock_conn(mocker, cursor)
-    crear = mocker.patch("services.asignaciones_service.crear_producto")
+    crear = mocker.patch("services.asignaciones_service.crear_producto", return_value={"id": 11})
     actualizar = mocker.patch("services.asignaciones_service.actualizar_producto")
 
     res = importar_productos(1, "2026-2027", [
         {"fila": 2, "sku": "AA-1", "cantidad": 12, "descripcion": "existente"},
     ], usuario_id=7)
 
-    assert res["insertados"] == 0 and res["actualizados"] == 0
-    assert res["errores"] == [{
-        "fila": 2, "sku": "AA-1", "code": "SKU_DESACTIVADO",
-        "motivo": "El SKU ya existe en el embarque, pero está desactivado",
-    }]
-    crear.assert_not_called()
+    assert res["insertados"] == 1 and res["actualizados"] == 0
+    assert res["errores"] == []
+    crear.assert_called_once_with(1, "AA-1", 12, "2026-2027", descripcion="existente", usuario_id=7)
     actualizar.assert_not_called()
 
 

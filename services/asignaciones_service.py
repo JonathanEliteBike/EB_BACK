@@ -466,7 +466,8 @@ def crear_producto(importacion_id: int, sku: str, cantidad_embarcada, periodo: s
             raise AsignacionesError("IMPORTACION_NO_EXISTE", "El embarque no existe", 404)
 
         cursor.execute(
-            "SELECT id FROM importacion_productos WHERE importacion_id = %s AND sku_norm = %s",
+            "SELECT id FROM importacion_productos "
+            "WHERE importacion_id = %s AND sku_norm = %s AND activo = 1",
             (importacion_id, sku_norm),
         )
         if cursor.fetchone():
@@ -807,7 +808,8 @@ def importar_productos(importacion_id: int, periodo: str, filas: list, usuario_i
         if not cur.fetchone():
             raise AsignacionesError("IMPORTACION_NO_EXISTE", "El embarque no existe", 404)
         cur.execute(
-            "SELECT id, sku_norm, activo FROM importacion_productos WHERE importacion_id = %s",
+            "SELECT id, sku_norm FROM importacion_productos "
+            "WHERE importacion_id = %s AND activo = 1",
             (importacion_id,),
         )
         existentes = {r["sku_norm"]: r for r in cur.fetchall()}
@@ -827,12 +829,6 @@ def importar_productos(importacion_id: int, periodo: str, filas: list, usuario_i
         num_fila = f.get("fila")
         try:
             existente = existentes.get(sku_norm)
-            if existente and not existente.get("activo", 1):
-                raise AsignacionesError(
-                    "SKU_DESACTIVADO",
-                    "El SKU ya existe en el embarque, pero está desactivado",
-                    409,
-                )
             if existente:
                 actualizar_producto(
                     existente["id"],
