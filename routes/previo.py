@@ -121,6 +121,7 @@ def actualizar_previo():
             capturar_metas_protegidas,
             restaurar_metas_protegidas,
             sincronizar_metas_previo_my27,
+            EVAC_INTEGRAL_2,
         )
         metas_protegidas = capturar_metas_protegidas(conexion)
         
@@ -271,7 +272,12 @@ def actualizar_previo():
                         %s, %s
                     )
                 """, (
-                    registro.get('clave'), registro.get('evac'), registro.get('nombre_cliente'),
+                    registro.get('clave'),
+                    EVAC_INTEGRAL_2.get(
+                        str(registro.get('clave') or '').strip().upper(),
+                        registro.get('evac')
+                    ),
+                    registro.get('nombre_cliente'),
                     avance_real, registro.get('nivel'), meta_anual, p_anual_calc,
                     meta_inicial, registro.get('avance_global', 0), p_global_calc,
                     registro.get('compromiso_scott', 0), registro.get('avance_global_scott', 0),

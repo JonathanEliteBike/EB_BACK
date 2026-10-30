@@ -31,6 +31,23 @@ INTEGRALES_PROTEGIDAS = {
 }
 
 CLAVES_PROTEGIDAS = {"JE537", "4E013"}
+
+# Acuerdo comercial especial MY27 - Integral 2.
+# Solo se protege la meta anual individual.
+METAS_ANUALES_INTEGRAL_2 = {
+    "GC411": Decimal("3882900.56"),
+    "MC679": Decimal("8779435.07"),
+    "MC677": Decimal("7527613.88"),
+    "LC657": Decimal("2370050.49"),
+}
+
+EVAC_INTEGRAL_2 = {
+    "GC411": "A",
+    "MC679": "A",
+    "MC677": "B",
+    "LC657": "B",
+}
+
 NOMBRES_PROTEGIDOS = {
     "CHRISTIAN BOCCALETTI",
     "CHRISTIAN BOCCALETTI.",
@@ -213,6 +230,11 @@ def _objetivo_individual(cursor, fila: Dict[str, Any]):
         metas = calcular_metas_my27(nivel, 1)
     except ValueError as exc:
         return "OMITIDO", None, None, None, str(exc)
+
+    clave_norm = _norm(fila.get("clave"))
+    if clave_norm in METAS_ANUALES_INTEGRAL_2:
+        metas = dict(metas)
+        metas["compra_minima_anual"] = METAS_ANUALES_INTEGRAL_2[clave_norm]
 
     tipo = "MIEMBRO_INTEGRAL" if cliente.get("id_grupo") is not None else "NORMAL"
     return tipo, metas["nivel"], 1, metas, None

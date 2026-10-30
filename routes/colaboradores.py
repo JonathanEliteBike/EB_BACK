@@ -92,6 +92,7 @@ def formatear_colaborador(row):
         "empresa": row["empresa"] or "ELITE BIKE",
         "departamento": row["departamento"] or "",
         "puesto": row["puesto"] or "",
+        "prefijo": row.get("prefijo") or "",
         "correo": row["correo"] or "",
         "telefono": row["telefono"] or "",
         "extension": row["extension"] or "",
@@ -236,6 +237,60 @@ def respuesta_error_base_datos(error, accion):
     }), 500
 
 
+
+
+# ============================================================
+# DEPARTAMENTOS FIJOS Y PUESTOS DE TEXTO LIBRE
+# ============================================================
+
+# Lista aprobada por negocio. Los puestos fijos se muestran en Angular;
+# un puesto personalizado se guarda solo en el colaborador.
+DEPARTAMENTOS_FIJOS = frozenset({
+    'DIRECCIÓN',
+    'ADMINISTRACIÓN Y FINANZAS',
+    'SISTEMAS',
+    'OPERACIONES',
+    'RECURSOS HUMANOS',
+    'MARKETING',
+    'COMERCIAL / VENTAS',
+    'TIENDA',
+    'LOGÍSTICA E IMPORTACIONES',
+})
+
+
+def normalizar_prefijo(valor):
+    valor = limpiar_texto(valor)
+    if valor is None:
+        return None
+    if not isinstance(valor, str) or len(valor) > 50:
+        raise ValueError('El prefijo debe tener máximo 50 caracteres.')
+    return valor.upper()
+
+
+def validar_datos_laborales(cursor, data, colaborador_id=None):
+    departamento = limpiar_texto(data.get('departamento'))
+    puesto = limpiar_texto(data.get('puesto'))
+
+    if not isinstance(departamento, str) or len(departamento) > 100:
+        raise ValueError('El departamento es inválido o demasiado largo.')
+    if not isinstance(puesto, str) or len(puesto) > 120:
+        raise ValueError('El puesto es inválido o supera 120 caracteres.')
+    if departamento in DEPARTAMENTOS_FIJOS:
+        return
+
+    # Compatibilidad: la edición de un colaborador histórico NO cambia su
+    # departamento anterior sin consentimiento. No se incorpora al catálogo.
+    if colaborador_id is not None:
+        cursor.execute('''
+            SELECT departamento FROM inventario_colaboradores WHERE id = %s
+        ''', (colaborador_id,))
+        anterior = cursor.fetchone()
+        if anterior and anterior.get('departamento') == departamento:
+            return
+
+    raise ValueError('Selecciona un departamento del listado fijo.')
+
+
 # ============================================================
 # GET: LISTAR COLABORADORES
 # ============================================================
@@ -371,6 +426,7 @@ def listar_colaboradores():
             c.empresa,
             c.departamento,
             c.puesto,
+            c.prefijo,
             c.correo,
             c.telefono,
             c.extension,
@@ -600,6 +656,7 @@ def obtener_colaborador(colaborador_id):
                 c.empresa,
                 c.departamento,
                 c.puesto,
+            c.prefijo,
                 c.correo,
                 c.telefono,
                 c.extension,
@@ -727,9 +784,10 @@ def crear_colaborador():
         }), 400
 
     conexion = obtener_conexion()
-    cursor = conexion.cursor()
+    cursor = conexion.cursor(dictionary=True)
 
     try:
+        validar_datos_laborales(cursor, data)
         cursor.execute("""
             INSERT INTO inventario_colaboradores (
                 numero_empleado,
@@ -739,6 +797,7 @@ def crear_colaborador():
                 empresa,
                 departamento,
                 puesto,
+                prefijo,
                 correo,
                 telefono,
                 extension,
@@ -748,7 +807,7 @@ def crear_colaborador():
                 comentarios
             )
             VALUES (
-                %s, %s, %s, %s, %s, %s, %s,
+                %s, %s, %s, %s, %s, %s, %s, %s,
                 %s, %s, %s, %s, %s, %s, %s
             )
         """, (
@@ -773,6 +832,7 @@ def crear_colaborador():
             limpiar_texto(
                 data.get("puesto")
             ),
+            normalizar_prefijo(data.get("prefijo")),
             limpiar_texto(
                 data.get("correo")
             ),
@@ -803,6 +863,9 @@ def crear_colaborador():
             "id": nuevo_id
         }), 201
 
+    except ValueError as error:
+        conexion.rollback()
+        return jsonify({"error": str(error)}), 400
     except Exception as error:
         conexion.rollback()
 
@@ -895,6 +958,7 @@ def actualizar_colaborador(colaborador_id):
                     )
                 }), 409
 
+        validar_datos_laborales(cursor, data, colaborador_id)
         estado_anterior_bitacora = capturar_estado(cursor, 'Colaborador', colaborador_id)
         cursor.execute("""
             UPDATE inventario_colaboradores
@@ -906,6 +970,7 @@ def actualizar_colaborador(colaborador_id):
                 empresa = %s,
                 departamento = %s,
                 puesto = %s,
+                prefijo = %s,
                 correo = %s,
                 telefono = %s,
                 extension = %s,
@@ -936,6 +1001,7 @@ def actualizar_colaborador(colaborador_id):
             limpiar_texto(
                 data.get("puesto")
             ),
+            normalizar_prefijo(data.get("prefijo")),
             limpiar_texto(
                 data.get("correo")
             ),
@@ -966,6 +1032,9 @@ def actualizar_colaborador(colaborador_id):
             "id": colaborador_id
         })
 
+    except ValueError as error:
+        conexion.rollback()
+        return jsonify({"error": str(error)}), 400
     except Exception as error:
         conexion.rollback()
 

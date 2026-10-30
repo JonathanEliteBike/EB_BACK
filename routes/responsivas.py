@@ -2,6 +2,7 @@ import os
 from datetime import datetime
 from html import escape
 from io import BytesIO
+from urllib.parse import urlsplit
 
 from flask import Blueprint, jsonify, request, send_file
 
@@ -749,8 +750,10 @@ def actualizar_responsiva(responsiva_id):
     observaciones = limpiar_texto(
         data.get("observaciones")
     )
-    archivo_pdf = limpiar_texto(
-        data.get("archivoPdf")
+    archivo_pdf = (
+        limpiar_texto(data.get("archivoPdf"))
+        if "archivoPdf" in data
+        else None
     )
 
     conexion = obtener_conexion()
@@ -778,16 +781,14 @@ def actualizar_responsiva(responsiva_id):
                 {"error": "Responsiva no encontrada."}
             ), 404
 
-        if responsiva["estado"] == "Anulada":
+        if responsiva["estado"] in ("Anulada", "Firmada"):
             conexion.rollback()
-
-            return jsonify(
-                {
-                    "error": (
-                        "Una responsiva anulada no puede editarse."
-                    )
-                }
-            ), 409
+            return jsonify({
+                "error": (
+                    "La responsiva firmada o anulada no puede "
+                    "modificarse. Se requiere una correccion documentada."
+                )
+            }), 409
 
         estado_anterior_bitacora = capturar_estado(cursor, 'Responsiva', responsiva_id)
         cursor.execute(
@@ -795,7 +796,7 @@ def actualizar_responsiva(responsiva_id):
             UPDATE inventario_responsivas
             SET
                 observaciones = %s,
-                archivo_pdf = %s
+                archivo_pdf = COALESCE(%s, archivo_pdf)
             WHERE id = %s
             """,
             (
@@ -834,6 +835,147 @@ def actualizar_responsiva(responsiva_id):
         cursor.close()
         conexion.close()
 
+
+# ============================================================
+# PUT: CORREGIR ENLACE DE RESPONSIVA FIRMADA
+# ============================================================
+
+@responsivas_bp.route(
+    "/<int:responsiva_id>/corregir-enlace",
+    methods=["PUT"],
+)
+def corregir_enlace_responsiva(responsiva_id):
+    data = request.get_json(silent=True)
+
+    if not isinstance(data, dict):
+        return jsonify({
+            "error": "No se recibieron datos validos."
+        }), 400
+
+    if set(data.keys()) != {"archivoPdf", "enlaceAnterior"}:
+        return jsonify({
+            "error": "La solicitud contiene campos no permitidos."
+        }), 400
+
+    enlace_nuevo = data.get("archivoPdf")
+    enlace_anterior = data.get("enlaceAnterior")
+
+    if not isinstance(enlace_nuevo, str) or not isinstance(enlace_anterior, str):
+        return jsonify({
+            "error": "Los enlaces deben ser texto."
+        }), 400
+
+    enlace_nuevo = enlace_nuevo.strip()
+    enlace_anterior = enlace_anterior.strip()
+
+    if not enlace_nuevo or len(enlace_nuevo) > 2048:
+        return jsonify({
+            "error": "El enlace es obligatorio y no debe superar 2048 caracteres."
+        }), 400
+
+    try:
+        url = urlsplit(enlace_nuevo)
+
+        if (
+            url.scheme not in ("https", "http")
+            or not url.hostname
+            or url.username is not None
+            or url.password is not None
+        ):
+            raise ValueError("URL invalida")
+
+    except ValueError:
+        return jsonify({
+            "error": "Ingresa una URL valida."
+        }), 400
+
+    conexion = obtener_conexion()
+    cursor = conexion.cursor(dictionary=True)
+
+    try:
+        conexion.start_transaction()
+
+        cursor.execute(
+            """
+            SELECT id, estado, archivo_pdf
+            FROM inventario_responsivas
+            WHERE id = %s
+            FOR UPDATE
+            """,
+            (responsiva_id,),
+        )
+
+        responsiva = cursor.fetchone()
+
+        if not responsiva:
+            conexion.rollback()
+            return jsonify({
+                "error": "Responsiva no encontrada."
+            }), 404
+
+        if responsiva["estado"] != "Firmada":
+            conexion.rollback()
+            return jsonify({
+                "error": "Solo se permiten correcciones de responsivas firmadas."
+            }), 409
+
+        enlace_actual = (responsiva["archivo_pdf"] or "").strip()
+
+        if enlace_actual != enlace_anterior:
+            conexion.rollback()
+            return jsonify({
+                "error": "El enlace fue modificado en otra sesion."
+            }), 409
+
+        if enlace_actual == enlace_nuevo:
+            conexion.rollback()
+            return jsonify({
+                "error": "El enlace nuevo es igual al anterior."
+            }), 400
+
+        estado_anterior = capturar_estado(
+            cursor,
+            "Responsiva",
+            responsiva_id
+        )
+
+        cursor.execute(
+            """
+            UPDATE inventario_responsivas
+            SET archivo_pdf = %s
+            WHERE id = %s AND estado = 'Firmada'
+            """,
+            (enlace_nuevo, responsiva_id),
+        )
+
+        registrar_evento(
+            cursor,
+            "editar",
+            "Responsiva",
+            responsiva_id,
+            anterior=estado_anterior
+        )
+
+        conexion.commit()
+
+        return jsonify({
+            "message": "Enlace corregido correctamente.",
+            "id": responsiva_id,
+            "estado": "Firmada",
+            "archivoPdf": enlace_nuevo
+        }), 200
+
+    except Exception as error:
+        conexion.rollback()
+        print("Error al corregir enlace:", error)
+
+        return jsonify({
+            "error": "No fue posible corregir el enlace."
+        }), 500
+
+    finally:
+        cursor.close()
+        conexion.close()
 
 # ============================================================
 # PUT: FIRMAR RESPONSIVA
@@ -1737,3 +1879,180 @@ def descargar_responsiva_pdf(responsiva_id):
     finally:
         cursor.close()
         conexion.close()
+
+# ============================================================
+# PUT: RESTAURAR RESPONSIVA ANULADA
+#
+# Agregar este bloque al FINAL del archivo Python EXISTENTE que
+# declara responsivas_bp (NO reemplazar el backend por este archivo).
+# No requiere ALTER TABLE: recupera el estado anterior a partir de
+# fecha_firma, que no se elimina al anular.
+#
+# IMPORTANTE: adecuar autorización y auditoría al mecanismo real
+# del backend antes de habilitar en producción.
+# ============================================================
+
+@responsivas_bp.route('/<int:responsiva_id>/restaurar', methods=['PUT'])
+def restaurar_responsiva(responsiva_id):
+    conexion = obtener_conexion()
+    cursor = conexion.cursor(dictionary=True)
+
+    try:
+        conexion.start_transaction()
+
+        # Primera lectura solo para encontrar la asignación a bloquear.
+        cursor.execute(
+            "SELECT asignacion_id FROM inventario_responsivas WHERE id = %s",
+            (responsiva_id,),
+        )
+        referencia = cursor.fetchone()
+        if not referencia:
+            conexion.rollback()
+            return jsonify({'error': 'Responsiva no encontrada.'}), 404
+
+        # Mismo orden de bloqueo que la creación manual: asignación primero.
+        cursor.execute(
+            """
+            SELECT id, equipo_id, colaborador_id, estado
+            FROM inventario_asignaciones
+            WHERE id = %s
+            FOR UPDATE
+            """,
+            (referencia['asignacion_id'],),
+        )
+        asignacion = cursor.fetchone()
+        if not asignacion or asignacion['estado'] != 'Activa':
+            conexion.rollback()
+            return jsonify({
+                'error': 'No se puede restaurar: la asignación ya no está activa.'
+            }), 409
+
+        cursor.execute(
+            """
+            SELECT id, asignacion_id, equipo_id, colaborador_id,
+                   folio, estado, fecha_firma, archivo_pdf
+            FROM inventario_responsivas
+            WHERE id = %s
+            FOR UPDATE
+            """,
+            (responsiva_id,),
+        )
+        responsiva = cursor.fetchone()
+        if not responsiva:
+            conexion.rollback()
+            return jsonify({'error': 'Responsiva no encontrada.'}), 404
+
+        if responsiva['estado'] != 'Anulada':
+            conexion.rollback()
+            return jsonify({
+                'error': 'Solo pueden restaurarse responsivas anuladas.'
+            }), 409
+
+        if (
+            responsiva['asignacion_id'] != asignacion['id']
+            or responsiva['equipo_id'] != asignacion['equipo_id']
+            or responsiva['colaborador_id'] != asignacion['colaborador_id']
+        ):
+            conexion.rollback()
+            return jsonify({
+                'error': 'Los datos de la responsiva ya no coinciden con la asignación.'
+            }), 409
+
+        # No permitir dos responsivas vigentes para la misma asignación.
+        cursor.execute(
+            """
+            SELECT id FROM inventario_responsivas
+            WHERE asignacion_id = %s
+              AND id <> %s
+              AND estado IN ('Pendiente', 'Firmada')
+            LIMIT 1
+            """,
+            (asignacion['id'], responsiva_id),
+        )
+        if cursor.fetchone():
+            conexion.rollback()
+            return jsonify({
+                'error': 'Ya existe otra responsiva vigente para esta asignación.'
+            }), 409
+
+        cursor.execute(
+            "SELECT estado FROM inventario_equipos WHERE id = %s FOR UPDATE",
+            (asignacion['equipo_id'],),
+        )
+        equipo = cursor.fetchone()
+        if not equipo or equipo['estado'] != 'Asignado':
+            conexion.rollback()
+            return jsonify({
+                'error': 'No se puede restaurar: el equipo ya no está asignado.'
+            }), 409
+
+        estado_restaurado = (
+            'Firmada' if responsiva['fecha_firma'] is not None else 'Pendiente'
+        )
+        if estado_restaurado == 'Firmada' and not (responsiva['archivo_pdf'] or '').strip():
+            conexion.rollback()
+            return jsonify({
+                'error': 'La responsiva tenía fecha de firma pero no conserva su documento; requiere revisión.'
+            }), 409
+
+        # Capturar el estado anterior para la bitácora.
+        estado_anterior_bitacora = capturar_estado(
+            cursor,
+            'Responsiva',
+            responsiva_id
+        )
+
+        # Se modifica solo el estado. Se preservan el folio, PDF,
+        # fecha de firma y las evidencias de la anulación anterior.
+        cursor.execute(
+            """
+            UPDATE inventario_responsivas
+            SET estado = %s
+            WHERE id = %s AND estado = 'Anulada'
+            """,
+            (estado_restaurado, responsiva_id),
+        )
+
+        if cursor.rowcount != 1:
+            conexion.rollback()
+            return jsonify({
+                'error': 'El estado cambió mientras se procesaba la restauración.'
+            }), 409
+
+        cursor.execute(
+            """
+            UPDATE inventario_equipos
+            SET responsiva_estado = %s
+            WHERE id = %s
+            """,
+            (estado_restaurado, asignacion['equipo_id']),
+        )
+
+        # Registrar restauración en la bitácora.
+        registrar_evento(
+            cursor,
+            'restaurar',
+            'Responsiva',
+            responsiva_id,
+            anterior=estado_anterior_bitacora
+        )
+
+        conexion.commit()
+
+        return jsonify({
+            'message': 'Responsiva restaurada correctamente.',
+            'id': responsiva_id,
+            'folio': responsiva['folio'],
+            'estado': estado_restaurado,
+        }), 200
+    
+    except Exception as error:
+        conexion.rollback()
+        print('Error al restaurar responsiva:', error)
+        return jsonify({
+            'error': 'No se pudo restaurar la responsiva.'
+        }), 500
+    finally:
+        cursor.close()
+        conexion.close()
+
