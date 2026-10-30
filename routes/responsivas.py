@@ -2,6 +2,7 @@ import os
 from datetime import datetime
 from html import escape
 from io import BytesIO
+from urllib.parse import urlsplit
 
 from flask import Blueprint, jsonify, request, send_file
 
@@ -834,6 +835,147 @@ def actualizar_responsiva(responsiva_id):
         cursor.close()
         conexion.close()
 
+
+# ============================================================
+# PUT: CORREGIR ENLACE DE RESPONSIVA FIRMADA
+# ============================================================
+
+@responsivas_bp.route(
+    "/<int:responsiva_id>/corregir-enlace",
+    methods=["PUT"],
+)
+def corregir_enlace_responsiva(responsiva_id):
+    data = request.get_json(silent=True)
+
+    if not isinstance(data, dict):
+        return jsonify({
+            "error": "No se recibieron datos validos."
+        }), 400
+
+    if set(data.keys()) != {"archivoPdf", "enlaceAnterior"}:
+        return jsonify({
+            "error": "La solicitud contiene campos no permitidos."
+        }), 400
+
+    enlace_nuevo = data.get("archivoPdf")
+    enlace_anterior = data.get("enlaceAnterior")
+
+    if not isinstance(enlace_nuevo, str) or not isinstance(enlace_anterior, str):
+        return jsonify({
+            "error": "Los enlaces deben ser texto."
+        }), 400
+
+    enlace_nuevo = enlace_nuevo.strip()
+    enlace_anterior = enlace_anterior.strip()
+
+    if not enlace_nuevo or len(enlace_nuevo) > 2048:
+        return jsonify({
+            "error": "El enlace es obligatorio y no debe superar 2048 caracteres."
+        }), 400
+
+    try:
+        url = urlsplit(enlace_nuevo)
+
+        if (
+            url.scheme not in ("https", "http")
+            or not url.hostname
+            or url.username is not None
+            or url.password is not None
+        ):
+            raise ValueError("URL invalida")
+
+    except ValueError:
+        return jsonify({
+            "error": "Ingresa una URL valida."
+        }), 400
+
+    conexion = obtener_conexion()
+    cursor = conexion.cursor(dictionary=True)
+
+    try:
+        conexion.start_transaction()
+
+        cursor.execute(
+            """
+            SELECT id, estado, archivo_pdf
+            FROM inventario_responsivas
+            WHERE id = %s
+            FOR UPDATE
+            """,
+            (responsiva_id,),
+        )
+
+        responsiva = cursor.fetchone()
+
+        if not responsiva:
+            conexion.rollback()
+            return jsonify({
+                "error": "Responsiva no encontrada."
+            }), 404
+
+        if responsiva["estado"] != "Firmada":
+            conexion.rollback()
+            return jsonify({
+                "error": "Solo se permiten correcciones de responsivas firmadas."
+            }), 409
+
+        enlace_actual = (responsiva["archivo_pdf"] or "").strip()
+
+        if enlace_actual != enlace_anterior:
+            conexion.rollback()
+            return jsonify({
+                "error": "El enlace fue modificado en otra sesion."
+            }), 409
+
+        if enlace_actual == enlace_nuevo:
+            conexion.rollback()
+            return jsonify({
+                "error": "El enlace nuevo es igual al anterior."
+            }), 400
+
+        estado_anterior = capturar_estado(
+            cursor,
+            "Responsiva",
+            responsiva_id
+        )
+
+        cursor.execute(
+            """
+            UPDATE inventario_responsivas
+            SET archivo_pdf = %s
+            WHERE id = %s AND estado = 'Firmada'
+            """,
+            (enlace_nuevo, responsiva_id),
+        )
+
+        registrar_evento(
+            cursor,
+            "editar",
+            "Responsiva",
+            responsiva_id,
+            anterior=estado_anterior
+        )
+
+        conexion.commit()
+
+        return jsonify({
+            "message": "Enlace corregido correctamente.",
+            "id": responsiva_id,
+            "estado": "Firmada",
+            "archivoPdf": enlace_nuevo
+        }), 200
+
+    except Exception as error:
+        conexion.rollback()
+        print("Error al corregir enlace:", error)
+
+        return jsonify({
+            "error": "No fue posible corregir el enlace."
+        }), 500
+
+    finally:
+        cursor.close()
+        conexion.close()
 
 # ============================================================
 # PUT: FIRMAR RESPONSIVA
