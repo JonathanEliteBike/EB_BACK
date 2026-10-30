@@ -46,6 +46,7 @@ from routes.proyecciones_my27 import proyecciones_my27_bp
 from routes.asignaciones_importaciones import asignaciones_bp as importaciones_asignaciones_bp
 from routes.solicitud_retroactivo import solicitud_retroactivo_bp
 from routes.solicitud_retroactivo_campanias import solicitud_retroactivo_campanias_bp
+from routes.archivos_locales import archivos_locales_bp
 
 # --- BLUEPRINTS DE PERMISOS ---
 from routes.usuarios_hijos_bp import usuarios_hijos_bp
@@ -287,6 +288,7 @@ def create_app():
     app.register_blueprint(importaciones_asignaciones_bp)
     app.register_blueprint(solicitud_retroactivo_bp)
     app.register_blueprint(solicitud_retroactivo_campanias_bp)
+    app.register_blueprint(archivos_locales_bp)
 
     # --- PERMISOS ---
     app.register_blueprint(usuarios_hijos_bp)

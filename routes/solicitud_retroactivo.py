@@ -1081,7 +1081,7 @@ def dashboard_distribuidor():
                 validacion_docs,
                 tiene_factura_xml=bool(solicitud['archivos']['factura_xml']['key'])
             )
-            totales[f"{solicitud['estatus']}s"] += 1
+            totales[{'pendiente': 'pendientes', 'validado': 'validadas', 'rechazado': 'rechazadas'}[solicitud['estatus']]] += 1
             monto_solicitud = Decimal(str(solicitud.get('monto_pagar') or 0))
             monto_total_estimado += monto_solicitud
 
