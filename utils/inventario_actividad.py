@@ -153,6 +153,7 @@ CAMPOS_HISTORICOS = {
         (
             'estado',
             'observaciones',
+            'archivo_pdf',
             'fecha_firma',
             'fecha_anulacion',
             'motivo_anulacion',
