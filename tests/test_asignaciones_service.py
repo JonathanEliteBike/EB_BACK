@@ -22,6 +22,7 @@ from services.asignaciones_service import (
     _split_periodo, _migrar_esquema_reservas, MESES_ORDEN,
 )
 from services.asignaciones_service import listar_periodos_activos, crear_siguiente_periodo_activo
+from services.asignaciones_service import desactivar_producto
 from services.proyecciones_service import demanda_neta_por_cliente_mensual, OdooReservaError
 from db_conexion import obtener_conexion
 import datetime as _dt
@@ -126,6 +127,88 @@ def test_crear_producto_sku_duplicado_por_carrera_en_el_insert(mocker):
     assert not conn.commit.called
 
 
+def test_desactivar_producto_requiere_motivo_sin_abrir_conexion():
+    with pytest.raises(AsignacionesError) as exc:
+        desactivar_producto(10, "   ", usuario_id=1, importacion_id=1)
+    assert exc.value.code == "MOTIVO_REQUERIDO"
+
+
+def test_desactivar_producto_bloquea_reservas_vigentes(mocker):
+    cursor = MagicMock()
+    cursor.fetchone.side_effect = [
+        {"id": 10, "importacion_id": 1, "activo": 1},
+        {"uno": 1},
+    ]
+    conn = _mock_conn(mocker, cursor)
+
+    with pytest.raises(AsignacionesError) as exc:
+        desactivar_producto(10, "Captura incorrecta", usuario_id=7, importacion_id=1)
+
+    assert exc.value.code == "SKU_CON_RESERVAS_VIGENTES"
+    assert conn.rollback.called
+    assert not conn.commit.called
+
+
+def test_desactivar_producto_bloquea_ventas_vigentes(mocker):
+    cursor = MagicMock()
+    cursor.fetchone.side_effect = [
+        {"id": 10, "importacion_id": 1, "activo": 1},
+        None,
+        {"uno": 1},
+    ]
+    conn = _mock_conn(mocker, cursor)
+
+    with pytest.raises(AsignacionesError) as exc:
+        desactivar_producto(10, "Captura incorrecta", usuario_id=7, importacion_id=1)
+
+    assert exc.value.code == "SKU_CON_VENTAS_VIGENTES"
+    assert conn.rollback.called
+    assert not conn.commit.called
+
+
+def test_desactivar_producto_guarda_auditoria_sin_tocar_ledger(mocker):
+    cursor = MagicMock()
+    cursor.fetchone.side_effect = [
+        {"id": 10, "importacion_id": 1, "activo": 1},
+        None,
+        None,
+        {"id": 10, "activo": 0, "desactivado_por": 7,
+         "motivo_desactivacion": "Captura incorrecta"},
+    ]
+    conn = _mock_conn(mocker, cursor)
+
+    resultado = desactivar_producto(10, "  Captura incorrecta  ", usuario_id=7, importacion_id=1)
+
+    assert resultado["activo"] == 0
+    assert conn.commit.called
+    updates = [c for c in cursor.execute.call_args_list if "UPDATE importacion_productos" in c.args[0]]
+    assert len(updates) == 1
+    assert updates[0].args[1] == (7, "Captura incorrecta", 10)
+    assert not [c for c in cursor.execute.call_args_list if "importacion_movimientos" in c.args[0]]
+
+
+def test_reservar_bloquea_producto_desactivado(mocker):
+    cursor = MagicMock()
+    cursor.fetchone.return_value = {"id": 10, "importacion_id": 1, "activo": 0}
+    _mock_conn(mocker, cursor)
+
+    with pytest.raises(AsignacionesError) as exc:
+        asignar(10, [{"clave_cliente": "LC657", "cantidad": 1}], importacion_id=1)
+
+    assert exc.value.code == "SKU_DESACTIVADO"
+
+
+def test_venta_sobrante_bloquea_producto_desactivado(mocker):
+    cursor = MagicMock()
+    cursor.fetchone.return_value = {"id": 10, "importacion_id": 1, "activo": 0}
+    _mock_conn(mocker, cursor)
+
+    with pytest.raises(AsignacionesError) as exc:
+        crear_venta_sobrante(10, "LC657", 1, importacion_id=1)
+
+    assert exc.value.code == "SKU_DESACTIVADO"
+
+
 def test_crear_producto_exitoso_normaliza_sku_y_registra_entrada(mocker):
     cursor = MagicMock()
     cursor.fetchone.side_effect = [
@@ -145,6 +228,27 @@ def test_crear_producto_exitoso_normaliza_sku_y_registra_entrada(mocker):
     assert len(inserts) == 1
     assert inserts[0].args[1][1] == "ENTRADA"
     assert inserts[0].args[1][2] == 10
+
+
+def test_crear_producto_ignora_historico_desactivado_y_conserva_sku_original(mocker):
+    cursor = MagicMock()
+    cursor.fetchone.side_effect = [
+        {"id": 1},  # importación existe
+        None,        # no existe un SKU activo con la misma normalización
+        {"id": 11, "sku": "427536-8086006", "sku_norm": "4275368086006", "activo": 1},
+    ]
+    cursor.lastrowid = 11
+    _mock_conn(mocker, cursor)
+
+    resultado = crear_producto(1, "427536-8086006", 10, "2026-2027")
+
+    consulta = [c for c in cursor.execute.call_args_list
+                if "SELECT id FROM importacion_productos" in c.args[0]][0]
+    assert "activo = 1" in consulta.args[0]
+    insercion = [c for c in cursor.execute.call_args_list
+                 if "INSERT INTO importacion_productos" in c.args[0]][0]
+    assert insercion.args[1][2:4] == ("427536-8086006", "4275368086006")
+    assert resultado["sku"] == "427536-8086006"
 
 
 def test_listar_productos_calcula_disponible_asignado_sobrante_vendido(mocker):
@@ -177,6 +281,20 @@ def test_listar_productos_calcula_disponible_asignado_sobrante_vendido(mocker):
     assert len(consultas_vendido) == 1
     # una venta PENDIENTE_VALIDACION ya descontó del disponible: debe contar como vendida
     assert "estado IN ('VALIDADO', 'PENDIENTE_VALIDACION')" in consultas_vendido[0].args[0]
+    consulta_productos = cursor.execute.call_args_list[1].args[0]
+    assert "activo = 1" in consulta_productos
+
+
+def test_listar_productos_permite_consultar_desactivados(mocker):
+    cursor = MagicMock()
+    cursor.fetchone.return_value = {"id": 1}
+    cursor.fetchall.return_value = []
+    _mock_conn(mocker, cursor)
+
+    assert listar_productos(1, estado="desactivados") == []
+
+    consulta_productos = cursor.execute.call_args_list[1].args[0]
+    assert "activo = 0" in consulta_productos
 
 
 def test_listar_productos_cuenta_ventas_pendientes_de_validacion_como_vendidas(mocker):
@@ -243,7 +361,7 @@ def test_actualizar_producto_registra_movimiento_ajuste(mocker):
 
 
 def test_recalcular_reparte_por_prioridad_hasta_agotar_disponible(mocker):
-    _recalc_setup(
+    cursor = _recalc_setup(
         mocker, producto=_PROD_SKU1, disponible=10,
         demanda_mensual={"MC677": {"octubre": 2}, "LC657": {"octubre": 3}},  # LC657 prioridad 1
     )
@@ -254,6 +372,11 @@ def test_recalcular_reparte_por_prioridad_hasta_agotar_disponible(mocker):
     assert orden == ["LC657", "MC677"]                    # prioridad absoluta
     assert propuestas[0]["sobrante_estimado"] == 5        # 10 - 3 - 2
     assert propuestas[0]["ventana"] == {"desde": "2026-10", "hasta": "2026-10"}
+    consulta_productos = next(
+        c.args[0] for c in cursor.execute.call_args_list
+        if "FROM importacion_productos WHERE importacion_id" in c.args[0]
+    )
+    assert "activo = 1" in consulta_productos
 
 
 def test_recalcular_cliente_mayor_recorre_meses_cronologicos(mocker):
@@ -1356,6 +1479,9 @@ def test_listar_movimientos_devuelve_los_del_embarque(mocker):
 
     assert len(resultado) == 1
     assert resultado[0]["tipo_movimiento"] == "ENTRADA"
+    consulta = cursor.execute.call_args_list[-1].args[0]
+    assert "importacion_movimientos m" in consulta
+    assert "activo" not in consulta
 
 
 def test_listar_reservas_embarque_importacion_no_existe(mocker):
@@ -1716,6 +1842,26 @@ def test_importar_productos_inserta_nuevos_y_actualiza_existentes(mocker):
     assert crear.call_args.args[1] == "BB-2" and crear.call_args.args[2] == 8
 
 
+def test_importar_productos_inserta_sku_corregido_si_solo_existe_desactivado(mocker):
+    cursor = MagicMock()
+    cursor.fetchone.return_value = {"id": 1}
+    # La consulta de importación solo devuelve SKU activos; el histórico
+    # desactivado no bloquea la creación del SKU corregido.
+    cursor.fetchall.return_value = []
+    _mock_conn(mocker, cursor)
+    crear = mocker.patch("services.asignaciones_service.crear_producto", return_value={"id": 11})
+    actualizar = mocker.patch("services.asignaciones_service.actualizar_producto")
+
+    res = importar_productos(1, "2026-2027", [
+        {"fila": 2, "sku": "AA-1", "cantidad": 12, "descripcion": "existente"},
+    ], usuario_id=7)
+
+    assert res["insertados"] == 1 and res["actualizados"] == 0
+    assert res["errores"] == []
+    crear.assert_called_once_with(1, "AA-1", 12, "2026-2027", descripcion="existente", usuario_id=7)
+    actualizar.assert_not_called()
+
+
 def test_importar_productos_fila_que_falla_va_a_errores_y_el_resto_se_procesa(mocker):
     cursor = MagicMock()
     cursor.fetchone.return_value = {"id": 1}
@@ -1796,6 +1942,27 @@ def test_resumen_global_solo_con_disponible_agrega_having(mocker):
     assert "HAVING disponibles > 0" in sql
 
 
+def test_resumen_global_excluye_sku_desactivados_por_defecto(mocker):
+    cursor = MagicMock()
+    cursor.fetchall.return_value = []
+    _mock_conn(mocker, cursor)
+
+    resumen_global({})
+
+    sql = cursor.execute.call_args[0][0]
+    assert "WHERE p.activo = 1" in sql
+
+
+def test_resumen_global_permite_sku_desactivados(mocker):
+    cursor = MagicMock()
+    cursor.fetchall.return_value = []
+    _mock_conn(mocker, cursor)
+
+    resumen_global({"estado_sku": "desactivados"})
+
+    assert "WHERE p.activo = 0" in cursor.execute.call_args[0][0]
+
+
 def test_listar_productos_global_calcula_sobrante_y_totales(mocker):
     cursor = MagicMock()
     cursor.fetchone.return_value = {"n": 2}
@@ -1846,6 +2013,7 @@ def test_listar_productos_global_solo_disponible_filtra_en_sql(mocker):
 
     count_sql = cursor.execute.call_args_list[0][0][0]
     assert "importacion_movimientos m" in count_sql and "> 0" in count_sql
+    assert "p.activo = 1" in count_sql
 
 
 # ── Reservas por mes: helpers de calendario ───────────────────────────────────
